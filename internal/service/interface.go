@@ -3,13 +3,28 @@ package service
 import (
 	"context"
 	"fmt"
+	"net"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"fnwg/internal/model"
-	"fnwg/internal/store"
 	"fnwg/internal/wgconf"
 	"fnwg/internal/wgkey"
 )
+
+// 连接的内部地址网段与监听端口在全部连接内必须唯一：
+// 网段重叠会让两条连接上的设备互相抢地址，端口重复会让后创建的连接无法监听。
+// 下面这组常量用于按连接序号错开默认值，从源头规避冲突。
+const (
+	defaultMTU        = 1420
+	defaultListenPort = 51820
+	defaultAddrOctet  = 10 // 默认内部网段 10.10.0.0/24 的第三个八位组
+	autoAllocTries    = 64 // 自动分配时最多顺延尝试的位数
+)
+
+// ifaceIndexRe 匹配 wgN 形式的连接名，用于推导默认地址与端口的偏移量。
+var ifaceIndexRe = regexp.MustCompile(`^wg(\d+)$`)
 
 // ListInterfaces 返回全部接口（默认不回传私钥）。
 func (s *Service) ListInterfaces(ctx context.Context) ([]model.Interface, error) {
@@ -50,6 +65,9 @@ type CreateInterfaceInput struct {
 	PostDown   string   `json:"post_down"`
 	Enabled    bool     `json:"enabled"`
 	Autostart  bool     `json:"autostart"`
+	// AllowLAN 控制「允许设备访问家里内网」。
+	// 新建连接时为 nil 表示采用默认值（开启）；编辑时为 nil 表示保持原值。
+	AllowLAN *bool `json:"allow_lan"`
 	// PrivateKey 仅在导入已有配置时使用；为空表示自动生成。
 	PrivateKey string `json:"private_key"`
 }
@@ -93,8 +111,13 @@ func (s *Service) CreateInterface(ctx context.Context, in CreateInterfaceInput, 
 		PostDown:   in.PostDown,
 		Enabled:    in.Enabled,
 		Autostart:  in.Autostart,
+		// 新建连接默认开启内网访问：设备连回家就是为了访问 NAS 与家里其它设备，
+		// 不开的话表现是「能连上 NAS，但访问不了家里的机器」。
+		AllowLAN: in.AllowLAN == nil || *in.AllowLAN,
 	}
-	s.applyInterfaceDefaults(it)
+	if err := s.applyInterfaceDefaults(ctx, it, 0); err != nil {
+		return nil, err
+	}
 	if err := s.validateInterface(ctx, it, 0); err != nil {
 		return nil, err
 	}
@@ -131,6 +154,9 @@ func (s *Service) UpdateInterface(ctx context.Context, id int64, in CreateInterf
 	it.PostDown = in.PostDown
 	it.Enabled = in.Enabled
 	it.Autostart = in.Autostart
+	if in.AllowLAN != nil {
+		it.AllowLAN = *in.AllowLAN
+	}
 	// 私钥仅在显式传入时覆盖，避免前端表单未携带该字段导致密钥丢失
 	if in.PrivateKey != "" {
 		if !wgkey.Validate(in.PrivateKey) {
@@ -138,7 +164,9 @@ func (s *Service) UpdateInterface(ctx context.Context, id int64, in CreateInterf
 		}
 		it.PrivateKey = in.PrivateKey
 	}
-	s.applyInterfaceDefaults(it)
+	if err := s.applyInterfaceDefaults(ctx, it, id); err != nil {
+		return nil, err
+	}
 	if err := s.validateInterface(ctx, it, id); err != nil {
 		return nil, err
 	}
@@ -186,6 +214,36 @@ func (s *Service) ToggleInterface(ctx context.Context, id int64, enabled bool, a
 	return s.reconcile(ctx)
 }
 
+// SetLanAccess 一键切换「允许设备访问家里内网」。
+//
+// 单独开一个入口是为了让用户不必进编辑表单就能开启/关闭；
+// 打开后本应用会为该连接的隧道网段做源地址改写（NAT），
+// 让连进来的设备能够访问 NAS 所在局域网中的其它设备。
+func (s *Service) SetLanAccess(ctx context.Context, id int64, enabled bool, a Actor) (*model.Interface, error) {
+	it, err := s.Store.GetInterface(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if it.AllowLAN == enabled {
+		it.PrivateKey = ""
+		return it, nil
+	}
+	it.AllowLAN = enabled
+	if err := s.Store.UpdateInterface(ctx, it); err != nil {
+		return nil, err
+	}
+	action := "iface.lan_access_off"
+	if enabled {
+		action = "iface.lan_access_on"
+	}
+	s.audit(ctx, a, action, "interface", fmt.Sprint(id), "", fmt.Sprint(enabled), "ok", "")
+	if err := s.reconcile(ctx); err != nil {
+		return nil, err
+	}
+	it.PrivateKey = ""
+	return it, nil
+}
+
 // RevealPrivateKey 在二次鉴权后回显接口私钥，并记录审计。
 func (s *Service) RevealPrivateKey(ctx context.Context, id int64, a Actor) (string, error) {
 	it, err := s.Store.GetInterface(ctx, id)
@@ -228,14 +286,16 @@ func (s *Service) InterfaceConf(ctx context.Context, id int64) (string, string, 
 	return it.Name, wgconf.RenderServer(it, peers), nil
 }
 
-func (s *Service) applyInterfaceDefaults(it *model.Interface) {
+// applyInterfaceDefaults 归一化字段并补齐缺省值。
+//
+// 内部地址与监听端口留空时，按连接序号自动分配一个不与其它连接冲突的取值：
+// wg0 → 10.10.0.1/24 + 51820，wg1 → 10.11.0.1/24 + 51821，以此类推；
+// 若序号位已被占用则顺延寻找空位，避免「新建第二条连接就必须手工改端口和网段」。
+func (s *Service) applyInterfaceDefaults(ctx context.Context, it *model.Interface, selfID int64) error {
 	it.Addresses = wgconf.MergeCIDRs(it.Addresses)
 	it.DNS = wgconf.MergeCIDRs(it.DNS)
 	if it.MTU <= 0 {
-		it.MTU = 1420
-	}
-	if it.ListenPort <= 0 {
-		it.ListenPort = 51820
+		it.MTU = defaultMTU
 	}
 	if it.DNSMode == "" {
 		it.DNSMode = "client"
@@ -244,9 +304,129 @@ func (s *Service) applyInterfaceDefaults(it *model.Interface) {
 	if it.RouteTable == "" || it.RouteTable == "auto" {
 		it.RouteTable = model.RouteTableOff
 	}
-	if len(it.Addresses) == 0 {
-		it.Addresses = []string{"10.10.0.1/24"}
+	if it.ListenPort > 0 && len(it.Addresses) > 0 {
+		return nil // 两项都由用户指定，无需自动分配
 	}
+	others, err := s.otherInterfaces(ctx, selfID)
+	if err != nil {
+		return err
+	}
+	start := defaultIndexFor(it.Name)
+	if it.ListenPort <= 0 {
+		it.ListenPort = pickFreePort(others, start)
+	}
+	if len(it.Addresses) == 0 {
+		it.Addresses = []string{pickFreeAddr(others, start)}
+	}
+	return nil
+}
+
+// defaultIndexFor 从连接名推导自动分配序号：wg0 → 0、wg12 → 12。
+// 非 wgN 命名的连接从 0 号位开始，由顺延逻辑寻找空位。
+func defaultIndexFor(name string) int {
+	m := ifaceIndexRe.FindStringSubmatch(name)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// defaultInterfaceAddr 按序号给出默认内部地址：wg0 → 10.10.0.1/24、wg1 → 10.11.0.1/24。
+func defaultInterfaceAddr(idx int) string {
+	if idx < 0 {
+		idx = 0
+	}
+	if idx > 240 { // 10.10.0.0/24 ~ 10.250.0.0/24
+		idx = 240
+	}
+	return fmt.Sprintf("10.%d.0.1/24", defaultAddrOctet+idx)
+}
+
+// defaultInterfacePort 按序号给出默认监听端口：wg0 → 51820、wg1 → 51821。
+func defaultInterfacePort(idx int) int {
+	if idx < 0 {
+		idx = 0
+	}
+	if p := defaultListenPort + idx; p <= 65535 {
+		return p
+	}
+	return 65535
+}
+
+// pickFreePort 从序号对应的默认端口开始顺延，返回第一个未被占用的端口。
+func pickFreePort(others []model.Interface, start int) int {
+	for i := 0; i < autoAllocTries; i++ {
+		if p := defaultInterfacePort(start + i); !portUsedBy(others, p) {
+			return p
+		}
+	}
+	return defaultInterfacePort(start)
+}
+
+// pickFreeAddr 从序号对应的默认网段开始顺延，返回第一个不与已有连接重叠的网段。
+func pickFreeAddr(others []model.Interface, start int) string {
+	for i := 0; i < autoAllocTries; i++ {
+		if a := defaultInterfaceAddr(start + i); !addrOverlapsAny(others, a) {
+			return a
+		}
+	}
+	return defaultInterfaceAddr(start)
+}
+
+// otherInterfaces 返回除 selfID 之外的全部连接，用于跨连接冲突检查与空位查找。
+func (s *Service) otherInterfaces(ctx context.Context, selfID int64) ([]model.Interface, error) {
+	list, err := s.Store.ListInterfaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if selfID <= 0 {
+		return list, nil
+	}
+	out := make([]model.Interface, 0, len(list))
+	for i := range list {
+		if list[i].ID != selfID {
+			out = append(out, list[i])
+		}
+	}
+	return out, nil
+}
+
+// portUsedBy 判断端口是否已被其它连接占用（0 表示交给内核随机分配，不算冲突）。
+func portUsedBy(others []model.Interface, port int) bool {
+	if port <= 0 {
+		return false
+	}
+	for i := range others {
+		if others[i].ListenPort == port {
+			return true
+		}
+	}
+	return false
+}
+
+// addrOverlapsAny 判断网段是否与其它连接的内部地址存在重叠。
+func addrOverlapsAny(others []model.Interface, cidr string) bool {
+	_, n, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	for i := range others {
+		for _, o := range others[i].Addresses {
+			if _, on, err := net.ParseCIDR(o); err == nil && cidrOverlap(n, on) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cidrOverlap 判断两个网段是否有交集（不同协议族之间永远不重叠）。
+func cidrOverlap(a, b *net.IPNet) bool {
+	return a.Contains(b.IP) || b.Contains(a.IP)
 }
 
 func (s *Service) validateInterface(ctx context.Context, it *model.Interface, selfID int64) error {
@@ -275,10 +455,66 @@ func (s *Service) validateInterface(ctx context.Context, it *model.Interface, se
 	default:
 		return fmt.Errorf("「本机访问路线管理」取值不正确，请选择：不管理（推荐）或 客户端模式")
 	}
-	if other, err := s.Store.GetInterfaceByName(ctx, it.Name); err == nil && other.ID != selfID {
-		return fmt.Errorf("连接名称「%s」已经被使用了，请换一个名称", it.Name)
-	} else if err != nil && err != store.ErrNotFound {
+	// 跨连接校验：名称、监听端口与内部地址网段在全部连接内都必须唯一。
+	// 提前在这里拦下，避免把冲突留到内核层才以晦涩的错误暴露出来。
+	others, err := s.otherInterfaces(ctx, selfID)
+	if err != nil {
 		return err
+	}
+	if err := checkInterfaceConflicts(it, others); err != nil {
+		return err
+	}
+
+	// 内核侧冲突：系统上已存在、但本应用不认的 WireGuard 网卡
+	// （典型是早期版本卸载残留）会占住同名网卡与 UDP 端口。
+	// 同样提前拦下并给出可操作的提示；取不到自检报告（如代理未运行）时跳过这段检查，
+	// 不因为读不到信息就阻断创建。
+	if rep, err := s.Core.InspectNetwork(ctx); err == nil {
+		for _, fi := range rep.ForeignInterfaces {
+			switch {
+			case fi.Name == it.Name:
+				return fmt.Errorf("系统上已存在名为 %s 的 WireGuard 网卡，但它不是本应用创建的"+
+					"（可能是历史残留，也可能是其它工具在用）。请改用其他名称，"+
+					"或先到「系统设置 → 运行状态 → 疑似残留网卡」中确认并清理它", fi.Name)
+			case it.ListenPort > 0 && fi.ListenPort == it.ListenPort:
+				return fmt.Errorf("服务端口 %d 已被系统上不是本应用创建的网卡 %s 占用，请更换端口"+
+					"（该网卡可能是历史残留，可在「系统设置 → 运行状态 → 疑似残留网卡」中清理）",
+					it.ListenPort, fi.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// checkInterfaceConflicts 校验名称、监听端口与内部地址网段是否与其它连接冲突。
+func checkInterfaceConflicts(it *model.Interface, others []model.Interface) error {
+	for i := range others {
+		if others[i].Name == it.Name {
+			return fmt.Errorf("连接名称「%s」已经被使用了，请换一个名称", it.Name)
+		}
+	}
+	for i := range others {
+		if it.ListenPort > 0 && others[i].ListenPort == it.ListenPort {
+			return fmt.Errorf("端口 %d 已被连接 %s 使用，请更换", it.ListenPort, others[i].Name)
+		}
+	}
+	for _, a := range it.Addresses {
+		_, an, err := net.ParseCIDR(a)
+		if err != nil {
+			continue // 格式问题已在字段校验中报出
+		}
+		for i := range others {
+			for _, o := range others[i].Addresses {
+				_, on, err := net.ParseCIDR(o)
+				if err != nil {
+					continue // 历史脏数据不阻断本次校验
+				}
+				if cidrOverlap(an, on) {
+					return fmt.Errorf("内部地址网段 %s 与连接 %s 的 %s 重叠，请更换（例如 %s）",
+						a, others[i].Name, o, pickFreeAddr(others, defaultIndexFor(it.Name)))
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -287,6 +523,14 @@ func (s *Service) nextInterfaceName(ctx context.Context) (string, error) {
 	used, err := s.Store.InterfaceNames(ctx)
 	if err != nil {
 		return "", err
+	}
+	// 内核里存在、但本应用不认的网卡名（历史残留等）也要避开：
+	// 否则自动命名给出的名字会因为「拒绝接管他人网卡」而无法下发，
+	// 表现为「自动创建失败，但手工换个名字就好了」。
+	if rep, err := s.Core.InspectNetwork(ctx); err == nil {
+		for _, fi := range rep.ForeignInterfaces {
+			used[fi.Name] = true
+		}
 	}
 	for i := 0; i < 100; i++ {
 		name := fmt.Sprintf("wg%d", i)

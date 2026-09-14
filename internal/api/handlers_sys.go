@@ -159,6 +159,25 @@ func (s *Server) handleNetworkCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleDeleteForeignInterface 清理一个疑似残留的 WireGuard 网卡。
+// 请求体需带 confirm（与 name 完全一致）作为二次确认。
+func (s *Server) handleDeleteForeignInterface(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name    string `json:"name"`
+		Confirm string `json:"confirm"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式不正确")
+		return
+	}
+	actions, err := s.svc.DeleteForeignInterface(r.Context(), in.Name, in.Confirm, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"actions": actions})
+}
+
 func (s *Server) handleNetworkRepair(w http.ResponseWriter, r *http.Request) {
 	actions, err := s.svc.RepairNetwork(r.Context(), actorOf(r))
 	if err != nil {

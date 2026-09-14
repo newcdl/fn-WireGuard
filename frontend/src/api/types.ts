@@ -16,6 +16,8 @@ export interface WgInterface {
   post_down: string
   enabled: boolean
   autostart: boolean
+  /** 允许设备访问家里内网（NAT 转发） */
+  allow_lan: boolean
   revision: number
   created_at: string
   updated_at: string
@@ -174,12 +176,47 @@ export interface DefaultRoute {
   owned_by_us: boolean
 }
 
+/** 内核里存在、但不属于本应用的 WireGuard 网卡（疑似历史残留或其它工具创建） */
+export interface ForeignInterface {
+  name: string
+  listen_port: number
+  up: boolean
+  peer_count: number
+  addresses: string[]
+}
+
+/** 内网访问链路上某一层的检查结果 */
+export interface NATCheck {
+  key: string
+  label: string
+  ok: boolean
+  detail: string
+  fix?: string
+}
+
+/** 内网访问（设备访问家里其它机器）的规则状态 */
+export interface NATStatus {
+  active: boolean
+  sources: string[]
+  wans: string[]
+  /** 内核是否允许转发（net.ipv4.ip_forward） */
+  ip_forward: boolean
+  /** 该开关是否由本应用开启 */
+  ip_forward_enabled_by_us: boolean
+  note?: string
+  /** 逐项自检结果：直接指出卡在哪一层 */
+  checks: NATCheck[]
+}
+
 export interface NetworkCheckResult {
   healthy: boolean
   route_info_readable: boolean
   managed_interfaces: string[]
   system_defaults: DefaultRoute[]
   stray_defaults: DefaultRoute[]
+  foreign_interfaces: ForeignInterface[]
+  nat: NATStatus
+  forward_policy_drop: boolean
   messages: string[]
 }
 

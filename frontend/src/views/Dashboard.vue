@@ -424,14 +424,13 @@ watch(liveRxRate, () => {
 async function quickStart() {
   quickStarting.value = true
   try {
+    // 连接名称、本机专用地址与服务端口交给后端自动分配，
+    // 保证已有连接时不会因为写死的默认值产生端口/网段冲突。
     const created = await api.post<{ name: string }>('/interfaces', {
-      name: 'wg0',
-      listen_port: 51820,
       mtu: 1420,
-      addresses: ['10.10.0.1/24'],
       dns: ['223.5.5.5'],
       dns_mode: 'client',
-      route_table: 'auto',
+      route_table: 'off',
       enabled: true,
       autostart: true,
     })

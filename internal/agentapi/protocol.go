@@ -21,6 +21,9 @@ const (
 	MethodNetInspect      = "net.inspect"
 	MethodNetRepair       = "net.repair"
 	MethodNetCleanup      = "net.cleanup"
+	// MethodNetDeleteForeign 删除一个不属于本应用的 WireGuard 网卡（疑似残留）。
+	// 这是白名单里唯一会触碰非受管对象的方法，代理侧会再次校验网卡类型。
+	MethodNetDeleteForeign = "net.delete_foreign_iface"
 )
 
 // Request 是一次调用请求。
@@ -43,6 +46,11 @@ type DeleteInterfaceParams struct {
 	Name string `json:"name"`
 }
 
+// DeleteForeignInterfaceParams 删除疑似残留网卡的参数。
+type DeleteForeignInterfaceParams struct {
+	Name string `json:"name"`
+}
+
 // Core 是特权能力的抽象，既可由本地引擎实现，也可由 UDS 客户端实现。
 //
 // 注意：这里不对上层暴露任何"修改系统路由"的能力，从协议层就杜绝越权。
@@ -61,4 +69,7 @@ type Core interface {
 	RepairNetwork(ctx context.Context) ([]string, error)
 	// CleanupNetwork 删除本应用创建的全部内核对象（停用/卸载使用）。
 	CleanupNetwork(ctx context.Context) ([]string, error)
+	// DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡。
+	// 代理侧只允许删除 link 类型为 wireguard 的网卡，其余一律拒绝。
+	DeleteForeignInterface(ctx context.Context, name string) ([]string, error)
 }

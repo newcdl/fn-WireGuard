@@ -4,6 +4,7 @@ go 1.24
 
 require (
 	github.com/go-chi/chi/v5 v5.3.2
+	github.com/google/nftables v0.3.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/crypto v0.31.0
@@ -15,10 +16,9 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/josharian/native v1.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mdlayher/genetlink v1.3.2 // indirect
-	github.com/mdlayher/netlink v1.7.2 // indirect
+	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect

@@ -44,6 +44,8 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.Get("/system/network", s.handleNetworkCheck)
 			r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/repair", s.handleNetworkRepair)
 			r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/cleanup", s.handleNetworkCleanup)
+			// 清理「不是本应用创建的」WireGuard 网卡（疑似历史残留，需二次确认）
+			r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/foreign-interface/delete", s.handleDeleteForeignInterface)
 
 			// 接口
 			r.Get("/interfaces", s.handleListInterfaces)
@@ -52,6 +54,8 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.With(requirePerm(model.PermIfaceWrite)).Patch("/interfaces/{id}", s.handleUpdateInterface)
 			r.With(requirePerm(model.PermIfaceWrite)).Delete("/interfaces/{id}", s.handleDeleteInterface)
 			r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/toggle", s.handleToggleInterface)
+			// 一键切换「允许设备访问家里内网」（不必进编辑表单）
+			r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/lan-access", s.handleSetLanAccess)
 			r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/apply", s.handleApplyInterface)
 			r.With(requirePerm(model.PermKeyReveal)).Post("/interfaces/{id}/reveal-key", s.handleRevealInterfaceKey)
 			r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/rotate-key", s.handleRotateInterfaceKey)

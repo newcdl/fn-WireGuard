@@ -6,6 +6,9 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"net"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,7 +70,60 @@ func (b *mockBackend) Cleanup(ctx context.Context) ([]string, error) {
 }
 
 func (b *mockBackend) Inspect(ctx context.Context) (model.NetworkReport, error) {
-	return model.NetworkReport{ManagedInterfaces: b.state.ManagedCopy()}, nil
+	return model.NetworkReport{
+		ManagedInterfaces: b.state.ManagedCopy(),
+		ForeignInterfaces: []model.ForeignInterface{},
+		NAT:               b.NATStatus(),
+	}, nil
+}
+
+// DeleteForeignInterface 演示模式下没有真实的残留网卡可删。
+func (b *mockBackend) DeleteForeignInterface(name string) ([]string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return []string{fmt.Sprintf("演示模式：%s 是模拟对象，未做任何删除", name)}, nil
+}
+
+// NATStatus 演示模式下不产生真实的转发规则。
+func (b *mockBackend) NATStatus() model.NATStatus {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	sources := []string{}
+	for name, dev := range b.devs {
+		if !b.state.IsManaged(name) || !dev.spec.AllowLAN {
+			continue
+		}
+		for _, a := range dev.spec.Addresses {
+			if _, n, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil && n.IP.To4() != nil {
+				sources = append(sources, (&net.IPNet{IP: n.IP.Mask(n.Mask), Mask: n.Mask}).String())
+			}
+		}
+	}
+	if len(sources) == 0 {
+		return model.NATStatus{
+			Sources:   []string{},
+			WANs:      []string{},
+			IPForward: true,
+			Checks: []model.NATCheck{
+				{Key: "rules", Label: "转发规则", OK: false,
+					Detail: "演示模式：没有已打开「内网访问」开关的连接"},
+				{Key: "ip_forward", Label: "内核转发", OK: true, Detail: "演示模式：未读取真实内核参数"},
+			},
+		}
+	}
+	sort.Strings(sources)
+	return model.NATStatus{
+		Active:    true,
+		Sources:   sources,
+		WANs:      []string{},
+		IPForward: true,
+		Note:      "演示模式：未产生真实的转发规则",
+		Checks: []model.NATCheck{
+			{Key: "rules", Label: "转发规则", OK: true,
+				Detail: fmt.Sprintf("演示模式：将为 %s 做源地址改写", strings.Join(sources, "、"))},
+			{Key: "ip_forward", Label: "内核转发", OK: true, Detail: "演示模式：未读取真实内核参数"},
+		},
+	}
 }
 
 func (b *mockBackend) Apply(specs []model.InterfaceSpec, opts ApplyOptions) (Diff, error) {

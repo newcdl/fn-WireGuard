@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/tabwriter"
 
 	"fnwg/internal/agentapi"
@@ -17,12 +18,22 @@ import (
 	"fnwg/internal/wgback"
 )
 
+// buildVersion 由构建脚本通过 -ldflags "-X main.buildVersion=..." 注入。
+// 缺少这个变量时 -ldflags 会被静默忽略，`fnwg-cli version` 就会报出错误的版本号。
+var buildVersion string
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	cfg := config.Load(os.Args[2:])
+	switch {
+	case buildVersion != "":
+		cfg.Version = buildVersion
+	case os.Getenv("FNWG_BUILD_VERSION") != "":
+		cfg.Version = os.Getenv("FNWG_BUILD_VERSION")
+	}
 	cmd := os.Args[1]
 
 	switch cmd {
@@ -36,6 +47,12 @@ func main() {
 		runExport(cfg, os.Args[2:])
 	case "cleanup":
 		runCleanup(cfg)
+	case "cleanup-foreign":
+		name := ""
+		if len(os.Args) > 2 {
+			name = os.Args[2]
+		}
+		runCleanupForeign(cfg, name)
 	case "netcheck":
 		runNetCheck(cfg)
 	case "help", "-h", "--help":
@@ -54,11 +71,16 @@ func usage() {
   fnwg-cli status                 查看接口与节点实时状态
   fnwg-cli netcheck               检查 NAS 系统上网路线是否被本应用影响
   fnwg-cli cleanup                删除本应用创建的全部网络对象（停用/卸载使用）
+  fnwg-cli cleanup-foreign <名称> 清理不是本应用创建的 WireGuard 网卡（疑似残留）
   fnwg-cli reconcile              立即把数据库期望态下发到内核
   fnwg-cli export --all --out DIR 导出全部接口的 wg-quick 配置
   fnwg-cli version                输出版本
 
 环境变量与 fnOS 一致（TRIM_PKGVAR / TRIM_PKGETC 等），也可用 --var / --socket 覆盖。
+
+本工具位于 /usr/local/bin/fnwg-cli。sudo 会按自己的 secure_path 查找命令，
+若提示 "sudo: fnwg-cli: command not found"，请改用绝对路径调用：
+  sudo /usr/local/bin/fnwg-cli <命令>
 `)
 }
 
@@ -78,6 +100,27 @@ func runCleanup(cfg *config.Config) {
 	}
 }
 
+// runCleanupForeign 清理一个不是本应用创建的 WireGuard 网卡（疑似历史残留）。
+//
+// 这是命令行里唯一会触碰非受管对象的能力，因此数据面后端会再次校验
+// 该网卡的 link 类型必须是 wireguard —— 普通网卡一律拒绝。
+func runCleanupForeign(cfg *config.Config, name string) {
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "用法: fnwg-cli cleanup-foreign <网卡名称>")
+		fmt.Fprintln(os.Stderr, "可用 fnwg-cli netcheck 查看当前有哪些疑似残留。")
+		os.Exit(2)
+	}
+	backend := wgback.New(cfg.NetStatePath())
+	actions, err := backend.DeleteForeignInterface(name)
+	for _, a := range actions {
+		fmt.Println("·", a)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "清理失败:", err)
+		os.Exit(1)
+	}
+}
+
 // runNetCheck 网络自检（只读）。
 func runNetCheck(cfg *config.Config) {
 	backend := wgback.New(cfg.NetStatePath())
@@ -87,6 +130,51 @@ func runNetCheck(cfg *config.Config) {
 		os.Exit(1)
 	}
 	fmt.Printf("本应用创建的连接: %v\n", rep.ManagedInterfaces)
+	if len(rep.ForeignInterfaces) > 0 {
+		fmt.Println("疑似残留（不是本应用创建的 WireGuard 网卡）:")
+		for _, fi := range rep.ForeignInterfaces {
+			state := "已停止"
+			if fi.Up {
+				state = "运行中"
+			}
+			port := "未监听"
+			if fi.ListenPort > 0 {
+				port = fmt.Sprintf("占用 UDP 端口 %d", fi.ListenPort)
+			}
+			fmt.Printf("  · %s（%s，%s，%d 个节点，地址 %v）\n", fi.Name, state, port, fi.PeerCount, fi.Addresses)
+		}
+		fmt.Println("  它们可能是早期版本卸载时没清理干净的残留，也可能是其它工具（如手工 wg-quick）在用。")
+		fmt.Println("  确认无用后可用：fnwg-cli cleanup-foreign <名称>  清理")
+	}
+	if rep.NAT.Active {
+		src := "无"
+		if len(rep.NAT.Sources) > 0 {
+			src = strings.Join(rep.NAT.Sources, "、")
+		}
+		wan := "无"
+		if len(rep.NAT.WANs) > 0 {
+			wan = strings.Join(rep.NAT.WANs, "、")
+		}
+		fmt.Printf("内网访问: 已开启（%s 的设备经 %s 访问 NAS 所在局域网）\n", src, wan)
+	} else if rep.NAT.Note != "" {
+		fmt.Println("内网访问: 异常 -", rep.NAT.Note)
+	} else {
+		fmt.Println("内网访问: 未开启（连进来的设备只能访问 NAS 本身）")
+	}
+	// 逐项自检：访问不了家里其它设备时，看哪一项是「未通过」
+	if len(rep.NAT.Checks) > 0 {
+		fmt.Println("内网访问链路自检:")
+		for _, c := range rep.NAT.Checks {
+			mark := "通过  "
+			if !c.OK {
+				mark = "未通过"
+			}
+			fmt.Printf("  [%s] %s：%s\n", mark, c.Label, c.Detail)
+			if !c.OK && c.Fix != "" {
+				fmt.Printf("            → %s\n", c.Fix)
+			}
+		}
+	}
 	fmt.Println("NAS 自身的上网路线:")
 	for _, d := range rep.Defaults {
 		fmt.Printf("  · dev=%s via=%s metric=%d\n", d.Dev, d.Gw, d.Metric)

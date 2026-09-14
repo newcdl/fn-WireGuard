@@ -403,7 +403,7 @@ func (s *Service) serverEndpoint(ctx context.Context, it *model.Interface) (stri
 	}
 	port := it.ListenPort
 	if port == 0 {
-		port = 51820
+		port = defaultListenPort
 	}
 	return net.JoinHostPort(ip, strconv.Itoa(port)),
 		"当前 Endpoint 使用自动探测的本机地址，公网访问请到系统设置中配置 DDNS 域名或公网 IP"

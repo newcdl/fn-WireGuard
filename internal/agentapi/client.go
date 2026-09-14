@@ -182,6 +182,17 @@ func (c *Client) CleanupNetwork(ctx context.Context) ([]string, error) {
 	return out.Actions, nil
 }
 
+// DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡（疑似残留）。
+func (c *Client) DeleteForeignInterface(ctx context.Context, name string) ([]string, error) {
+	var out struct {
+		Actions []string `json:"actions"`
+	}
+	if err := c.call(ctx, MethodNetDeleteForeign, DeleteForeignInterfaceParams{Name: name}, &out); err != nil {
+		return nil, err
+	}
+	return out.Actions, nil
+}
+
 // WaitReady 轮询等待代理就绪。
 func (c *Client) WaitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)

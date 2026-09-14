@@ -221,6 +221,116 @@ func TestValidation(t *testing.T) {
 	}
 }
 
+// TestInterfaceCrossConnectionConflicts 回归：监听端口重复与内部地址网段重叠
+// 必须在业务层就被拒绝并给出可读的中文提示，不能留到内核层才报错。
+func TestInterfaceCrossConnectionConflicts(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+
+	first, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, ListenPort: 51820,
+		Enabled: true, Autostart: true,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 端口与已有连接重复：提示应点名占用的连接
+	_, err = svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg1", Addresses: []string{"10.11.0.1/24"}, ListenPort: 51820,
+		Enabled: true, Autostart: true,
+	}, actor)
+	if err == nil || !strings.Contains(err.Error(), "51820") || !strings.Contains(err.Error(), "wg0") {
+		t.Fatalf("端口重复应被拒绝并提示占用的连接，实际: %v", err)
+	}
+
+	// 内部地址网段与已有连接重叠
+	_, err = svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg1", Addresses: []string{"10.10.0.5/24"}, ListenPort: 51821,
+		Enabled: true, Autostart: true,
+	}, actor)
+	if err == nil || !strings.Contains(err.Error(), "重叠") {
+		t.Fatalf("网段重叠应被拒绝，实际: %v", err)
+	}
+
+	// 不同协议族不算冲突（V6 网段与 V4 网段永远不重叠）
+	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg1", Addresses: []string{"fd00::1/64"}, ListenPort: 51821,
+		Enabled: true, Autostart: true,
+	}, actor); err != nil {
+		t.Fatalf("不同协议族不应判定为冲突: %v", err)
+	}
+
+	// 更新连接时不应与自身判定为冲突
+	if _, err := svc.UpdateInterface(ctx, first.ID, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, ListenPort: 51820,
+		MTU: 1420, DNSMode: "client", RouteTable: "off", Enabled: true, Autostart: true,
+	}, actor); err != nil {
+		t.Fatalf("更新自身不应报冲突: %v", err)
+	}
+}
+
+// TestInterfaceAutoAllocation 回归：地址与端口留空时应按连接序号自动错开，
+// 新建第二条连接不必手工改端口和网段。
+func TestInterfaceAutoAllocation(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+
+	// 名称、地址、端口全部留空 → 自动分配 wg0 / 10.10.0.1/24 / 51820
+	first, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: true, Autostart: true}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Name != "wg0" || first.ListenPort != 51820 || first.Addresses[0] != "10.10.0.1/24" {
+		t.Fatalf("首条连接的默认值不正确: %s %d %v", first.Name, first.ListenPort, first.Addresses)
+	}
+
+	// 第二条同样留空 → 名称顺延为 wg1，地址与端口同步递增，从源头避开冲突
+	second, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: true, Autostart: true}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Name != "wg1" || second.ListenPort != 51821 || second.Addresses[0] != "10.11.0.1/24" {
+		t.Fatalf("第二条连接的默认值未随名称递增: %s %d %v", second.Name, second.ListenPort, second.Addresses)
+	}
+
+	// 指定名称 wg5、地址与端口留空 → 按名称序号给出 10.15.0.1/24 + 51825
+	third, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg5", Enabled: true, Autostart: true,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.ListenPort != 51825 || third.Addresses[0] != "10.15.0.1/24" {
+		t.Fatalf("按名称序号分配不正确: %d %v", third.ListenPort, third.Addresses)
+	}
+
+	// 非 wgN 命名从 0 号位起顺延，跳过已被占用的端口与网段，而不是直接报冲突
+	fourth, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "office", Enabled: true, Autostart: true,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fourth.ListenPort != 51822 || fourth.Addresses[0] != "10.12.0.1/24" {
+		t.Fatalf("未跳过已占用的端口/网段: %d %v", fourth.ListenPort, fourth.Addresses)
+	}
+
+	// 用户显式指定的取值必须原样保留，不被自动分配覆盖
+	fifth, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "custom", ListenPort: 52000, Addresses: []string{"172.20.0.1/24"},
+		Enabled: true, Autostart: true,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fifth.ListenPort != 52000 || fifth.Addresses[0] != "172.20.0.1/24" {
+		t.Fatalf("显式指定的取值被覆盖: %d %v", fifth.ListenPort, fifth.Addresses)
+	}
+}
+
 func TestImportExportAndBackup(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()

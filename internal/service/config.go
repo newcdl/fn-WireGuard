@@ -49,9 +49,9 @@ func (s *Service) ImportConf(ctx context.Context, text, nameOverride string, a A
 	if f.Interface.Table != "" {
 		it.RouteTable = f.Interface.Table
 	}
-	s.applyInterfaceDefaults(it)
-	if it.ListenPort == 0 {
-		it.ListenPort = 51820
+	// 留空的地址与端口由 applyInterfaceDefaults 自动分配（并避开已有连接）
+	if err := s.applyInterfaceDefaults(ctx, it, 0); err != nil {
+		return nil, 0, err
 	}
 	if err := s.validateInterface(ctx, it, 0); err != nil {
 		return nil, 0, err

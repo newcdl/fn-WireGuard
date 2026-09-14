@@ -96,6 +96,7 @@ func (e *Engine) Desired(ctx context.Context) ([]model.InterfaceSpec, error) {
 			MTU:        it.MTU,
 			Addresses:  it.Addresses,
 			RouteTable: it.RouteTable,
+			AllowLAN:   it.AllowLAN,
 			Up:         it.Autostart,
 		}
 		peers, err := e.store.ListPeers(ctx, it.ID)
@@ -107,6 +108,7 @@ func (e *Engine) Desired(ctx context.Context) ([]model.InterfaceSpec, error) {
 				continue
 			}
 			spec.Peers = append(spec.Peers, model.PeerSpec{
+				Name:         p.Name,
 				PublicKey:    p.PublicKey,
 				PresharedKey: p.PresharedKey,
 				Endpoint:     p.EndpointString(),
@@ -174,6 +176,22 @@ func (e *Engine) RepairNetwork(ctx context.Context) ([]string, error) {
 			Result: "ok", Message: strings.Join(actions, "; "),
 		})
 	}
+	return actions, nil
+}
+
+// DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡（疑似历史残留）。
+// 具体的安全校验在数据面后端完成，这里只做转发与审计。
+func (e *Engine) DeleteForeignInterface(ctx context.Context, name string) ([]string, error) {
+	actions, err := e.back.DeleteForeignInterface(name)
+	if err != nil {
+		return actions, err
+	}
+	e.log.Warn("已清理疑似残留的 WireGuard 网卡", "name", name, "actions", strings.Join(actions, "; "))
+	_ = e.store.AddLog(ctx, "warn", "netguard", "清理疑似残留网卡 "+name, strings.Join(actions, "; "))
+	_ = e.store.AddAudit(ctx, &model.AuditEntry{
+		Action: "net.delete_foreign", TargetType: "interface", TargetID: name, Username: "system",
+		Result: "ok", Message: strings.Join(actions, "; "),
+	})
 	return actions, nil
 }
 

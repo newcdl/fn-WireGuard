@@ -31,7 +31,7 @@ func jsonStrings(s string) []string {
 // ---------------------------------------------------------------- 接口
 
 const ifaceCols = `id,name,uuid,private_key,listen_port,fwmark,mtu,addresses,dns,dns_mode,route_table,
-	pre_up,post_up,pre_down,post_down,enabled,autostart,revision,created_at,updated_at`
+	pre_up,post_up,pre_down,post_down,enabled,autostart,allow_lan,revision,created_at,updated_at`
 
 func (s *Store) scanInterface(sc interface{ Scan(...any) error }) (*model.Interface, error) {
 	var (
@@ -41,13 +41,14 @@ func (s *Store) scanInterface(sc interface{ Scan(...any) error }) (*model.Interf
 		dns       string
 		enabled   int
 		autostart int
+		allowLAN  int
 		createdAt string
 		updatedAt string
 	)
 	err := sc.Scan(&it.ID, &it.Name, &it.UUID, &privKey, &it.ListenPort, &it.FWMark, &it.MTU,
 		&addrs, &dns, &it.DNSMode, &it.RouteTable,
 		&it.PreUp, &it.PostUp, &it.PreDown, &it.PostDown,
-		&enabled, &autostart, &it.Revision, &createdAt, &updatedAt)
+		&enabled, &autostart, &allowLAN, &it.Revision, &createdAt, &updatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +56,7 @@ func (s *Store) scanInterface(sc interface{ Scan(...any) error }) (*model.Interf
 	it.DNS = jsonStrings(dns)
 	it.Enabled = enabled == 1
 	it.Autostart = autostart == 1
+	it.AllowLAN = allowLAN == 1
 	it.CreatedAt = parseTS(createdAt)
 	it.UpdatedAt = parseTS(updatedAt)
 	if s.box != nil && len(privKey) > 0 {
@@ -114,12 +116,12 @@ func (s *Store) CreateInterface(ctx context.Context, it *model.Interface) error 
 	it.Revision = 1
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO wg_interface(name,uuid,private_key,listen_port,fwmark,mtu,addresses,dns,dns_mode,route_table,
-		 pre_up,post_up,pre_down,post_down,enabled,autostart,revision,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 pre_up,post_up,pre_down,post_down,enabled,autostart,allow_lan,revision,created_at,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		it.Name, it.UUID, key, it.ListenPort, it.FWMark, it.MTU,
 		mustJSON(it.Addresses), mustJSON(it.DNS), it.DNSMode, it.RouteTable,
 		it.PreUp, it.PostUp, it.PreDown, it.PostDown,
-		b2i(it.Enabled), b2i(it.Autostart), it.Revision, ts(now), ts(now))
+		b2i(it.Enabled), b2i(it.Autostart), b2i(it.AllowLAN), it.Revision, ts(now), ts(now))
 	if err != nil {
 		return err
 	}
@@ -137,10 +139,12 @@ func (s *Store) UpdateInterface(ctx context.Context, it *model.Interface) error 
 	it.UpdatedAt = now
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE wg_interface SET name=?,private_key=?,listen_port=?,fwmark=?,mtu=?,addresses=?,dns=?,dns_mode=?,
-		 route_table=?,pre_up=?,post_up=?,pre_down=?,post_down=?,enabled=?,autostart=?,revision=revision+1,updated_at=?
+		 route_table=?,pre_up=?,post_up=?,pre_down=?,post_down=?,enabled=?,autostart=?,allow_lan=?,
+		 revision=revision+1,updated_at=?
 		 WHERE id=?`,
 		it.Name, key, it.ListenPort, it.FWMark, it.MTU, mustJSON(it.Addresses), mustJSON(it.DNS), it.DNSMode,
-		it.RouteTable, it.PreUp, it.PostUp, it.PreDown, it.PostDown, b2i(it.Enabled), b2i(it.Autostart), ts(now), it.ID)
+		it.RouteTable, it.PreUp, it.PostUp, it.PreDown, it.PostDown, b2i(it.Enabled), b2i(it.Autostart),
+		b2i(it.AllowLAN), ts(now), it.ID)
 	if err != nil {
 		return err
 	}

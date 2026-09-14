@@ -58,10 +58,10 @@
 
           <template v-if="netResult">
             <el-alert
-              :type="netResult.healthy ? 'success' : 'error'"
+              :type="netAlert.type"
               :closable="false"
               show-icon
-              :title="netResult.healthy ? '未发现影响 NAS 系统网络的问题' : '发现异常，建议立即修复'"
+              :title="netAlert.title"
               style="margin-top: 12px"
             />
             <ul class="fnwg-net-list">
@@ -76,6 +76,57 @@
             >
               立即修复
             </el-button>
+
+            <!-- 内网访问逐层诊断：把「连上了但访问不了家里其它设备」定位到具体环节 -->
+            <div v-if="netResult.nat?.checks?.length" class="fnwg-nat-checks">
+              <div class="fnwg-foreign-title">
+                内网访问诊断（设备访问家里其它设备）
+                <span v-if="natFailed" class="fnwg-nat-badge">有 {{ natFailed }} 项未通过</span>
+              </div>
+              <div v-for="c in netResult.nat.checks" :key="c.key" class="fnwg-nat-check">
+                <el-tag size="small" :type="c.ok ? 'success' : 'danger'" effect="plain">
+                  {{ c.ok ? '通过' : '未通过' }}
+                </el-tag>
+                <div class="fnwg-nat-check-body">
+                  <strong>{{ c.label }}</strong>
+                  <div class="fnwg-nat-check-detail">{{ c.detail }}</div>
+                  <div v-if="!c.ok && c.fix" class="fnwg-nat-check-fix">处理建议：{{ c.fix }}</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 疑似残留：内核里有、但本应用不认的 WireGuard 网卡。只提示，删除需用户手工确认名称 -->
+            <div v-if="netResult.foreign_interfaces?.length" class="fnwg-foreign-box">
+              <div class="fnwg-foreign-title">疑似残留网卡</div>
+              <div v-for="fi in netResult.foreign_interfaces" :key="fi.name" class="fnwg-foreign-item">
+                <div class="fnwg-foreign-main">
+                  <el-tag size="small" effect="plain" :type="fi.up ? 'warning' : 'info'">
+                    {{ fi.up ? '运行中' : '已停止' }}
+                  </el-tag>
+                  <strong>{{ fi.name }}</strong>
+                  <span class="fnwg-foreign-meta">
+                    {{ fi.listen_port > 0 ? `占用 UDP 端口 ${fi.listen_port}` : '未监听端口' }}
+                    · {{ fi.peer_count }} 个节点
+                    <template v-if="fi.addresses?.length">· {{ fi.addresses.join('、') }}</template>
+                  </span>
+                </div>
+                <el-button
+                  v-if="session.can('iface.write')"
+                  size="small"
+                  type="danger"
+                  plain
+                  :loading="removingForeign === fi.name"
+                  @click="removeForeign(fi)"
+                >
+                  清理
+                </el-button>
+              </div>
+              <div class="fnwg-foreign-hint">
+                这些网卡<b>不是本应用创建的</b>：可能是早期版本卸载时没清理干净的残留，
+                也可能是你用 wg-quick 等工具手工建的。残留会一直占着上面标注的端口，
+                导致新连接无法使用这些端口。<b>无法确认来源时请不要清理。</b>
+              </div>
+            </div>
           </template>
         </div>
 
@@ -338,7 +389,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Download, Refresh, Reading, CircleCheck, Search } from '@element-plus/icons-vue'
 import { api, download } from '@/api/client'
-import type { BackupRecord, Health, NetworkCheckResult, User } from '@/api/types'
+import type { BackupRecord, ForeignInterface, Health, NetworkCheckResult, User } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
@@ -360,9 +411,65 @@ const helpGroups = allHelpGroups
 const netResult = ref<NetworkCheckResult | null>(null)
 const checkingNet = ref(false)
 const repairingNet = ref(false)
+const removingForeign = ref('')
+
+/**
+ * 自检结论的呈现方式。
+ * 疑似残留网卡不算「异常」—— 它也可能真的在被别的工具使用，
+ * 因此只给中性提醒，不把整块自检标成红色。
+ */
+const netAlert = computed<{ type: 'success' | 'warning' | 'error' | 'info'; title: string }>(() => {
+  const r = netResult.value
+  if (!r) return { type: 'info', title: '' }
+  if (!r.healthy) return { type: 'error', title: '发现异常，建议立即修复' }
+  if (r.foreign_interfaces?.length) {
+    return { type: 'warning', title: '未发现路由异常，但有疑似残留网卡待你确认' }
+  }
+  return { type: 'success', title: '未发现影响 NAS 系统网络的问题' }
+})
 const netTone = computed(() =>
   !netResult.value ? '#909399' : netResult.value.healthy ? '#22c55e' : '#ef4444',
 )
+
+/** 内网访问自检里未通过的项数，0 表示这条链路完全就绪 */
+const natFailed = computed(
+  () => (netResult.value?.nat?.checks || []).filter((c) => !c.ok).length,
+)
+
+/**
+ * 清理疑似残留网卡。
+ * 这是应用里唯一能删除「非本应用创建」对象的操作，
+ * 因此强制用户手工输入网卡名二次确认；后端还会再校验一次名称与网卡类型。
+ */
+async function removeForeign(fi: ForeignInterface) {
+  const portTip = fi.listen_port > 0 ? `，并释放 UDP 端口 ${fi.listen_port}` : ''
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `将删除系统上的 WireGuard 网卡「${fi.name}」${portTip}。\n` +
+        '如果它其实正被其它工具（例如你自己写的 wg-quick 配置）使用，删除会中断该连接。\n\n' +
+        `请输入网卡名称「${fi.name}」以确认：`,
+      '清理疑似残留网卡',
+      {
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+        inputPlaceholder: fi.name,
+        inputValidator: (v: string) => (v === fi.name ? true : `请输入「${fi.name}」以确认`),
+      },
+    )
+    removingForeign.value = fi.name
+    const res = await api.post<{ actions: string[] }>('/system/network/foreign-interface/delete', {
+      name: fi.name,
+      confirm: value,
+    })
+    ElMessage.success(res.actions?.[0] || `已清理 ${fi.name}`)
+    await checkNetwork()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error((e as Error).message)
+  } finally {
+    removingForeign.value = ''
+  }
+}
 
 async function checkNetwork() {
   checkingNet.value = true
@@ -631,5 +738,92 @@ onMounted(async () => {
   font-size: 12.5px;
   line-height: 1.9;
   color: var(--el-text-color-regular);
+}
+
+.fnwg-foreign-box {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 10px;
+  background: var(--el-fill-color-lighter);
+}
+
+.fnwg-foreign-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.fnwg-foreign-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+  flex-wrap: wrap;
+}
+
+.fnwg-foreign-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.fnwg-foreign-meta {
+  color: var(--el-text-color-secondary);
+}
+
+.fnwg-foreign-hint {
+  margin-top: 8px;
+  font-size: 12.5px;
+  line-height: 1.85;
+  color: var(--el-text-color-regular);
+}
+
+.fnwg-nat-checks {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 10px;
+  background: var(--el-fill-color-lighter);
+}
+
+.fnwg-nat-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.fnwg-nat-check:first-of-type {
+  border-top: none;
+}
+
+.fnwg-nat-check-body {
+  font-size: 12.5px;
+  line-height: 1.8;
+  flex: 1;
+  min-width: 0;
+}
+
+.fnwg-nat-check-detail {
+  color: var(--el-text-color-regular);
+  word-break: break-word;
+}
+
+.fnwg-nat-check-fix {
+  color: var(--el-color-danger);
+  margin-top: 2px;
+}
+
+.fnwg-nat-badge {
+  margin-left: 8px;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--el-color-danger);
 }
 </style>

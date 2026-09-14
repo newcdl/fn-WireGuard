@@ -47,6 +47,19 @@
             ↓{{ formatBytes(row.rx_bytes) }} ↑{{ formatBytes(row.tx_bytes) }}
           </template>
         </el-table-column>
+        <el-table-column label="内网访问" width="112">
+          <template #default="{ row }">
+            <el-switch
+              :model-value="row.allow_lan"
+              :disabled="!session.can('iface.write')"
+              :loading="lanSaving === row.id"
+              inline-prompt
+              active-text="开"
+              inactive-text="关"
+              @change="(v: string | number | boolean) => toggleLan(row, !!v)"
+            />
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="gotoPeers(row)">设备</el-button>
@@ -106,6 +119,20 @@
           <span class="fnwg-kv-key">累计流量</span>
           <span class="fnwg-kv-val">↓ {{ formatBytes(row.rx_bytes) }}　↑ {{ formatBytes(row.tx_bytes) }}</span>
         </div>
+        <div class="fnwg-kv">
+          <span class="fnwg-kv-key">访问家里内网</span>
+          <span class="fnwg-kv-val">
+            <el-switch
+              :model-value="row.allow_lan"
+              :disabled="!session.can('iface.write')"
+              :loading="lanSaving === row.id"
+              inline-prompt
+              active-text="开"
+              inactive-text="关"
+              @change="(v: string | number | boolean) => toggleLan(row, !!v)"
+            />
+          </span>
+        </div>
 
         <template #actions>
           <el-button size="small" @click="gotoPeers(row)">设备</el-button>
@@ -145,7 +172,7 @@
           type="info"
           :closable="false"
           show-icon
-          title="下面的参数已按推荐值填好，不确定时直接保存即可"
+          title="连接名称、本机专用地址与服务端口都可以留空，系统会自动分配互不冲突的值；其余参数已按推荐值填好，不确定时直接保存即可"
           style="margin-bottom: 12px"
         />
 
@@ -163,7 +190,7 @@
 
         <el-form-item>
           <template #label><FieldLabel :meta="F.name" /></template>
-          <el-input v-model="form.name" placeholder="wg0" />
+          <el-input v-model="form.name" placeholder="留空自动分配（推荐）" />
           <FieldTips :meta="F.name" />
         </el-form-item>
 
@@ -175,7 +202,7 @@
             filterable
             allow-create
             default-first-option
-            placeholder="输入后回车，例如 10.10.0.1/24"
+            placeholder="留空自动分配（推荐），也可输入后回车，例如 10.10.0.1/24"
             style="width: 100%"
           />
           <FieldTips :meta="F.addresses" example />
@@ -183,7 +210,7 @@
 
         <el-form-item>
           <template #label><FieldLabel :meta="F.listen_port" /></template>
-          <el-input-number v-model="form.listen_port" :min="1" :max="65535" />
+          <el-input-number v-model="form.listen_port" :min="0" :max="65535" placeholder="留空自动分配" />
           <FieldTips :meta="F.listen_port" example />
         </el-form-item>
 
@@ -220,10 +247,16 @@
         <el-form-item>
           <template #label><FieldLabel :meta="F.route_table" /></template>
           <el-radio-group v-model="form.route_table">
-            <el-radio value="off" class="fnwg-radio-line">不管理（推荐）</el-radio>
-            <el-radio value="client" class="fnwg-radio-line">客户端模式</el-radio>
+            <el-radio value="off" class="fnwg-radio-line">不开启（推荐）</el-radio>
+            <el-radio value="client" class="fnwg-radio-line">开启（异地组网）</el-radio>
           </el-radio-group>
           <FieldTips :meta="F.route_table" example />
+        </el-form-item>
+
+        <el-form-item>
+          <template #label><FieldLabel :meta="F.allow_lan" /></template>
+          <el-switch v-model="form.allow_lan" active-text="开启" />
+          <FieldTips :meta="F.allow_lan" example />
         </el-form-item>
 
         <el-form-item>
@@ -343,12 +376,14 @@ const confText = ref('')
 const helpVisible = ref(false)
 const scenario = ref('home')
 
+// 名称、专用地址与服务端口刻意留空：由后端按连接序号自动分配，
+// 并避开已有连接占用的端口与网段（见 service.applyInterfaceDefaults）。
 const emptyForm = () => ({
   id: 0,
-  name: 'wg0',
-  listen_port: 51820,
+  name: '',
+  listen_port: undefined as number | undefined,
   mtu: 1420,
-  addresses: ['10.10.0.1/24'] as string[],
+  addresses: [] as string[],
   dns: ['223.5.5.5'] as string[],
   dns_mode: 'client' as string,
   route_table: 'off' as string,
@@ -356,7 +391,10 @@ const emptyForm = () => ({
   post_down: '',
   enabled: true,
   autostart: true,
+  // 默认开启内网访问：设备连回家就是为了访问 NAS 与家里其它设备
+  allow_lan: true,
 })
+const lanSaving = ref(0)
 const form = reactive(emptyForm())
 
 async function load() {
@@ -391,8 +429,33 @@ function openEdit(row: WgInterface) {
     post_down: row.post_down || '',
     enabled: row.enabled,
     autostart: row.autostart,
+    allow_lan: row.allow_lan ?? true,
   })
   drawerVisible.value = true
+}
+
+/** 一键切换「允许设备访问家里内网」，不必进编辑表单 */
+async function toggleLan(row: WgInterface, enabled: boolean) {
+  if (!enabled) {
+    const ok = await ElMessageBox.confirm(
+      `关闭后，连接到「${row.name}」的设备将只能访问 NAS 本身，\n无法再访问家里其它设备（电脑、打印机、路由器管理页等）。\n\n确认关闭？`,
+      '关闭内网访问',
+      { type: 'warning', confirmButtonText: '确认关闭', cancelButtonText: '保持开启' },
+    )
+      .then(() => true)
+      .catch(() => false)
+    if (!ok) return
+  }
+  lanSaving.value = row.id
+  try {
+    await api.post(`/interfaces/${row.id}/lan-access`, { enabled })
+    ElMessage.success(enabled ? '已开启：设备现在可以访问家里其它设备' : '已关闭内网访问')
+    await load()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    lanSaving.value = 0
+  }
 }
 
 /** 应用场景预设：只覆盖与该场景相关的字段 */
@@ -405,7 +468,7 @@ async function submit() {
   try {
     const payload = {
       name: form.name,
-      listen_port: form.listen_port,
+      listen_port: form.listen_port || 0,
       mtu: form.mtu,
       addresses: form.addresses,
       dns: form.dns,
@@ -415,6 +478,7 @@ async function submit() {
       post_down: form.post_down,
       enabled: form.enabled,
       autostart: form.autostart,
+      allow_lan: form.allow_lan,
     }
     if (form.id) {
       await api.patch(`/interfaces/${form.id}`, payload)

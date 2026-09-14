@@ -62,26 +62,29 @@ func PermissionsOf(role string) map[string]bool {
 
 // Interface 表示一个 WireGuard 接口（内核 link）。
 type Interface struct {
-	ID         int64     `json:"id"`
-	Name       string    `json:"name"`        // wg0
-	UUID       string    `json:"uuid"`        // 稳定标识，导出/导入时使用
-	PrivateKey string    `json:"private_key"` // 明文字段仅在明确授权时下发
-	ListenPort int       `json:"listen_port"`
-	FWMark     int       `json:"fwmark"`
-	MTU        int       `json:"mtu"`
-	Addresses  []string  `json:"addresses"`   // ["10.10.0.1/24","fd00::1/64"]
-	DNS        []string  `json:"dns"`         // 下发给客户端的 DNS
-	DNSMode    string    `json:"dns_mode"`    // client | host | off
-	RouteTable string    `json:"route_table"` // auto | off | <n>
-	PreUp      string    `json:"pre_up"`
-	PostUp     string    `json:"post_up"`
-	PreDown    string    `json:"pre_down"`
-	PostDown   string    `json:"post_down"`
-	Enabled    bool      `json:"enabled"`
-	Autostart  bool      `json:"autostart"`
-	Revision   int64     `json:"revision"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID         int64    `json:"id"`
+	Name       string   `json:"name"`        // wg0
+	UUID       string   `json:"uuid"`        // 稳定标识，导出/导入时使用
+	PrivateKey string   `json:"private_key"` // 明文字段仅在明确授权时下发
+	ListenPort int      `json:"listen_port"`
+	FWMark     int      `json:"fwmark"`
+	MTU        int      `json:"mtu"`
+	Addresses  []string `json:"addresses"`   // ["10.10.0.1/24","fd00::1/64"]
+	DNS        []string `json:"dns"`         // 下发给客户端的 DNS
+	DNSMode    string   `json:"dns_mode"`    // client | host | off
+	RouteTable string   `json:"route_table"` // auto | off | <n>
+	PreUp      string   `json:"pre_up"`
+	PostUp     string   `json:"post_up"`
+	PreDown    string   `json:"pre_down"`
+	PostDown   string   `json:"post_down"`
+	Enabled    bool     `json:"enabled"`
+	Autostart  bool     `json:"autostart"`
+	// AllowLAN 为真时启用「允许设备访问家里内网」：
+	// 为这条连接的隧道网段做源地址改写，让连进来的设备能访问局域网中的其它设备。
+	AllowLAN  bool      `json:"allow_lan"`
+	Revision  int64     `json:"revision"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	// 以下为运行时字段，不落库
 	PublicKey  string  `json:"public_key,omitempty"`
@@ -219,6 +222,29 @@ type NetworkReport struct {
 	Defaults []DefaultRoute `json:"defaults"`
 	// StrayDefaults 指向本应用接口的异常默认路由（会被自动清除）。
 	StrayDefaults []DefaultRoute `json:"stray_defaults"`
+	// ForeignInterfaces 内核里存在、但不属于本应用的 WireGuard 接口。
+	ForeignInterfaces []ForeignInterface `json:"foreign_interfaces"`
+	// NAT 内网访问（设备访问家里其它机器）的规则状态。
+	NAT NATStatus `json:"nat"`
+	// ForwardPolicyDrop 系统转发链策略是否为丢弃（装过 Docker 的机器常见），
+	// 为真时即使规则正确也可能被系统拦下。
+	ForwardPolicyDrop bool `json:"forward_policy_drop"`
+}
+
+// ForeignInterface 描述一个不是本应用创建的 WireGuard 接口。
+//
+// 典型来源：
+//   - 早期版本卸载时没清理干净的残留（netstate.json 丢失后本应用不再认领它）；
+//   - 用户手工用 wg-quick 或其他工具创建的接口。
+//
+// 这些接口会占住 UDP 端口，并让本应用无法使用同名接口（安全起见不接管他人对象）。
+// 本应用只做**只读上报**，删除必须由用户在界面上明确确认。
+type ForeignInterface struct {
+	Name       string   `json:"name"`
+	ListenPort int      `json:"listen_port"`
+	Up         bool     `json:"up"`
+	PeerCount  int      `json:"peer_count"`
+	Addresses  []string `json:"addresses"`
 }
 
 // DefaultRoute 是一条默认路由的描述。
@@ -312,12 +338,53 @@ type InterfaceSpec struct {
 	Addresses  []string
 	// RouteTable 取 off（默认，不动系统路由）或 client（本机作为客户端时才下发路由）。
 	RouteTable string
-	Up         bool
-	Peers      []PeerSpec
+	// AllowLAN 为真时启用内网访问：为这条连接的隧道网段做源地址改写，
+	// 让连进来的设备能够访问 NAS 所在局域网中的其它设备。
+	AllowLAN bool
+	Up       bool
+	Peers    []PeerSpec
+}
+
+// NATStatus 描述内网访问（NAT 转发）的当前状态，用于界面诊断。
+type NATStatus struct {
+	// Active 规则是否已生效。
+	Active bool `json:"active"`
+	// Sources 当前放行的源网段（各连接的隧道网段）。
+	Sources []string `json:"sources"`
+	// WANs 转发出口网卡。
+	WANs []string `json:"wans"`
+	// IPForward 内核是否允许转发（net.ipv4.ip_forward）。
+	// 为假时数据包在进入转发链之前就被丢掉，转发规则再正确也没用。
+	IPForward bool `json:"ip_forward"`
+	// IPForwardEnabledByUs 该开关是否由本应用开启。
+	IPForwardEnabledByUs bool `json:"ip_forward_enabled_by_us"`
+	// Note 异常说明（为空表示正常）。
+	Note string `json:"note,omitempty"`
+	// Checks 是内网访问链路的逐项自检结果。
+	// 「设备连上了但访问不了家里其它设备」在界面上只是一个现象，
+	// 成因可能有好几层，这里把每层都查一遍并给出修复建议。
+	Checks []NATCheck `json:"checks"`
+}
+
+// NATCheck 是内网访问链路上某一层的检查结果，用于把
+// 「设备连上了但访问不了家里其它设备」精确定位到具体环节。
+type NATCheck struct {
+	// Key 是检查项的稳定标识。
+	Key string `json:"key"`
+	// Label 是面向用户的名称。
+	Label string `json:"label"`
+	// OK 表示该项通过。
+	OK bool `json:"ok"`
+	// Detail 是实测到的具体情况。
+	Detail string `json:"detail"`
+	// Fix 是未通过时的处置建议（可为空）。
+	Fix string `json:"fix,omitempty"`
 }
 
 // PeerSpec 是下发给内核的节点期望态。
 type PeerSpec struct {
+	// Name 仅用于日志与提示（内核不认识节点名）。
+	Name         string
 	PublicKey    string
 	PresharedKey string
 	Endpoint     string

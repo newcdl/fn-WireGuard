@@ -64,6 +64,14 @@ type Backend interface {
 	ManagedInterfaces() []string
 	// Inspect 网络自检（只读）。
 	Inspect(ctx context.Context) (model.NetworkReport, error)
+	// DeleteForeignInterface 删除一个**不属于本应用**的 WireGuard 接口。
+	//
+	// 这是全项目唯一一处允许触碰非受管对象的能力，因此实现必须自校验：
+	// 只允许删除 link 类型为 wireguard 的接口，其它类型一律拒绝。
+	// 调用方（界面）还要用户输入接口名二次确认。
+	DeleteForeignInterface(name string) ([]string, error)
+	// NATStatus 返回内网访问规则当前的实际状态。
+	NATStatus() model.NATStatus
 }
 
 // findDevice 在快照中按名称查找接口状态。

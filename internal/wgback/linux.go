@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,11 +30,13 @@ type kernelBackend struct {
 	mu     sync.Mutex
 	client *wgctrl.Client
 	state  *State
+	// endpoints 缓存对端地址的 DNS 解析结果，见 resolveEndpoint。
+	endpoints map[string]endpointEntry
 }
 
 // New 创建内核态后端。statePath 用于记录受管对象与系统路由基线。
 func New(statePath string) Backend {
-	return &kernelBackend{state: LoadState(statePath)}
+	return &kernelBackend{state: LoadState(statePath), endpoints: map[string]endpointEntry{}}
 }
 
 func (b *kernelBackend) Kind() string { return "kernel" }
@@ -104,12 +107,23 @@ func (b *kernelBackend) Apply(specs []model.InterfaceSpec, opts ApplyOptions) (D
 	}
 
 	managed := map[string]bool{}
+	var failures []string
 	for _, spec := range specs {
 		managed[spec.Name] = true
 		if err := b.ensureOne(client, spec, opts, &diff); err != nil {
+			// 单条连接失败不阻断其余连接：否则系统里一个历史残留网卡
+			// （例如上一版卸载时没清干净的 wg0）就能让所有连接都无法下发。
+			failures = append(failures, fmt.Sprintf("%s：%v", spec.Name, err))
 			b.reset()
-			return diff, fmt.Errorf("接口 %s 收敛失败: %w", spec.Name, err)
+			continue
 		}
+	}
+	// 内网访问（NAT 转发）：按全部连接的期望态聚合，见 nat.go。
+	// 与单条连接是否成功无关，因此放在失败检查之前。
+	b.syncNATLocked(specs, opts, &diff)
+
+	if len(failures) > 0 {
+		return diff, fmt.Errorf("有 %d 条连接未能下发 —— %s", len(failures), strings.Join(failures, "；"))
 	}
 
 	if opts.RemoveMissing {
@@ -174,62 +188,17 @@ func (b *kernelBackend) ensureOne(client *wgctrl.Client, spec model.InterfaceSpe
 		}
 	}
 
-	// 接口与节点配置（ReplacePeers 保证节点集合与期望态严格一致）
-	cfg := wgtypes.Config{ReplacePeers: true}
-	if spec.PrivateKey != "" {
-		k, err := wgtypes.ParseKey(spec.PrivateKey)
-		if err != nil {
-			return fmt.Errorf("接口私钥非法: %w", err)
-		}
-		cfg.PrivateKey = &k
+	// 设备与节点配置：按增量下发（见 peerdiff.go）。
+	// 绝不再使用 ReplacePeers —— 内核收到它会执行 wg_peer_remove_all()，
+	// 清空重建全部节点，销毁会话密钥与动态学习到的 endpoint。
+	current, err := client.Device(spec.Name)
+	if err != nil {
+		// 刚创建、或用户态后端读不到时，退化为「全部按新增处理」
+		current = nil
 	}
-	if spec.ListenPort > 0 {
-		p := spec.ListenPort
-		cfg.ListenPort = &p
+	if err := b.syncDevice(client, spec, current, opts, diff); err != nil {
+		return err
 	}
-	fm := spec.FWMark
-	cfg.FirewallMark = &fm
-
-	peers := make([]wgtypes.PeerConfig, 0, len(spec.Peers))
-	for _, p := range spec.Peers {
-		pk, err := wgtypes.ParseKey(p.PublicKey)
-		if err != nil {
-			return fmt.Errorf("节点公钥非法: %w", err)
-		}
-		pc := wgtypes.PeerConfig{PublicKey: pk, ReplaceAllowedIPs: true}
-		if p.PresharedKey != "" {
-			psk, err := wgtypes.ParseKey(p.PresharedKey)
-			if err != nil {
-				return fmt.Errorf("预共享密钥非法: %w", err)
-			}
-			pc.PresharedKey = &psk
-		}
-		if p.Endpoint != "" {
-			if u, err := net.ResolveUDPAddr("udp", p.Endpoint); err == nil {
-				pc.Endpoint = u
-			}
-		}
-		if p.Keepalive > 0 {
-			d := time.Duration(p.Keepalive) * time.Second
-			pc.PersistentKeepaliveInterval = &d
-		}
-		for _, cidr := range p.AllowedIPs {
-			ip, ipnet, err := net.ParseCIDR(cidr)
-			if err != nil {
-				return fmt.Errorf("AllowedIPs %q 非法: %w", cidr, err)
-			}
-			ipnet.IP = ip
-			pc.AllowedIPs = append(pc.AllowedIPs, *ipnet)
-		}
-		peers = append(peers, pc)
-	}
-	cfg.Peers = peers
-	if !opts.DryRun {
-		if err := client.ConfigureDevice(spec.Name, cfg); err != nil {
-			return fmt.Errorf("下发配置失败: %w", err)
-		}
-	}
-	diff.Append("同步 %s 的 %d 个节点", spec.Name, len(peers))
 
 	// 地址
 	want, protected, err := parseAddrs(spec.Addresses)
@@ -261,6 +230,332 @@ func (b *kernelBackend) ensureOne(client *wgctrl.Client, spec model.InterfaceSpe
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------- 设备与节点增量下发
+
+// syncDevice 只下发与内核现状存在差异的部分。
+//
+// 这是「隧道不抖动」的关键：没有变化的节点与字段完全不进入下发请求，
+// 内核因此不会重置它的会话密钥与动态学习到的 endpoint；
+// 全部一致时连一次 ConfigureDevice 都不会调用。
+func (b *kernelBackend) syncDevice(client *wgctrl.Client, spec model.InterfaceSpec,
+	current *wgtypes.Device, opts ApplyOptions, diff *Diff) error {
+
+	cfg := wgtypes.Config{}
+	var notes []string
+
+	// 本机密钥：用公钥比较。内核在没有 CAP_NET_ADMIN 时不会回传私钥，
+	// 但公钥始终可读，用它判断可以避免「每轮都重设私钥」。
+	if spec.PrivateKey != "" {
+		k, err := wgtypes.ParseKey(spec.PrivateKey)
+		if err != nil {
+			return fmt.Errorf("接口私钥非法: %w", err)
+		}
+		if current == nil || current.PublicKey != k.PublicKey() {
+			cfg.PrivateKey = &k
+			notes = append(notes, "本机密钥")
+		}
+	}
+	// 服务端口：仅在变化时下发
+	if spec.ListenPort > 0 && (current == nil || current.ListenPort != spec.ListenPort) {
+		p := spec.ListenPort
+		cfg.ListenPort = &p
+		notes = append(notes, fmt.Sprintf("服务端口→%d", p))
+	}
+	// 防火墙标记：同样只在变化时下发（下发给 0 会清除已有标记）
+	if current == nil || current.FirewallMark != spec.FWMark {
+		cfg.FirewallMark = &spec.FWMark
+		if spec.FWMark != 0 {
+			notes = append(notes, fmt.Sprintf("防火墙标记→%d", spec.FWMark))
+		}
+	}
+
+	want, err := b.peerWants(spec, diff)
+	if err != nil {
+		return err
+	}
+	changes := DiffPeers(want, peerHaves(current), b.pskNeedsPush(spec))
+
+	added, updated, removed := 0, 0, 0
+	for _, c := range changes {
+		pc, err := b.toPeerConfig(spec, c)
+		if err != nil {
+			return err
+		}
+		cfg.Peers = append(cfg.Peers, pc)
+		switch c.Kind {
+		case PeerDiffAdd:
+			added++
+			diff.Append("新增节点 %s", peerLabel(spec, c.PublicKey))
+		case PeerDiffUpdate:
+			updated++
+			diff.Append("更新节点 %s（%s）", peerLabel(spec, c.PublicKey), strings.Join(c.Fields, "、"))
+		case PeerDiffRemove:
+			removed++
+			b.state.DropPskFingerprint(spec.Name, c.PublicKey)
+			diff.Append("移除节点 %s", peerLabel(spec, c.PublicKey))
+		}
+	}
+
+	if len(notes) == 0 && len(changes) == 0 {
+		// 与内核完全一致：一次下发都不做，节点会话与流量统计保持原样
+		return nil
+	}
+	if opts.DryRun {
+		diff.Append("（预演）%s 需要下发：%s", spec.Name, describeChanges(notes, added, updated, removed))
+		return nil
+	}
+	if err := client.ConfigureDevice(spec.Name, cfg); err != nil {
+		return fmt.Errorf("下发配置失败: %w", err)
+	}
+	b.rememberPSKFingerprints(spec)
+	diff.Append("已同步 %s（共 %d 个节点：新增 %d、更新 %d、移除 %d%s）",
+		spec.Name, len(want), added, updated, removed, notesSuffix(notes))
+	return nil
+}
+
+// peerWants 把期望态节点转成可比较形式，并带上解析后的对端地址。
+func (b *kernelBackend) peerWants(spec model.InterfaceSpec, diff *Diff) ([]PeerWant, error) {
+	out := make([]PeerWant, 0, len(spec.Peers))
+	for _, p := range spec.Peers {
+		if p.PublicKey == "" {
+			continue
+		}
+		ep := ""
+		if strings.TrimSpace(p.Endpoint) != "" {
+			// 收敛每 10 秒一轮，解析结果必须缓存：
+			// DNS 查询（尤其超时）会阻塞整轮收敛，表现为隧道延迟毛刺。
+			addr, err := b.resolveEndpoint(p.Endpoint)
+			if err != nil {
+				diff.Append("解析对端地址 %s 失败，本次跳过该字段：%v", p.Endpoint, err)
+			} else {
+				ep = addr
+			}
+		}
+		out = append(out, PeerWant{
+			PublicKey:    p.PublicKey,
+			Endpoint:     ep,
+			AllowedIPs:   p.AllowedIPs,
+			Keepalive:    p.Keepalive,
+			HasPreshared: strings.TrimSpace(p.PresharedKey) != "",
+		})
+	}
+	return out, nil
+}
+
+// peerHaves 把内核当前节点转成可比较形式。
+func peerHaves(dev *wgtypes.Device) []PeerHave {
+	if dev == nil {
+		return nil
+	}
+	out := make([]PeerHave, 0, len(dev.Peers))
+	for _, p := range dev.Peers {
+		h := PeerHave{
+			PublicKey:    p.PublicKey.String(),
+			Keepalive:    int(p.PersistentKeepaliveInterval.Seconds()),
+			HasPreshared: p.PresharedKey != wgtypes.Key{},
+		}
+		if p.Endpoint != nil {
+			h.Endpoint = p.Endpoint.String()
+		}
+		for _, n := range p.AllowedIPs {
+			h.AllowedIPs = append(h.AllowedIPs, n.String())
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// toPeerConfig 把一个变更转换为内核下发结构。
+func (b *kernelBackend) toPeerConfig(spec model.InterfaceSpec, c PeerDiff) (wgtypes.PeerConfig, error) {
+	pk, err := wgtypes.ParseKey(c.PublicKey)
+	if err != nil {
+		return wgtypes.PeerConfig{}, fmt.Errorf("节点公钥非法: %w", err)
+	}
+	pc := wgtypes.PeerConfig{PublicKey: pk}
+
+	if c.Kind == PeerDiffRemove {
+		pc.Remove = true
+		return pc, nil
+	}
+	if c.SetAllowedIPs {
+		// ReplaceAllowedIPs 只替换通行范围，不会重置会话
+		allowed, err := parseIPNets(c.AllowedIPs)
+		if err != nil {
+			return pc, err
+		}
+		pc.ReplaceAllowedIPs = true
+		pc.AllowedIPs = allowed
+	}
+	if c.SetEndpoint {
+		u, err := net.ResolveUDPAddr("udp", c.Endpoint)
+		if err != nil {
+			return pc, fmt.Errorf("对端地址 %q 非法: %w", c.Endpoint, err)
+		}
+		pc.Endpoint = u
+	}
+	if c.SetKeepalive {
+		d := time.Duration(c.Keepalive) * time.Second
+		pc.PersistentKeepaliveInterval = &d
+	}
+	if c.SetPresharedKey {
+		if c.PresharedWanted {
+			k, err := wgtypes.ParseKey(findPeerPSK(spec, c.PublicKey))
+			if err != nil {
+				return pc, fmt.Errorf("二次加密口令非法: %w", err)
+			}
+			pc.PresharedKey = &k
+		} else {
+			// 非 nil 的零值表示清除口令
+			zero := wgtypes.Key{}
+			pc.PresharedKey = &zero
+		}
+	}
+	return pc, nil
+}
+
+// parseIPNets 把 CIDR 字符串转成 net.IPNet 列表。
+func parseIPNets(list []string) ([]net.IPNet, error) {
+	out := make([]net.IPNet, 0, len(list))
+	for _, cidr := range list {
+		ip, ipnet, err := net.ParseCIDR(strings.TrimSpace(cidr))
+		if err != nil {
+			return nil, fmt.Errorf("通行范围 %q 非法: %w", cidr, err)
+		}
+		ipnet.IP = ip
+		out = append(out, *ipnet)
+	}
+	return out, nil
+}
+
+// pskNeedsPush 返回一个判断函数：该节点的二次加密口令是否需要重新下发。
+//
+// 内核不返回口令明文，只能靠本地指纹判断。两边都有口令且指纹一致时绝不重发，
+// 因为重新下发口令会让内核 wg_noise_expire_current_peer_keypairs()
+// 销毁该节点当前的会话密钥 —— 这正是早期版本「每轮重下发」造成掉线的另一个原因。
+func (b *kernelBackend) pskNeedsPush(spec model.InterfaceSpec) func(string) bool {
+	return func(publicKey string) bool {
+		raw := findPeerPSK(spec, publicKey)
+		if raw == "" {
+			return false
+		}
+		return b.state.PskFingerprint(spec.Name, publicKey) != pskFingerprint(raw)
+	}
+}
+
+// rememberPSKFingerprints 记录本次成功下发的口令指纹。
+func (b *kernelBackend) rememberPSKFingerprints(spec model.InterfaceSpec) {
+	changed := false
+	for _, p := range spec.Peers {
+		raw := strings.TrimSpace(p.PresharedKey)
+		if p.PublicKey == "" || raw == "" {
+			continue
+		}
+		fp := pskFingerprint(raw)
+		if b.state.PskFingerprint(spec.Name, p.PublicKey) != fp {
+			b.state.SetPskFingerprint(spec.Name, p.PublicKey, fp)
+			changed = true
+		}
+	}
+	if changed {
+		_ = b.state.Save()
+	}
+}
+
+// findPeerPSK 取出指定节点的二次加密口令明文。
+func findPeerPSK(spec model.InterfaceSpec, publicKey string) string {
+	for _, p := range spec.Peers {
+		if p.PublicKey == publicKey {
+			return strings.TrimSpace(p.PresharedKey)
+		}
+	}
+	return ""
+}
+
+// peerLabel 返回便于阅读的节点标识（优先用名称）。
+func peerLabel(spec model.InterfaceSpec, publicKey string) string {
+	for _, p := range spec.Peers {
+		if p.PublicKey != publicKey {
+			continue
+		}
+		if strings.TrimSpace(p.Name) != "" {
+			return fmt.Sprintf("%s（%s）", strings.TrimSpace(p.Name), shortKey(publicKey))
+		}
+		break
+	}
+	return shortKey(publicKey)
+}
+
+// shortKey 截取公钥前若干字符，便于在日志里辨认。
+func shortKey(key string) string {
+	if len(key) <= 12 {
+		return key
+	}
+	return key[:12] + "…"
+}
+
+func describeChanges(notes []string, added, updated, removed int) string {
+	parts := append([]string{}, notes...)
+	if added > 0 {
+		parts = append(parts, fmt.Sprintf("新增 %d 个节点", added))
+	}
+	if updated > 0 {
+		parts = append(parts, fmt.Sprintf("更新 %d 个节点", updated))
+	}
+	if removed > 0 {
+		parts = append(parts, fmt.Sprintf("移除 %d 个节点", removed))
+	}
+	if len(parts) == 0 {
+		return "无"
+	}
+	return strings.Join(parts, "、")
+}
+
+func notesSuffix(notes []string) string {
+	if len(notes) == 0 {
+		return ""
+	}
+	return "，" + strings.Join(notes, "、")
+}
+
+// 对端地址解析结果的缓存时长。
+//
+// 收敛循环每 10 秒一轮；如果每轮都对域名做 DNS 查询，
+// 一次超时（常见 3~5 秒）就会把整轮收敛拖住。
+const (
+	endpointTTL   = 5 * time.Minute
+	endpointRetry = 30 * time.Second
+)
+
+type endpointEntry struct {
+	addr    string
+	expires time.Time
+}
+
+// resolveEndpoint 解析对端地址（IP 或域名 + 端口），结果带缓存。
+func (b *kernelBackend) resolveEndpoint(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	now := time.Now()
+	if e, ok := b.endpoints[raw]; ok && now.Before(e.expires) && e.addr != "" {
+		return e.addr, nil
+	}
+	u, err := net.ResolveUDPAddr("udp", raw)
+	if err != nil {
+		// 解析失败时沿用上一次成功的地址：瞬时 DNS 故障不该把已配好的对端地址改坏。
+		// 同时缩短重试间隔，DNS 恢复后能尽快跟进。
+		if e, ok := b.endpoints[raw]; ok && e.addr != "" {
+			b.endpoints[raw] = endpointEntry{addr: e.addr, expires: now.Add(endpointRetry)}
+			return e.addr, nil
+		}
+		return "", err
+	}
+	addr := u.String()
+	b.endpoints[raw] = endpointEntry{addr: addr, expires: now.Add(endpointTTL)}
+	return addr, nil
 }
 
 // parseAddrs 把字符串地址转成 net.IPNet，并返回「受保护的网段」（接口自身网段）。
@@ -322,8 +617,11 @@ func (b *kernelBackend) syncAddrs(link netlink.Link, want map[string]*net.IPNet,
 	return nil
 }
 
-// syncRoutes 只做「新增」：是否新增、能新增哪些，全部由 PlanRoutes 决定。
-// 本函数不会修改或删除系统上的任何既有路由。
+// syncRoutes 依据 PlanRoutes 的结论下发路由。
+//
+// 铁规则 2/3：绝不创建、修改或删除系统主路由表里的任何条目。
+// 需要下发时（异地组网场景）一律写进本应用专用策略表并用 ip rule 限定目标网段，
+// 详见 policyroute.go —— 系统主表在整个生命周期里零改动。
 func (b *kernelBackend) syncRoutes(link netlink.Link, spec model.InterfaceSpec, protected []*net.IPNet,
 	opts ApplyOptions, diff *Diff) {
 
@@ -349,30 +647,176 @@ func (b *kernelBackend) syncRoutes(link netlink.Link, spec model.InterfaceSpec, 
 		HostNetworks:   hostNets,
 		ExistingRoutes: existing,
 	})
+	want := PlanPolicyRoutes(spec.Name, plan)
 
-	if !opts.DryRun {
-		for _, cidr := range plan.Add {
-			_, ipnet, err := net.ParseCIDR(cidr)
-			if err != nil {
-				continue
-			}
-			r := &netlink.Route{
-				LinkIndex: idx,
-				Dst:       ipnet,
-				Scope:     netlink.SCOPE_LINK,
-				Family:    familyOf(ipnet.IP),
-			}
-			// 铁规则 3：只用 RouteAdd（已存在会失败），绝不用 RouteReplace 覆盖系统路由。
-			if err := netlink.RouteAdd(r); err != nil {
-				diff.Append("跳过路由 %s：%v", cidr, err)
-				continue
-			}
-			diff.Append("添加路由 %s dev %s", cidr, spec.Name)
+	if opts.DryRun {
+		for _, pr := range want {
+			diff.Append("将添加策略路由 %s dev %s（专用表 %d）", pr.CIDR, spec.Name, pr.Table)
 		}
+	} else {
+		b.applyPolicyRoutesLocked(spec.Name, want, idx, diff)
 	}
 	if msg := DescribeSkip(plan.Skip); msg != "" {
 		diff.Append("为保护 NAS 系统网络，以下网段未添加路由：%s", msg)
 	}
+}
+
+// applyPolicyRoutesLocked 让某条连接的策略路由与期望态一致：补齐缺失的、清除多余的。
+// 只处理状态文件里记录过的条目，绝不动别人的规则。
+func (b *kernelBackend) applyPolicyRoutesLocked(dev string, want []PolicyRoute, linkIndex int, diff *Diff) {
+	keep := make(map[string]bool, len(want))
+	for _, pr := range want {
+		keep[pr.CIDR] = true
+	}
+	// 先清理：连接关掉「异地组网」后，旧规则必须撤销，否则会一直对目标网段生效
+	for _, pr := range b.state.PolicyRoutesFor(dev) {
+		if keep[pr.CIDR] {
+			continue
+		}
+		action, err := b.removePolicyRoute(pr)
+		if err != nil {
+			diff.Append("撤销策略路由 %s 失败：%v", pr.CIDR, err)
+			continue
+		}
+		if action != "" {
+			diff.Append("%s", action)
+		}
+	}
+	// 再补齐
+	for _, pr := range want {
+		if b.state.HasPolicyRoute(dev, pr.CIDR) {
+			continue
+		}
+		if err := b.addPolicyRoute(pr, linkIndex); err != nil {
+			diff.Append("添加策略路由 %s 失败：%v", pr.CIDR, err)
+			continue
+		}
+		b.state.MarkPolicyRoute(pr)
+		diff.Append("添加策略路由 %s dev %s（专用表 %d，未改动系统主路由表）", pr.CIDR, dev, pr.Table)
+	}
+	_ = b.state.Save()
+}
+
+// addPolicyRoute 下发一条策略路由：先补 ip rule，再写专用表。
+//
+// 顺序很重要：没有规则指向该表时，表里的路由不会被任何流量查到。
+// 先补规则可以保证不会出现「路由已写但规则缺失」的中间态。
+func (b *kernelBackend) addPolicyRoute(pr PolicyRoute, linkIndex int) error {
+	_, ipnet, err := net.ParseCIDR(pr.CIDR)
+	if err != nil {
+		return err
+	}
+	fam := netlinkFamily(pr.Family)
+	if err := b.ensurePolicyRule(ipnet, pr.Table, fam); err != nil {
+		return err
+	}
+	r := &netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       ipnet,
+		Scope:     netlink.SCOPE_LINK,
+		Table:     pr.Table,
+		Family:    fam,
+	}
+	// 只新增不覆盖：表内已有同目标时 RouteAdd 返回 EEXIST，视为已完成。
+	if err := netlink.RouteAdd(r); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return nil
+}
+
+// ensurePolicyRule 确保存在「目标网段 → 专用表」的规则，已存在则跳过。
+func (b *kernelBackend) ensurePolicyRule(dst *net.IPNet, table, fam int) error {
+	if rules, err := netlink.RuleList(fam); err == nil {
+		for i := range rules {
+			if rules[i].Table == table && sameNet(rules[i].Dst, dst) {
+				return nil
+			}
+		}
+	}
+	rule := netlink.NewRule()
+	rule.Family = fam
+	rule.Table = table
+	rule.Priority = policyRulePriority
+	rule.Dst = dst
+	if err := netlink.RuleAdd(rule); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return nil
+}
+
+// removePolicyRoute 撤销一条策略路由：先摘规则，再删表内路由，最后同步状态记录。
+func (b *kernelBackend) removePolicyRoute(pr PolicyRoute) (string, error) {
+	_, ipnet, err := net.ParseCIDR(pr.CIDR)
+	if err != nil {
+		b.state.UnmarkPolicyRoute(pr.Dev, pr.CIDR)
+		_ = b.state.Save()
+		return "", nil
+	}
+	fam := netlinkFamily(pr.Family)
+	if err := b.removePolicyRule(ipnet, pr.Table, fam); err != nil {
+		return "", err
+	}
+	del := &netlink.Route{Dst: ipnet, Table: pr.Table, Family: fam}
+	if err := netlink.RouteDel(del); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	b.state.UnmarkPolicyRoute(pr.Dev, pr.CIDR)
+	_ = b.state.Save()
+	return fmt.Sprintf("已撤销策略路由 %s（专用表 %d）", pr.CIDR, pr.Table), nil
+}
+
+// removePolicyRule 按内核中的实际条目删除规则（先列举再删除，避免构造不匹配）。
+func (b *kernelBackend) removePolicyRule(dst *net.IPNet, table, fam int) error {
+	rules, err := netlink.RuleList(fam)
+	if err != nil {
+		return err
+	}
+	for i := range rules {
+		if rules[i].Table != table || !sameNet(rules[i].Dst, dst) {
+			continue
+		}
+		r := rules[i]
+		if err := netlink.RuleDel(&r); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// clearPolicyRoutesLocked 撤销某条连接（name 为空表示全部）下发的策略路由与 ip rule。
+// 停用、删除连接、卸载以及接口已消失时都会调用，确保不留下影响系统的残留规则。
+func (b *kernelBackend) clearPolicyRoutesLocked(name string) []string {
+	var actions []string
+	for _, pr := range b.state.PolicyRoutesCopy() {
+		if name != "" && pr.Dev != name {
+			continue
+		}
+		action, err := b.removePolicyRoute(pr)
+		if err != nil {
+			actions = append(actions, fmt.Sprintf("撤销策略路由 %s 失败：%v", pr.CIDR, err))
+			continue
+		}
+		if action != "" {
+			actions = append(actions, action)
+		}
+	}
+	return actions
+}
+
+// sameNet 比较两个网段是否等价（忽略主机位）。
+func sameNet(a, b *net.IPNet) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return maskedCIDR(a) == maskedCIDR(b)
+}
+
+// netlinkFamily 把 4/6 映射为 netlink 协议族常量。
+func netlinkFamily(f int) int {
+	if f == 6 {
+		return netlink.FAMILY_V6
+	}
+	return netlink.FAMILY_V4
 }
 
 // hostRouteContext 收集主机上（排除本接口）的网段与既有路由。
@@ -422,6 +866,31 @@ func maskedCIDR(n *net.IPNet) string {
 		return ""
 	}
 	return (&net.IPNet{IP: n.IP.Mask(n.Mask), Mask: n.Mask}).String()
+}
+
+// eachRoute 遍历系统**全部路由表**中的路由。
+//
+// 两个必须显式处理的细节（netlink 库的默认行为对我们都不合适）：
+//  1. 默认会跳过非 main 表。而策略路由、多出口分流会把默认路由放进自定义表，
+//     只看 main 表就会得出「没有默认路由」的错误结论（内网访问转不出去即源于此）。
+//     传 RT_FILTER_TABLE + 通配表号（Route.Table 为 0，即 RT_TABLE_UNSPEC）表示「任意表」。
+//  2. 用 Iter 版本逐条交付：内核在 dump 途中被打断（NLM_F_DUMP_INTR，例如 Docker
+//     正在增删路由）时，已经读到的部分仍然有效，不该整批丢弃。
+//
+// 传输途中被打断产生的 ErrDumpInterrupted 会被忽略：已交付的部分对调用方仍然可用。
+func eachRoute(family int, f func(netlink.Route)) error {
+	err := netlink.RouteListFilteredIter(
+		family,
+		&netlink.Route{Table: 0},
+		netlink.RT_FILTER_TABLE,
+		func(r netlink.Route) bool {
+			f(r)
+			return true
+		})
+	if errors.Is(err, netlink.ErrDumpInterrupted) {
+		return nil
+	}
+	return err
 }
 
 func cidrStrings(list []*net.IPNet) []string {
@@ -495,8 +964,10 @@ func (b *kernelBackend) healLocked() ([]string, error) {
 		if l, err := netlink.LinkByName(name); err == nil {
 			managed[l.Attrs().Index] = name
 		} else {
-			// 接口已不存在，清理记录
+			// 接口已不存在，清理记录，并撤销它可能留下的 ip rule 与口令指纹
+			actions = append(actions, b.clearPolicyRoutesLocked(name)...)
 			b.state.UnmarkManaged(name)
+			b.state.DropPskFingerprints(name)
 		}
 	}
 	if err := b.state.Save(); err != nil {
@@ -586,6 +1057,90 @@ func (b *kernelBackend) restoreBaselineLocked() []string {
 	return actions
 }
 
+// foreignInterfacesLocked 列出内核里存在、但不属于本应用的 WireGuard 接口。
+// 只读，不做任何修改。
+func (b *kernelBackend) foreignInterfacesLocked(managed map[int]string) []model.ForeignInterface {
+	out := []model.ForeignInterface{}
+	links, err := netlink.LinkList()
+	if err != nil {
+		return out
+	}
+	client, cerr := b.conn()
+	for _, l := range links {
+		// 只看 WireGuard 类型的网卡，绝不把普通网卡当作疑似残留上报
+		if l.Type() != "wireguard" {
+			continue
+		}
+		if _, ours := managed[l.Attrs().Index]; ours {
+			continue
+		}
+		name := l.Attrs().Name
+		if b.state.IsManaged(name) {
+			continue
+		}
+		fi := model.ForeignInterface{
+			Name: name,
+			Up:   l.Attrs().Flags&net.FlagUp != 0,
+		}
+		if addrs, err := netlink.AddrList(l, netlink.FAMILY_ALL); err == nil {
+			for _, a := range addrs {
+				if a.IPNet != nil && !a.IPNet.IP.IsLinkLocalUnicast() {
+					fi.Addresses = append(fi.Addresses, a.IPNet.String())
+				}
+			}
+		}
+		if cerr == nil {
+			if dev, err := client.Device(name); err == nil {
+				fi.ListenPort = dev.ListenPort
+				fi.PeerCount = len(dev.Peers)
+			}
+		}
+		out = append(out, fi)
+	}
+	return out
+}
+
+// DeleteForeignInterface 删除疑似残留的 WireGuard 接口。
+//
+// 这是全项目唯一一处会触碰「非本应用创建」对象的能力，因此设了三道闸：
+//  1. 必须是 link 类型为 wireguard 的接口 —— 普通网卡、网桥、VLAN 一律拒绝；
+//  2. 已在受管列表里的接口必须走正常删除流程，这里直接拒绝，避免绕过状态记录；
+//  3. 调用方（界面）还要求用户输入接口名二次确认。
+func (b *kernelBackend) DeleteForeignInterface(name string) ([]string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("请指定要删除的网卡名称")
+	}
+	if b.state.IsManaged(name) {
+		return nil, fmt.Errorf("%s 是本应用创建的连接，请到「我的连接」里删除它", name)
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		var notFound netlink.LinkNotFoundError
+		if errors.As(err, &notFound) {
+			return []string{fmt.Sprintf("%s 已不存在，无需清理", name)}, nil
+		}
+		return nil, err
+	}
+	if kind := link.Type(); kind != "wireguard" {
+		return nil, fmt.Errorf("%s 的类型是 %q，不是 WireGuard 网卡，本应用拒绝删除", name, kind)
+	}
+
+	var actions []string
+	// 顺手撤销本应用记录过的、与该名称相关的策略路由
+	actions = append(actions, b.clearPolicyRoutesLocked(name)...)
+	if err := netlink.LinkDel(link); err != nil {
+		return actions, fmt.Errorf("删除 %s 失败: %w", name, err)
+	}
+	b.state.DropPskFingerprints(name)
+	_ = b.state.Save()
+	actions = append(actions, fmt.Sprintf("已删除残留网卡 %s，其占用的端口已释放", name))
+	return actions, nil
+}
+
 // DeleteInterface 删除接口。
 func (b *kernelBackend) DeleteInterface(name string) error {
 	b.mu.Lock()
@@ -608,10 +1163,14 @@ func (b *kernelBackend) deleteLocked(name string) error {
 		}
 		return err
 	}
+	// 先撤销该连接的策略路由与 ip rule，再删网卡：
+	// 网卡一删，它在专用表里的路由会随之消失，但 ip rule 会留下，必须自己清掉。
+	b.clearPolicyRoutesLocked(name)
 	if err := netlink.LinkDel(link); err != nil {
 		return fmt.Errorf("删除接口 %s 失败: %w", name, err)
 	}
 	b.state.UnmarkManaged(name)
+	b.state.DropPskFingerprints(name)
 	_ = b.state.Save()
 	return nil
 }
@@ -622,6 +1181,14 @@ func (b *kernelBackend) Cleanup(ctx context.Context) ([]string, error) {
 	defer b.mu.Unlock()
 
 	var actions []string
+	// 先撤掉内网访问规则（专用表 + 系统链里带标记的放行规则），再删接口
+	if b.clearNATLocked() {
+		actions = append(actions, "已移除内网访问转发规则")
+		b.state.SetNAT("", nil, nil)
+		_ = b.state.Save()
+	}
+	// 再摘掉全部策略路由与 ip rule，确保卸载后内核里不留任何本应用的痕迹
+	actions = append(actions, b.clearPolicyRoutesLocked("")...)
 	for _, name := range b.state.ManagedCopy() {
 		actions = append(actions, fmt.Sprintf("删除本应用创建的接口 %s", name))
 		if err := b.deleteLocked(name); err != nil {
@@ -719,29 +1286,31 @@ func (b *kernelBackend) Inspect(ctx context.Context) (model.NetworkReport, error
 			managed[l.Attrs().Index] = name
 		}
 	}
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
-	if err != nil {
-		return rep, err
-	}
-	for _, r := range routes {
-		if r.Dst != nil {
-			continue
+	// 疑似残留：内核里有、但本应用不认的 WireGuard 网卡（只读上报，绝不自动处理）
+	rep.ForeignInterfaces = b.foreignInterfacesLocked(managed)
+	// 内网访问规则状态与系统转发策略（用于诊断「连上了但访问不了其它设备」）
+	rep.NAT = b.natStatusLocked()
+	rep.ForwardPolicyDrop = b.systemForwardPolicyDropLocked()
+
+	// 默认路由同样要读全部路由表：只看 main 表会漏掉策略路由 / 多出口分流下的默认路由，
+	// 让用户看到「系统没有默认路由」，而实际上有一条，只是不在 main 表里。
+	_ = eachRoute(netlink.FAMILY_ALL, func(r netlink.Route) {
+		if !isDefaultRoute(r) {
+			return
 		}
 		entry := model.DefaultRoute{Family: r.Family, Metric: r.Priority, Table: r.Table}
 		if r.Gw != nil {
 			entry.Gw = r.Gw.String()
 		}
-		if l, err := netlink.LinkByIndex(r.LinkIndex); err == nil {
-			entry.Dev = l.Attrs().Name
-		}
+		entry.Dev = routeDevName(r)
 		if name, ours := managed[r.LinkIndex]; ours {
 			entry.OwnedByUs = true
 			entry.Dev = name
 			rep.StrayDefaults = append(rep.StrayDefaults, entry)
-			continue
+			return
 		}
 		rep.Defaults = append(rep.Defaults, entry)
-	}
+	})
 	return rep, nil
 }
 

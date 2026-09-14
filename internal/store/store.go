@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS wg_interface (
   post_down   TEXT    NOT NULL DEFAULT '',
   enabled     INTEGER NOT NULL DEFAULT 1,
   autostart   INTEGER NOT NULL DEFAULT 1,
+  allow_lan   INTEGER NOT NULL DEFAULT 0,
   revision    INTEGER NOT NULL DEFAULT 1,
   created_at  TEXT    NOT NULL,
   updated_at  TEXT    NOT NULL
@@ -177,6 +178,9 @@ func (s *Store) migrate() error {
 	for _, c := range []struct{ table, column, ddl string }{
 		{"wg_peer", "route_mode", `ALTER TABLE wg_peer ADD COLUMN route_mode TEXT NOT NULL DEFAULT 'lan'`},
 		{"wg_peer", "client_ips", `ALTER TABLE wg_peer ADD COLUMN client_ips TEXT NOT NULL DEFAULT '[]'`},
+		// 内网访问开关：历史数据默认关闭，避免升级即改用户的网络；
+		// 新建连接时由服务层默认开启。
+		{"wg_interface", "allow_lan", `ALTER TABLE wg_interface ADD COLUMN allow_lan INTEGER NOT NULL DEFAULT 0`},
 	} {
 		if err := s.ensureColumn(c.table, c.column, c.ddl); err != nil {
 			return err

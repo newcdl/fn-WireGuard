@@ -185,6 +185,21 @@ func (s *Server) dispatch(conn net.Conn, req *Request) Response {
 		resp.OK = true
 		resp.Result = mustJSON(map[string]any{"actions": actions})
 		return resp
+	case MethodNetDeleteForeign:
+		var p DeleteForeignInterfaceParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(resp, errors.New("参数解析失败"))
+		}
+		if err := validateIfaceName(p.Name); err != nil {
+			return fail(resp, err)
+		}
+		actions, err := s.handler.DeleteForeignInterface(ctx, p.Name)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(map[string]any{"actions": actions})
+		return resp
 	case MethodDeleteInterface:
 		var p DeleteInterfaceParams
 		if err := json.Unmarshal(req.Params, &p); err != nil {

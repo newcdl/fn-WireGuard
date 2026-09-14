@@ -52,3 +52,8 @@ func (l *Local) RepairNetwork(ctx context.Context) ([]string, error) {
 func (l *Local) CleanupNetwork(ctx context.Context) ([]string, error) {
 	return l.Eng.CleanupNetwork(ctx)
 }
+
+// DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡。
+func (l *Local) DeleteForeignInterface(ctx context.Context, name string) ([]string, error) {
+	return l.Eng.DeleteForeignInterface(ctx, name)
+}

@@ -8,8 +8,8 @@ import (
 
 // 本文件是「绝不破坏 NAS 系统网络」的核心防线。
 //
-// 全部决策都在 PlanRoutes 这个纯函数里完成，不依赖系统状态，可被单元测试穷举覆盖：
-// 只有同时满足下面所有条件的网段，才允许被写进主机的路由表：
+// 全部决策都在 PlanRoutes 这个纯函数里完成，不依赖系统状态，可被单元测试穷举覆盖。
+// 只有同时满足下面所有条件的网段，才允许被下发：
 //   1. 显式开启了路由管理（默认关闭）；
 //   2. 不是默认路由 0.0.0.0/0 或 ::/0 —— 主机默认路由永远归系统所有；
 //   3. 与本接口自身网段不重叠；
@@ -17,6 +17,10 @@ import (
 //   5. 主机上不存在同目标的路由（存在即跳过，绝不覆盖，等价于 wg-quick 的 route add 语义）。
 //
 // 任何一条不满足都只记录原因并跳过，绝不返回错误中断，更不会去改动系统已有路由。
+//
+// 另外，即便全部条件满足要被下发，也**不会写进系统主路由表**：
+// 下发目标一律是本应用专用的策略路由表，并用 ip rule 只对目标网段生效，
+// 详见 policyroute.go。这样 `ip route show` 与安装前完全一致。
 
 // HostRoute 是主机上已存在的一条路由。
 type HostRoute struct {
@@ -67,17 +71,28 @@ func IsDefaultRouteCIDR(cidr string) bool {
 // PlanRoutes 计算允许下发的路由清单。
 func PlanRoutes(in RoutePlanInput) RoutePlan {
 	plan := RoutePlan{}
+	ifaceNets := parseCIDRs(in.InterfaceAddrs)
+
 	if !in.ManageRoutes {
 		// 默认路径：完全不动系统路由。
-		for _, cidr := range in.PeerAllowedIPs {
-			if strings.TrimSpace(cidr) != "" {
-				plan.Skip = append(plan.Skip, RouteSkip{CIDR: cidr, Reason: "路由管理未开启，本应用不修改系统路由"})
+		//
+		// 这里只汇报「用户确实需要知道」的网段：落点在本连接自身网段内的地址，
+		// 已经被内核为该网卡自动建立的直连路由覆盖（例如 wg200 配了 10.210.0.1/24，
+		// 设备地址 10.210.0.2 就在这条直连路由里），本来就不需要任何动作，
+		// 因此不产生提示，避免把正常运行状态写成「警告」吓到用户。
+		for _, raw := range in.PeerAllowedIPs {
+			cidr := strings.TrimSpace(raw)
+			if cidr == "" {
+				continue
 			}
+			if _, n, err := net.ParseCIDR(cidr); err == nil && coveredBy(ifaceNets, n) {
+				continue
+			}
+			plan.Skip = append(plan.Skip, RouteSkip{CIDR: cidr, Reason: "路由管理未开启，本应用不修改系统路由"})
 		}
 		return plan
 	}
 
-	ifaceNets := parseCIDRs(in.InterfaceAddrs)
 	hostNets := parseCIDRs(in.HostNetworks)
 
 	// 主机上已存在的目标（含默认路由），绝不覆盖
@@ -155,6 +170,31 @@ func overlapsAny(target *net.IPNet, list []*net.IPNet) bool {
 			continue
 		}
 		if n.Contains(target.IP) || target.Contains(n.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+// coveredBy 判断目标网段是否已被 list 中某个网段的直连路由**完整**覆盖。
+//
+// 与 overlapsAny 的区别：overlapsAny 只要沾边就算命中（用于「保守拒绝下发」），
+// 而这里要求 list 中的网段前缀不长于目标网段且包含其起始地址，
+// 也就是「目标里的每一个地址都在这条直连路由里」。例如：
+//
+//	接口 10.210.0.1/24 + 目标 10.210.0.2/32 → 被覆盖（直连路由已够用）
+//	接口 10.210.0.1/24 + 目标 10.210.0.0/16 → 未被覆盖（还有 10.211.x.x 等也在这个目标里）
+func coveredBy(list []*net.IPNet, target *net.IPNet) bool {
+	if target == nil {
+		return false
+	}
+	to, _ := target.Mask.Size()
+	for _, n := range list {
+		if (n.IP.To4() == nil) != (target.IP.To4() == nil) {
+			continue
+		}
+		no, _ := n.Mask.Size()
+		if no <= to && n.Contains(target.IP) {
 			return true
 		}
 	}

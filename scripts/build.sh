@@ -84,6 +84,16 @@ package_fpk() {
         warn "下载: https://static2.fnnas.com/fnpack/fnpack-1.2.3-<darwin|linux>-<amd64|arm64>"
         return 0
     fi
+    # 约定：有任何改动都应先 bump 版本再打包，这样设备上装的版本与日志/更新说明始终对得上。
+    # 只在本次构建的第一个架构上提示，避免 all 模式下第二个架构被误报。
+    if [ -z "${VERSION_GUARD_DONE:-}" ]; then
+        VERSION_GUARD_DONE=1
+        if compgen -G "${DIST_DIR}/${APP_NAME}-${VERSION}-*.fpk" >/dev/null 2>&1; then
+            warn "版本 ${VERSION} 已有安装包，本次会覆盖它"
+            warn "如果这是一次新的改动，请先执行：./scripts/version.sh patch \"改动说明\""
+        fi
+    fi
+
     log "打包 ${arch} 安装包（$("$fnpack" --help 2>&1 | sed -n 's/^Version //p' | head -1)）"
 
     local stage_root="${DIST_DIR}/stage-${arch}"

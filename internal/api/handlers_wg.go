@@ -94,6 +94,27 @@ func (s *Server) handleToggleInterface(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"enabled": in.Enabled})
 }
 
+// handleSetLanAccess 切换「允许设备访问家里内网」。
+func (s *Server) handleSetLanAccess(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	it, err := s.svc.SetLanAccess(r.Context(), id, in.Enabled, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, it)
+}
+
 func (s *Server) handleApplyInterface(w http.ResponseWriter, r *http.Request) {
 	actions, err := s.svc.ReconcileNow(r.Context())
 	if err != nil {
