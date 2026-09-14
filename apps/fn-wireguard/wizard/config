@@ -1,0 +1,17 @@
+[
+  {
+    "stepTitle": "客户端接入",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_endpoint",
+        "label": "服务端对外地址（公网域名或 IP）"
+      },
+      {
+        "type": "text",
+        "field": "wizard_dns",
+        "label": "下发给客户端的默认 DNS"
+      }
+    ]
+  }
+]

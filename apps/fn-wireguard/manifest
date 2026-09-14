@@ -1,0 +1,17 @@
+appname               = fn-wireguard
+version               = 0.3.0
+display_name          = WireGuard 管理
+desc                  = 飞牛原生 WireGuard 配置管理工具。以数据库中的期望态为唯一事实来源，通过 netlink 幂等收敛到内核：支持接口与节点全生命周期管理、密钥托管与二维码下发、路由与 DNS 配置、流量实时监控、配置导入导出与备份恢复、用户权限与审计日志；配置修改后自动下发，系统重启后自动恢复。
+platform              = x86
+source                = thirdparty
+maintainer            = newcdl
+distributor           = newcdl
+os_min_version        = 0.9.0
+desktop_uidir         = ui
+desktop_applaunchname = fn-wireguard.Application
+service_port          = 34567
+checkport             = true
+ctl_stop              = true
+size                  = 30
+labels                = 网络,工具,WireGuard
+changelog             = 0.3.0 安全修复版（重要）：彻底修复早期版本可能抢占 NAS 系统默认路由、导致 FN Connect 等系统功能断网的问题——默认不再管理本机路由、禁止下发默认路由、不再覆盖任何已有路由、拒绝接管非本应用创建的网卡、启动自动自愈残留、停用与卸载自动清理内核痕迹；设备「上网方式」与服务端准入彻底分离（历史危险配置自动转换）；修复「配置说明」入口点击后页面空白；新增 NAS 系统网络安全检查与一键修复。0.2.0 界面重构（手机适配与通俗化说明）。0.1.0 首个测试版。

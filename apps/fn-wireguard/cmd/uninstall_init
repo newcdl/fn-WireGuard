@@ -1,0 +1,12 @@
+#!/bin/bash
+# 卸载前置：停止服务。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-uninstall.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+fnwg_log "停止 fn-WireGuard 服务"
+fnwg_stop
+exit 0

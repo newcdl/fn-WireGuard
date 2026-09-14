@@ -1,0 +1,34 @@
+#!/bin/bash
+# 应用运行控制。
+# 约定：start 成功返回 0 / 失败返回 1；status 运行中返回 0 / 未运行返回 3。
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+case "$1" in
+start)
+    fnwg_ensure_group
+    fnwg_prepare_dirs
+    if ! fnwg_start; then
+        fnwg_fail "启动失败（方式: $(fnwg_mode)）。systemd 方式请执行 journalctl -u ${FNWG_UNIT_AGENT} -u ${FNWG_UNIT_WEB}；PID 方式请查看 ${TRIM_PKGVAR}/log/"
+    fi
+    if ! fnwg_wait_health 15; then
+        fnwg_fail "Web 服务在 15 秒内未就绪，请检查 ${TRIM_PKGVAR}/log/web.log"
+    fi
+    exit 0
+    ;;
+stop)
+    fnwg_stop
+    exit 0
+    ;;
+status)
+    if fnwg_status; then
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    exit 1
+    ;;
+esac

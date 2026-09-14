@@ -1,0 +1,137 @@
+// Package config 负责加载 fn-WireGuard 的运行期配置。
+// 配置来源优先级：命令行参数 > TRIM_* 环境变量（fnOS 注入）> 默认值。
+package config
+
+import (
+	"flag"
+	"os"
+	"path/filepath"
+	"strconv"
+)
+
+// Config 是 fnwg-web / fnwg-agent 共用的运行期配置。
+type Config struct {
+	// Version 由构建脚本通过 -ldflags 注入
+	Version string
+	// Group 是运行用户组名，Web 进程以该用户运行，Agent 用它调整共享文件属组。
+	Group string
+
+	// Port 是 Web 服务监听端口，来自 manifest 的 service_port / TRIM_SERVICE_PORT。
+	Port int
+	// Bind 是监听地址，默认 0.0.0.0。
+	Bind string
+
+	// EtcDir 静态配置目录（TRIM_PKGETC）。
+	EtcDir string
+	// VarDir 动态数据目录（TRIM_PKGVAR），数据库与密钥落在此处。
+	VarDir string
+	// HomeDir 用户数据目录（TRIM_PKGHOME）。
+	HomeDir string
+	// AppDest 可执行文件目录（TRIM_APPDEST）。
+	AppDest string
+
+	// SocketPath 特权代理的 Unix Domain Socket 路径。
+	SocketPath string
+
+	// Dev 为本地开发模式：不依赖 fnwg-agent，直接使用内存后端。
+	Dev bool
+
+	// Timezone 仅用于日志展示，留空使用系统时区。
+	Timezone string
+
+	// Once 仅用于 fnwg-agent：执行一次收敛后退出（便于排查与脚本化）。
+	Once bool
+	// Cleanup 仅用于 fnwg-agent：删除本应用创建的全部内核对象后退出（停用/卸载使用）。
+	Cleanup bool
+}
+
+// Load 解析命令行参数与环境变量。
+func Load(args []string) *Config {
+	defaultVar := envOr("TRIM_PKGVAR", filepath.Join(os.TempDir(), "fn-wireguard"))
+	c := &Config{
+		Version:    "0.1.0-dev",
+		Group:      envOr("FNWG_GROUP", "fnwg"),
+		Port:       envInt("TRIM_SERVICE_PORT", 0),
+		Bind:       "0.0.0.0",
+		EtcDir:     envOr("TRIM_PKGETC", filepath.Join(defaultVar, "etc")),
+		VarDir:     defaultVar,
+		HomeDir:    envOr("TRIM_PKGHOME", filepath.Join(defaultVar, "home")),
+		AppDest:    envOr("TRIM_APPDEST", "."),
+		SocketPath: "",
+		Dev:        false,
+		Timezone:   envOr("TRIM_SYS_LANGUAGE", ""),
+	}
+
+	fs := flag.NewFlagSet("fnwg", flag.ContinueOnError)
+	fs.IntVar(&c.Port, "port", c.Port, "Web 监听端口")
+	fs.StringVar(&c.Bind, "bind", c.Bind, "Web 监听地址")
+	fs.StringVar(&c.EtcDir, "etc", c.EtcDir, "静态配置目录")
+	fs.StringVar(&c.VarDir, "var", c.VarDir, "动态数据目录")
+	fs.StringVar(&c.HomeDir, "home", c.HomeDir, "用户数据目录")
+	fs.StringVar(&c.AppDest, "appdest", c.AppDest, "可执行文件目录")
+	fs.StringVar(&c.SocketPath, "socket", "", "特权代理 socket 路径")
+	fs.StringVar(&c.Group, "group", c.Group, "运行用户组（共享文件属组）")
+	fs.BoolVar(&c.Dev, "dev", false, "开发模式：使用内存后端，不连接特权代理")
+	fs.BoolVar(&c.Once, "once", false, "只执行一次收敛后退出（fnwg-agent）")
+	fs.BoolVar(&c.Cleanup, "cleanup", false, "删除本应用创建的全部网络对象后退出（fnwg-agent）")
+	_ = fs.Parse(args)
+
+	if c.Port == 0 {
+		c.Port = 8080
+	}
+	if c.SocketPath == "" {
+		c.SocketPath = filepath.Join(c.VarDir, "agent.sock")
+	}
+	return c
+}
+
+// DBPath 返回 SQLite 数据库文件路径。
+func (c *Config) DBPath() string { return filepath.Join(c.VarDir, "fnwg.db") }
+
+// MasterKeyPath 返回主密钥文件路径（AES-256-GCM，用于加密私钥落库）。
+func (c *Config) MasterKeyPath() string { return filepath.Join(c.VarDir, "master.key") }
+
+// NetStatePath 返回网络安全状态文件路径。
+// 该文件记录本应用创建过的接口与接管前的系统路由基线，用于限定清理范围、避免误改系统。
+func (c *Config) NetStatePath() string { return filepath.Join(c.VarDir, "netstate.json") }
+
+// LogDir 返回日志目录。
+func (c *Config) LogDir() string { return filepath.Join(c.VarDir, "log") }
+
+// ShareDir 返回面向用户的共享导出目录（fnOS data-share）。
+// 优先使用 fnOS 依据 config/resource 创建的共享目录，其次回退到 var/share。
+func (c *Config) ShareDir() string {
+	for _, name := range []string{"fn-wireguard", "wireguard"} {
+		p := filepath.Join(c.VarDir, "shares", name)
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			return p
+		}
+	}
+	return filepath.Join(c.VarDir, "share")
+}
+
+// EnsureDirs 创建所有必需目录。
+func (c *Config) EnsureDirs() error {
+	for _, d := range []string{c.VarDir, c.EtcDir, c.HomeDir, c.LogDir(), c.ShareDir()} {
+		if err := os.MkdirAll(d, 0o770); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}

@@ -1,0 +1,15 @@
+{
+    "data-share": {
+        "shares": [
+            {
+                "name": "fn-wireguard",
+                "permission": {
+                    "rw": ["fnwg"]
+                }
+            }
+        ]
+    },
+    "usr-local-linker": {
+        "bin": ["fnwg-cli"]
+    }
+}

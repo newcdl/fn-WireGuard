@@ -1,0 +1,34 @@
+#!/bin/bash
+# 卸载回调：移除服务单元与系统集成。数据目录默认保留，重装后可无损恢复。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-uninstall.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+fnwg_log "清理 fn-WireGuard 服务"
+
+if fnwg_have_systemd; then
+    fnwg_systemd_remove
+fi
+rm -f "$TRIM_PKGVAR/agent.pid" "$TRIM_PKGVAR/web.pid" "$TRIM_PKGVAR/agent.sock"
+
+# 再次确认内核对象已清理（uninstall_init 已执行过一次；此处为兜底，且此时 target 可能已删除）
+if [ -x "$TRIM_APPDEST/fnwg-agent" ]; then
+    "$TRIM_APPDEST/fnwg-agent" --var "$TRIM_PKGVAR" --cleanup >/dev/null 2>&1 || true
+fi
+# 清理本应用的安全状态文件（记录已创建的接口，避免卸载后残留误导）
+rm -f "$TRIM_PKGVAR/netstate.json"
+
+# 清理可能残留的自身 nftables 表（防火墙模块后续版本接入）
+if command -v nft >/dev/null 2>&1; then
+    nft delete table inet fn-wireguard >/dev/null 2>&1 || true
+fi
+
+if [ -d "$TRIM_PKGVAR" ]; then
+    fnwg_log "已保留数据目录 ${TRIM_PKGVAR}（数据库与备份），重新安装后自动恢复"
+fi
+
+fnwg_log "卸载完成"
+exit 0

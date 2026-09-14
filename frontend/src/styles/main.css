@@ -1,0 +1,405 @@
+:root {
+  --fnwg-bg: #f5f7fa;
+  --fnwg-card: #ffffff;
+  --fnwg-border: #e4e7ed;
+  --fnwg-radius: 12px;
+  --fnwg-header-h: 52px;
+  --fnwg-bottom-nav-h: 56px;
+}
+
+html.dark {
+  --fnwg-bg: #14161a;
+  --fnwg-card: #1c1f24;
+  --fnwg-border: #2b2f36;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--fnwg-bg);
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* ---------------------------------------------------------------- 布局 */
+
+.fnwg-layout {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  overflow: hidden;
+}
+
+.fnwg-sidebar {
+  width: 200px;
+  flex: 0 0 200px;
+  border-right: 1px solid var(--fnwg-border);
+  background: var(--fnwg-card);
+  display: flex;
+  flex-direction: column;
+}
+
+.fnwg-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px;
+  font-weight: 600;
+  font-size: 15px;
+  border-bottom: 1px solid var(--fnwg-border);
+}
+
+.fnwg-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.fnwg-header {
+  min-height: var(--fnwg-header-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--fnwg-border);
+  background: var(--fnwg-card);
+  flex: 0 0 auto;
+}
+
+.fnwg-content {
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ---------------------------------------------------------------- 通用块 */
+
+.fnwg-card {
+  background: var(--fnwg-card);
+  border: 1px solid var(--fnwg-border);
+  border-radius: var(--fnwg-radius);
+  padding: 16px;
+}
+
+.fnwg-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fnwg-stat-value {
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.fnwg-stat-label {
+  font-size: 13px;
+  opacity: 0.65;
+}
+
+.fnwg-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+}
+
+.fnwg-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.fnwg-toolbar .el-input,
+.fnwg-toolbar .el-select {
+  max-width: 100%;
+}
+
+.fnwg-empty {
+  padding: 40px 0;
+  text-align: center;
+  opacity: 0.6;
+}
+
+/* 字段下方的说明文字（全局，避免各页面重复定义） */
+.fnwg-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.6;
+  margin-top: 4px;
+}
+
+/* 单选/多选说明行 */
+.fnwg-radio-line {
+  display: flex;
+  align-items: baseline;
+  margin-right: 16px;
+  height: auto;
+  padding: 2px 0;
+  white-space: normal;
+}
+
+.fnwg-radio-desc {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-left: 6px;
+}
+
+/* 安全提示横幅 */
+.fnwg-safety {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.fnwg-safety-icon {
+  font-size: 20px;
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.fnwg-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.fnwg-pre {
+  background: rgba(127, 127, 127, 0.1);
+  border-radius: 8px;
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* 状态圆点 */
+.fnwg-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  flex: 0 0 auto;
+}
+
+.fnwg-dot.ok {
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.16);
+}
+
+.fnwg-dot.warn {
+  background: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.16);
+}
+
+.fnwg-dot.off {
+  background: #94a3b8;
+}
+
+.fnwg-dot.down {
+  background: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.16);
+}
+
+/* 二维码 */
+.fnwg-qr {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.fnwg-qr img {
+  width: 220px;
+  max-width: 70vw;
+  height: auto;
+  background: #fff;
+  padding: 8px;
+  border-radius: 8px;
+}
+
+/* 信息行（移动端卡片中使用） */
+.fnwg-kv {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.fnwg-kv-key {
+  flex: 0 0 auto;
+  color: var(--el-text-color-secondary);
+}
+
+.fnwg-kv-val {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+}
+
+/* ---------------------------------------------------------------- 移动端 */
+
+.fnwg-mobile-only {
+  display: none !important;
+}
+
+@media (max-width: 767px) {
+  .fnwg-mobile-only {
+    display: block !important;
+  }
+
+  .fnwg-desktop-only {
+    display: none !important;
+  }
+
+  .fnwg-content {
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+  }
+
+  .fnwg-header {
+    padding: 0 12px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+
+  .fnwg-card {
+    padding: 12px;
+    border-radius: 10px;
+  }
+
+  /* 手机上表单标签统一放在输入框上方，避免标签被挤压 */
+  .fnwg-form .el-form-item__label {
+    width: auto !important;
+    text-align: left !important;
+    padding-right: 0 !important;
+    margin-bottom: 2px;
+    line-height: 1.5;
+  }
+
+  .fnwg-form .el-form-item {
+    display: block;
+  }
+
+  .fnwg-form .el-form-item__content {
+    margin-left: 0 !important;
+  }
+
+  .fnwg-form .el-input-number,
+  .fnwg-form .el-select,
+  .fnwg-form .el-date-editor {
+    width: 100% !important;
+  }
+
+  .fnwg-grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px;
+  }
+
+  .fnwg-stat-value {
+    font-size: 20px;
+  }
+
+  .fnwg-toolbar {
+    gap: 6px;
+  }
+
+  .fnwg-toolbar > .el-input,
+  .fnwg-toolbar > .el-select {
+    flex: 1 1 140px;
+    width: auto !important;
+  }
+
+  /* 抽屉/弹窗铺满，避免横向溢出 */
+  .el-drawer {
+    --el-drawer-padding-primary: 14px;
+  }
+
+  .el-message-box {
+    width: 90% !important;
+    max-width: 420px;
+  }
+
+  .el-message {
+    min-width: auto;
+    max-width: 92vw;
+  }
+
+  /* 表格在手机上改为横向滚动兜底（主要列表已切换为卡片） */
+  .el-table {
+    font-size: 12.5px;
+  }
+
+  .el-pagination {
+    justify-content: center;
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  /* 移动端底部导航 */
+  .fnwg-bottom-nav {
+    flex: 0 0 auto;
+    display: flex;
+    border-top: 1px solid var(--fnwg-border);
+    background: var(--fnwg-card);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .fnwg-bottom-nav-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    height: var(--fnwg-bottom-nav-h);
+    font-size: 11px;
+    color: var(--el-text-color-secondary);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-family: inherit;
+    padding: 0;
+  }
+
+  .fnwg-bottom-nav-item.active {
+    color: var(--el-color-primary);
+  }
+
+  .fnwg-bottom-nav-item .el-icon {
+    font-size: 20px;
+  }
+}
+
+/* 触屏设备加大可点击区域 */
+@media (hover: none) and (pointer: coarse) {
+  .el-button {
+    min-height: 32px;
+  }
+
+  .el-button.is-link {
+    min-height: 28px;
+    padding: 4px 6px;
+  }
+}

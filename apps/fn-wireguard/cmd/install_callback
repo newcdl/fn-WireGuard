@@ -1,0 +1,39 @@
+#!/bin/bash
+# 安装回调：创建运行用户、准备数据目录、启动服务、导入向导配置。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-install.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+fnwg_log "开始安装 fn-WireGuard（版本 ${TRIM_APPVER:-unknown}）"
+
+fnwg_ensure_group
+fnwg_prepare_dirs
+
+# 向导输入写入引导文件，由 Web 进程首次启动时导入到应用设置后删除
+bootstrap="${TRIM_PKGETC}/bootstrap.json"
+{
+    printf '{\n'
+    printf '  "server_endpoint": "%s",\n' "${wizard_endpoint:-}"
+    printf '  "default_dns": "%s"\n' "${wizard_dns:-}"
+    printf '}\n'
+} > "$bootstrap"
+chmod 640 "$bootstrap"
+
+chmod +x "$TRIM_APPDEST"/fnwg-* 2>/dev/null || true
+
+if ! fnwg_start; then
+    fnwg_fail "启动服务失败（方式: $(fnwg_mode)）"
+fi
+
+# 首次启动会创建数据库与主密钥，需要允许 fnwg 组读写
+fnwg_fix_db_perms
+
+if ! fnwg_wait_health 20; then
+    fnwg_fail "Web 控制台未能在 20 秒内就绪，请检查日志后重试"
+fi
+
+fnwg_log "安装完成，管理界面：http://<NAS地址>:$(fnwg_service_port)/"
+exit 0

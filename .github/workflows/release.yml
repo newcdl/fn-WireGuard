@@ -1,0 +1,85 @@
+name: Build & Release
+
+# 打 tag（如 v0.3.0）时自动构建双架构 fpk 并发布到 Release；
+# 也可在 Actions 页面手动触发（仅产出构建产物，不发布）。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      FN_VER: 1.2.3
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install fnpack
+        run: |
+          curl -fsSL -o /tmp/fnpack "https://static2.fnnas.com/fnpack/fnpack-${FN_VER}-linux-amd64"
+          chmod +x /tmp/fnpack
+          sudo mv /tmp/fnpack /usr/local/bin/fnpack
+          fnpack --help | head -3
+
+      - name: Verify (format / vet / tests)
+        run: |
+          test -z "$(gofmt -l .)" || { echo "以下文件未格式化:"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+
+      - name: Frontend type check
+        working-directory: frontend
+        run: npm ci && npx vue-tsc --noEmit
+
+      - name: Build fpk (amd64 + arm64)
+        run: ./scripts/build.sh all
+
+      - name: Show artifacts
+        run: ls -lh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fn-wireguard-fpk
+          path: dist/*.fpk
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.fpk
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            在飞牛 **应用中心 → 手动上传应用** 中选择对应架构的安装包：
+
+            | 文件 | 适用架构 | 确认方式 |
+            |---|---|---|
+            | `${{ github.ref_name }}-amd64.fpk` | x86_64 | `uname -m` 输出 `x86_64` |
+            | `${{ github.ref_name }}-arm64.fpk` | ARM64 | `uname -m` 输出 `aarch64` |
+
+            > 使用前请在路由器上把 WireGuard 端口（默认 UDP 51820）转发到 NAS 的局域网地址。
+
+            详细说明见 [README](https://github.com/${{ github.repository }}#readme)。

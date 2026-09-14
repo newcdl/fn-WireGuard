@@ -1,0 +1,13 @@
+{
+    ".url": {
+        "fn-wireguard.Application": {
+            "title": "WireGuard 管理",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "34567",
+            "url": "/",
+            "allUsers": true
+        }
+    }
+}

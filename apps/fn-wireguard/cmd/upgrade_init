@@ -1,0 +1,24 @@
+#!/bin/bash
+# 升级前置：停服并备份数据库，保证升级失败可回滚。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-upgrade.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+fnwg_log "准备升级 fn-WireGuard"
+fnwg_stop
+
+if [ -f "$TRIM_PKGVAR/fnwg.db" ]; then
+    mkdir -p "$TRIM_PKGVAR/backup"
+    target="$TRIM_PKGVAR/backup/pre-upgrade-$(date +%Y%m%d-%H%M%S).db"
+    if cp -a "$TRIM_PKGVAR/fnwg.db" "$target" 2>/dev/null; then
+        chmod 600 "$target"
+        fnwg_log "已备份数据库到 ${target}"
+    else
+        fnwg_log "警告：数据库备份失败（可能因升级流程已切换数据目录），将继续升级"
+    fi
+fi
+
+exit 0

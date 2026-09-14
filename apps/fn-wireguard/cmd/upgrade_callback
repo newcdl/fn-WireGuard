@@ -1,0 +1,26 @@
+#!/bin/bash
+# 升级回调：修正权限并启动（数据库 schema 迁移由进程启动时自动完成）。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-upgrade.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+fnwg_log "完成 fn-WireGuard 升级到 ${TRIM_APPVER:-unknown}"
+
+fnwg_ensure_group
+fnwg_prepare_dirs
+chmod +x "$TRIM_APPDEST"/fnwg-* 2>/dev/null || true
+
+if ! fnwg_start; then
+    fnwg_fail "升级后启动服务失败（方式: $(fnwg_mode)）"
+fi
+fnwg_fix_db_perms
+
+if ! fnwg_wait_health 20; then
+    fnwg_fail "升级后 Web 控制台未能在 20 秒内就绪，可执行 journalctl -u ${FNWG_UNIT_WEB} 或查看 ${TRIM_PKGVAR}/log/web.log 定位原因"
+fi
+
+fnwg_log "升级完成，配置已自动恢复"
+exit 0

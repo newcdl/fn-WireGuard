@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------- 构建产物
+/bin/
+/dist/
+*.fpk
+/apps/fn-wireguard/app/fnwg-*
+/apps/fn-wireguard/app/BUILDINFO
+
+# 前端构建产物会被 scripts/build.sh 复制到这里再由 go:embed 内嵌。
+# 仓库不跟踪它：干净克隆用 internal/webui 的占位实现即可编译（见 -tags embedui）。
+/internal/webui/dist/
+
+# ---------------------------------------------------------------- 前端
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/frontend/*.tsbuildinfo
+
+# ---------------------------------------------------------------- 运行期数据
+/.dev/
+*.db
+*.db-wal
+*.db-shm
+master.key
+netstate.json
+
+# ---------------------------------------------------------------- 工具与临时文件
+/tools/
+*.tgz
+*.tmp
+
+# ---------------------------------------------------------------- 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

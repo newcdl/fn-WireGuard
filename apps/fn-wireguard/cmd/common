@@ -1,0 +1,317 @@
+#!/bin/bash
+# fn-WireGuard 生命周期脚本公共函数库，由 install_init / install_callback / main 等脚本 source。
+#
+# 运行模式：优先使用 systemd（可自动重启、随系统启动）；当 /etc/systemd/system 不可写
+# 或系统未使用 systemd 时，自动回退为 PID 文件方式管理进程，保证在任何 fnOS 环境下都能安装。
+
+FNWG_GROUP="fnwg"
+FNWG_UNIT_AGENT="fnwg-agent.service"
+FNWG_UNIT_WEB="fnwg-web.service"
+FNWG_UNIT_DIR="/etc/systemd/system"
+
+fnwg_log() {
+    echo "[fn-wireguard] $*"
+}
+
+# fnwg_fail <消息>：写入 TRIM_TEMP_LOGFILE 以便前端弹窗展示后退出。
+fnwg_fail() {
+    if [ -n "$TRIM_TEMP_LOGFILE" ]; then
+        printf '%s\n' "$*" > "$TRIM_TEMP_LOGFILE"
+    fi
+    echo "[fn-wireguard] 错误: $*" >&2
+    exit 1
+}
+
+# fnwg_have_systemd：systemd 可用且单元目录可写。
+fnwg_have_systemd() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] || return 1
+    mkdir -p "$FNWG_UNIT_DIR" 2>/dev/null || return 1
+    [ -w "$FNWG_UNIT_DIR" ] || return 1
+    return 0
+}
+
+# fnwg_mode：输出当前采用的进程管理方式。
+fnwg_mode() {
+    if fnwg_have_systemd; then
+        echo "systemd"
+    else
+        echo "pidfile"
+    fi
+}
+
+# ---------------------------------------------------------------- 基础环境
+
+fnwg_ensure_group() {
+    if ! getent group "$FNWG_GROUP" >/dev/null 2>&1; then
+        groupadd --system "$FNWG_GROUP" 2>/dev/null || true
+    fi
+    if ! id -u "$FNWG_GROUP" >/dev/null 2>&1; then
+        useradd --system --gid "$FNWG_GROUP" --no-create-home \
+            --shell /usr/sbin/nologin --comment "fn-WireGuard service" "$FNWG_GROUP" 2>/dev/null || true
+    fi
+}
+
+fnwg_prepare_dirs() {
+    mkdir -p "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGHOME"
+    mkdir -p "$TRIM_PKGVAR/log" "$TRIM_PKGVAR/share" "$TRIM_PKGVAR/backup"
+    chown -R "root:${FNWG_GROUP}" "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGHOME" 2>/dev/null || true
+    chmod 770 "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGHOME" 2>/dev/null || true
+    # setgid 保证新建文件继承 fnwg 属组，两个进程才能共享数据库
+    chmod g+s "$TRIM_PKGVAR" "$TRIM_PKGETC" 2>/dev/null || true
+}
+
+# fnwg_fix_db_perms：修正数据库与主密钥属组，确保 Web 进程可读写。
+fnwg_fix_db_perms() {
+    local f
+    for f in "$TRIM_PKGVAR/fnwg.db" "$TRIM_PKGVAR/fnwg.db-wal" "$TRIM_PKGVAR/fnwg.db-shm"; do
+        [ -e "$f" ] || continue
+        chgrp "$FNWG_GROUP" "$f" 2>/dev/null || true
+        chmod 660 "$f" 2>/dev/null || true
+    done
+    if [ -e "$TRIM_PKGVAR/master.key" ]; then
+        chgrp "$FNWG_GROUP" "$TRIM_PKGVAR/master.key" 2>/dev/null || true
+        chmod 640 "$TRIM_PKGVAR/master.key" 2>/dev/null || true
+    fi
+}
+
+fnwg_service_port() {
+    echo "${TRIM_SERVICE_PORT:-34567}"
+}
+
+# ---------------------------------------------------------------- systemd 模式
+
+fnwg_write_agent_unit() {
+    cat > "${FNWG_UNIT_DIR}/${FNWG_UNIT_AGENT}" <<EOF
+[Unit]
+Description=fn-WireGuard privileged agent (netlink reconcile)
+After=network-online.target
+Wants=network-online.target
+Before=fnwg-web.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${TRIM_APPDEST}/fnwg-agent --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock --group ${FNWG_GROUP}
+Restart=always
+RestartSec=3
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=${TRIM_PKGVAR} ${TRIM_PKGETC} ${TRIM_PKGHOME}
+LimitNOFILE=65536
+SyslogIdentifier=fnwg-agent
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${FNWG_UNIT_DIR}/${FNWG_UNIT_AGENT}"
+}
+
+fnwg_write_web_unit() {
+    cat > "${FNWG_UNIT_DIR}/${FNWG_UNIT_WEB}" <<EOF
+[Unit]
+Description=fn-WireGuard web console (unprivileged)
+After=network-online.target fnwg-agent.service
+Wants=network-online.target
+PartOf=fnwg-agent.service
+
+[Service]
+Type=simple
+User=${FNWG_GROUP}
+Group=${FNWG_GROUP}
+ExecStart=${TRIM_APPDEST}/fnwg-web --bind 0.0.0.0 --port $(fnwg_service_port) --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=${TRIM_PKGVAR} ${TRIM_PKGETC} ${TRIM_PKGHOME}
+LimitNOFILE=65536
+SyslogIdentifier=fnwg-web
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${FNWG_UNIT_DIR}/${FNWG_UNIT_WEB}"
+}
+
+fnwg_systemd_install() {
+    fnwg_write_agent_unit || return 1
+    fnwg_write_web_unit || return 1
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable "$FNWG_UNIT_AGENT" >/dev/null 2>&1
+    systemctl enable "$FNWG_UNIT_WEB" >/dev/null 2>&1
+    return 0
+}
+
+fnwg_systemd_remove() {
+    systemctl disable --now "$FNWG_UNIT_WEB" >/dev/null 2>&1
+    systemctl disable --now "$FNWG_UNIT_AGENT" >/dev/null 2>&1
+    rm -f "${FNWG_UNIT_DIR}/${FNWG_UNIT_AGENT}" "${FNWG_UNIT_DIR}/${FNWG_UNIT_WEB}"
+    systemctl daemon-reload >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- PID 文件模式
+
+# fnwg_run_as_user：以专用普通用户身份执行命令（用于 Web 进程降权）。
+fnwg_run_as_user() {
+    local uid gid
+    uid="$(id -u "$FNWG_GROUP" 2>/dev/null)"
+    gid="$(id -g "$FNWG_GROUP" 2>/dev/null)"
+    if [ -z "$uid" ] || [ -z "$gid" ]; then
+        "$@"
+        return $?
+    fi
+    if command -v setpriv >/dev/null 2>&1; then
+        setpriv --reuid="$uid" --regid="$gid" --init-groups -- "$@"
+    elif command -v runuser >/dev/null 2>&1; then
+        runuser -u "$FNWG_GROUP" -- "$@"
+    else
+        "$@"
+    fi
+}
+
+fnwg_pid_alive() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    local pid
+    pid="$(head -n 1 "$file" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+fnwg_pidfile_start() {
+    local logdir="$TRIM_PKGVAR/log"
+    mkdir -p "$logdir"
+
+    if ! fnwg_pid_alive "$TRIM_PKGVAR/agent.pid"; then
+        nohup "$TRIM_APPDEST/fnwg-agent" \
+            --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" \
+            --socket "$TRIM_PKGVAR/agent.sock" --group "$FNWG_GROUP" \
+            >>"$logdir/agent.log" 2>&1 &
+        echo $! > "$TRIM_PKGVAR/agent.pid"
+    fi
+    sleep 1
+    fnwg_fix_db_perms
+
+    if ! fnwg_pid_alive "$TRIM_PKGVAR/web.pid"; then
+        nohup fnwg_run_as_user "$TRIM_APPDEST/fnwg-web" \
+            --bind 0.0.0.0 --port "$(fnwg_service_port)" \
+            --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" \
+            --socket "$TRIM_PKGVAR/agent.sock" \
+            >>"$logdir/web.log" 2>&1 &
+        echo $! > "$TRIM_PKGVAR/web.pid"
+    fi
+    sleep 1
+    return 0
+}
+
+fnwg_pidfile_stop() {
+    local name file pid
+    for name in web agent; do
+        file="$TRIM_PKGVAR/${name}.pid"
+        [ -f "$file" ] || continue
+        pid="$(head -n 1 "$file" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null
+            local i=0
+            while kill -0 "$pid" 2>/dev/null && [ $i -lt 10 ]; do
+                sleep 1
+                i=$((i + 1))
+            done
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+        fi
+        rm -f "$file"
+    done
+    return 0
+}
+
+fnwg_pidfile_status() {
+    if fnwg_pid_alive "$TRIM_PKGVAR/agent.pid" && fnwg_pid_alive "$TRIM_PKGVAR/web.pid"; then
+        return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------- 统一入口
+
+fnwg_start() {
+    case "$(fnwg_mode)" in
+    systemd)
+        fnwg_systemd_install || return 1
+        systemctl start "$FNWG_UNIT_AGENT" || return 1
+        fnwg_fix_db_perms
+        systemctl start "$FNWG_UNIT_WEB" || return 1
+        ;;
+    *)
+        fnwg_pidfile_start || return 1
+        ;;
+    esac
+    return 0
+}
+
+# fnwg_cleanup_kernel：删除本应用创建的内核对象（网卡与残留路由）。
+# 铁规则：只删除本应用自己创建的对象，绝不触碰系统或其他应用的对象。
+# 停用与卸载都会调用它，保证应用不在运行时不给 NAS 留下任何网络痕迹。
+fnwg_cleanup_kernel() {
+    mkdir -p "$TRIM_PKGVAR/log"
+    if [ -x "$TRIM_APPDEST/fnwg-agent" ]; then
+        "$TRIM_APPDEST/fnwg-agent" --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" --cleanup \
+            >>"$TRIM_PKGVAR/log/cleanup.log" 2>&1 \
+            || fnwg_log "提示：内核对象清理未完全成功，可稍后执行 fnwg-cli cleanup"
+        return 0
+    fi
+    if [ -x "$TRIM_APPDEST/fnwg-cli" ]; then
+        "$TRIM_APPDEST/fnwg-cli" cleanup --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" \
+            >>"$TRIM_PKGVAR/log/cleanup.log" 2>&1 || true
+    fi
+    return 0
+}
+
+fnwg_stop() {
+    case "$(fnwg_mode)" in
+    systemd)
+        systemctl stop "$FNWG_UNIT_WEB" >/dev/null 2>&1
+        systemctl stop "$FNWG_UNIT_AGENT" >/dev/null 2>&1
+        ;;
+    *)
+        fnwg_pidfile_stop
+        ;;
+    esac
+    # 停用后立刻清理内核痕迹，避免残留网卡/路由继续影响系统网络
+    fnwg_cleanup_kernel
+    return 0
+}
+
+fnwg_status() {
+    case "$(fnwg_mode)" in
+    systemd)
+        systemctl is-active --quiet "$FNWG_UNIT_AGENT" && systemctl is-active --quiet "$FNWG_UNIT_WEB" && return 0
+        return 1
+        ;;
+    *)
+        fnwg_pidfile_status
+        ;;
+    esac
+}
+
+# fnwg_wait_health <秒>：等待 Web 端口就绪，用于安装回调的失败快速反馈。
+fnwg_wait_health() {
+    local timeout="${1:-15}" port i=0
+    port="$(fnwg_service_port)"
+    while [ $i -lt "$timeout" ]; do
+        if command -v curl >/dev/null 2>&1; then
+            if curl -sf -m 2 "http://127.0.0.1:${port}/api/v1/auth/state" >/dev/null 2>&1; then
+                return 0
+            fi
+        else
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}

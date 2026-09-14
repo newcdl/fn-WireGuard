@@ -1,0 +1,30 @@
+#!/bin/bash
+# 配置变更回调：更新服务端对外地址与默认 DNS 并重启服务。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-config.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+bootstrap="${TRIM_PKGETC}/bootstrap.json"
+{
+    printf '{\n'
+    printf '  "server_endpoint": "%s",\n' "${wizard_endpoint:-}"
+    printf '  "default_dns": "%s"\n' "${wizard_dns:-}"
+    printf '}\n'
+} > "$bootstrap"
+chmod 640 "$bootstrap"
+
+fnwg_stop >/dev/null 2>&1 || true
+if ! fnwg_start; then
+    fnwg_fail "应用配置后重启服务失败"
+fi
+fnwg_fix_db_perms
+
+if ! fnwg_wait_health 15; then
+    fnwg_fail "应用配置后 Web 控制台未能在 15 秒内就绪"
+fi
+
+fnwg_log "配置已更新"
+exit 0

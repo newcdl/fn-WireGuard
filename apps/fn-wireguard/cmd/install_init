@@ -1,0 +1,42 @@
+#!/bin/bash
+# 安装前置检查：架构、内核模块、端口占用、已有配置探测。
+# 注意：内核态 WireGuard 不依赖 /dev/net/tun，因此缺少 TUN 只提示不阻断。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-install.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+fnwg_log "开始安装前环境检查"
+
+arch="$(uname -m)"
+case "$arch" in
+    x86_64 | aarch64 | arm64) ;;
+    *) fnwg_fail "不支持的系统架构：${arch}" ;;
+esac
+
+# 内核模块：内核态可用则最佳，不可用则提示将依赖用户态实现（当前版本会明确报错，便于定位）
+if modprobe wireguard >/dev/null 2>&1 || [ -e /sys/module/wireguard ]; then
+    fnwg_log "内核 wireguard 模块可用"
+else
+    fnwg_log "警告：未检测到内核 wireguard 模块，接口将无法创建。请确认系统内核版本（建议 5.6 以上）后重试。"
+fi
+
+if [ ! -e /dev/net/tun ]; then
+    fnwg_log "提示：未检测到 /dev/net/tun，内核态工作不受影响；如需用户态回退请在系统设置中启用 TUN/TAP。"
+fi
+
+port="$(fnwg_service_port)"
+if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}\$"; then
+        fnwg_fail "管理端口 ${port} 已被占用，请先释放该端口（例如停用占用它的应用）后重新安装。"
+    fi
+fi
+
+if [ -d /etc/wireguard ] && ls /etc/wireguard/*.conf >/dev/null 2>&1; then
+    fnwg_log "检测到已有的 /etc/wireguard 配置，安装完成后可在「接口管理 → 导入配置」中一键导入"
+fi
+
+fnwg_log "环境检查通过（进程管理方式：$(fnwg_mode)）"
+exit 0

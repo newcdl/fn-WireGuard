@@ -1,0 +1,18 @@
+#!/bin/bash
+# 配置变更前置：校验端口占用（端口固定为 manifest 中声明的 service_port）。
+set -e
+
+[ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-config.log
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common
+. "$DIR/common"
+
+port="$(fnwg_service_port)"
+if command -v ss >/dev/null 2>&1; then
+    if ! fnwg_pid_alive "$TRIM_PKGVAR/web.pid" && ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}\$"; then
+        fnwg_fail "端口 ${port} 已被其他程序占用，本次配置无法生效。"
+    fi
+fi
+
+fnwg_log "配置检查通过"
+exit 0
