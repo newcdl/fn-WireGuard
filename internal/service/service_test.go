@@ -19,7 +19,11 @@ import (
 )
 
 // newTestEnv 搭建一套完整的服务环境：临时数据库 + 内存数据面后端 + 收敛引擎。
-// 使用 mock 后端使得测试可以脱离 Linux 与 root 权限运行。
+//
+// 这里必须显式用 NewMock，不能用 New：New 在 Linux 上返回的是**真实内核后端**，
+// 而业务层测试会走到 Reconcile / DeleteInterface，真实的 netlink 调用需要
+// CAP_NET_ADMIN —— CI 的 runner 以非 root 运行，结果必然是
+// 「创建接口失败: operation not permitted」。
 func newTestEnv(t *testing.T) (*service.Service, *store.Store) {
 	t.Helper()
 	dir := t.TempDir()
@@ -34,7 +38,7 @@ func newTestEnv(t *testing.T) (*service.Service, *store.Store) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	backend := wgback.New(filepath.Join(dir, "netstate.json"))
+	backend := wgback.NewMock(filepath.Join(dir, "netstate.json"))
 	engine := reconcile.New(st, backend, logger)
 	svc := service.New(st, core.NewLocal(engine), logger, "test")
 	return svc, st

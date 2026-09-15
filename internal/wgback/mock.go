@@ -1,5 +1,3 @@
-//go:build !linux
-
 package wgback
 
 import (
@@ -16,9 +14,15 @@ import (
 	"fnwg/internal/wgkey"
 )
 
-// mockBackend 是开发/演示用的内存后端。
-// 非 Linux 平台（例如开发机）无法创建内核 WireGuard 设备，这里用内存态模拟，
-// 保证前端与 API 可以完整联调。生产环境运行在 fnOS（Linux）上会使用 kernelBackend。
+// mockBackend 是内存态数据面，供两处使用：
+//
+//  1. 非 Linux 平台（例如开发机）作为默认后端：那里无法创建内核 WireGuard 设备，
+//     用内存态模拟即可让前端与 API 完整联调（见 backend_nonlinux.go）；
+//  2. 各平台的单元测试：业务层测试不该依赖 root 与内核能力。
+//     CI 的 runner 以非 root 运行，真实的 netlink 调用必然返回 operation not permitted。
+//
+// 因为第 2 条，本文件不限定平台：NewMock 在所有平台都可用，
+// 只有「默认后端是谁」按平台区分（Linux 用 kernelBackend，见 linux.go）。
 //
 // 它同样遵守安全契约：只操作自己创建过的接口，不做任何路由操作。
 type mockBackend struct {
@@ -38,8 +42,9 @@ type mockPeer struct {
 	tx   int64
 }
 
-// New 创建内存后端。
-func New(statePath string) Backend {
+// NewMock 创建内存后端。所有平台都可用，供开发与非特权测试使用；
+// 生产环境请用 New（Linux 上是真实内核后端）。
+func NewMock(statePath string) Backend {
 	return &mockBackend{devs: map[string]*mockDevice{}, state: LoadState(statePath)}
 }
 
