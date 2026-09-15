@@ -3,7 +3,7 @@
     <el-card class="login-card">
       <div style="text-align: center; margin-bottom: 20px">
         <el-icon :size="36" color="#409eff"><Connection /></el-icon>
-        <h2 style="margin: 10px 0 4px">WireGuard 管理</h2>
+        <h2 style="margin: 10px 0 4px">WireGuard 管理工具</h2>
         <div style="font-size: 13px; opacity: 0.65">飞牛 NAS 原生 WireGuard 控制台</div>
       </div>
       <el-form :model="form" label-position="top" @submit.prevent="submit">

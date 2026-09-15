@@ -4,7 +4,7 @@
     <aside v-if="!isMobile" class="fnwg-sidebar">
       <div class="fnwg-brand">
         <el-icon :size="18"><Connection /></el-icon>
-        <span>WireGuard 管理</span>
+        <span>WireGuard 管理工具</span>
       </div>
 
       <!--
@@ -120,7 +120,7 @@
     <el-drawer v-model="navVisible" direction="ltr" size="240px" :with-header="false">
       <div class="fnwg-brand" style="border: none">
         <el-icon :size="18"><Connection /></el-icon>
-        <span>WireGuard 管理</span>
+        <span>WireGuard 管理工具</span>
       </div>
       <el-menu :default-active="route.name as string" class="fnwg-menu" @select="onMenuSelect">
         <el-menu-item v-for="n in navs" :key="n.name" :index="n.name">
@@ -243,7 +243,7 @@ async function quickRepair() {
     repairing.value = false
   }
 }
-const title = computed(() => titles[route.name as string] || 'WireGuard 管理')
+const title = computed(() => titles[route.name as string] || 'WireGuard 管理工具')
 const roleLabel = computed(
   () => ({ admin: '管理员', operator: '运维', viewer: '只读' })[session.user?.role || 'viewer'],
 )

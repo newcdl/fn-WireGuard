@@ -14,7 +14,7 @@ const placeholderHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>fn-WireGuard · 前端尚未构建</title>
+<title>WireGuard 管理工具 · 前端尚未构建</title>
 <style>
   :root { color-scheme: light dark; }
   body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
