@@ -25,8 +25,15 @@
             </el-form-item>
 
             <el-form-item>
-              <template #label><FieldLabel :meta="S.notify_webhook" /></template>
-              <el-input v-model="settings.notify_webhook" placeholder="可留空" />
+              <template #label>
+                <FieldLabel :meta="S.notify_webhook" />
+                <el-tag size="small" type="warning" effect="plain" style="margin-left: 6px">暂未生效</el-tag>
+              </template>
+              <el-input v-model="settings.notify_webhook" placeholder="可留空（当前版本暂不生效）" />
+              <!-- 界面不能说假话：这一项后端还没有发送逻辑，必须让用户当场看到 -->
+              <div class="fnwg-row-warn">
+                该功能尚未生效：事件通知已排入 0.7.0，现在填写不会被推送，只会保存下来备用。
+              </div>
               <FieldTips :meta="S.notify_webhook" example />
             </el-form-item>
 

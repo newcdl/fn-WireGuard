@@ -340,13 +340,17 @@ export const settingFields: Record<string, FieldMeta> = {
     ],
   },
   notify_webhook: {
-    label: '异常通知地址（可选）',
-    hint: '设备掉线、流量超额等异常会推送到这个地址',
-    what: '一个接收通知的网址，系统在出现异常时向它发送消息。',
-    why: '希望设备异常时第一时间收到提醒（企业微信/钉钉/飞书群机器人）时填写。',
-    effect: '填写后会推送设备异常、自动停用等事件；留空则只在界面内显示。',
+    label: '异常通知地址（暂未生效）',
+    hint: '该功能尚未生效：事件通知已排入 0.7.0，现在填写不会有任何推送',
+    what: '一个接收通知的网址，将来用于在设备掉线、流量超额等异常时推送消息。',
+    why: '当前版本尚未接入发送逻辑 —— 填写后不会收到任何通知，只会被保存下来留给后续版本。',
+    effect: '0.7.0 将实现：设备上线/离线、连接异常、设备到期与配额用尽等事件推送到该地址。在此之前这一项不产生任何行为，留空不影响任何功能。',
     examples: [
-      { title: '群机器人', value: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx', desc: '效果：设备异常时群里立即收到提醒。' },
+      {
+        title: '群机器人（规划中）',
+        value: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx',
+        desc: '0.7.0 生效后：设备异常时群里立即收到提醒。',
+      },
     ],
   },
 }
