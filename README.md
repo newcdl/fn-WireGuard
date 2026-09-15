@@ -187,6 +187,32 @@ git push origin v0.6.0
 
 欢迎提交 Issue 与 Pull Request。
 
+### 分支与发版流程
+
+日常开发一律在 `dev` 分支进行，只有「形成一个新版本」时才合回 `main` 并打 tag 发版：
+
+```bash
+git checkout dev                 # 日常都在 dev 上开发
+# ... 开发、提交若干次 ...
+git push origin dev
+
+# 新版本定型后，合入 main 并发版
+git checkout main
+git merge dev                    # 或 git merge --no-ff dev 保留合并记录
+./scripts/version.sh show        # 确认版本号
+git push origin main
+git tag -a v0.7.0 -m "..." && git push origin v0.7.0   # 触发 Release
+```
+
+约定：
+
+- **`main` 只放已定型的版本**，不发版不直接往 `main` 提交。
+- **`dev` 是唯一长期开发分支**，功能分支建议从 `dev` 拉出、完成后合回 `dev`。
+- **每次改动先 bump 版本**（`./scripts/version.sh patch "..."`），版本号与提交一起走。
+- 打 `v*` tag 会自动触发 `.github/workflows/release.yml` 校验版本 → 测试 → 双架构打包 → 创建 Release。
+
+### 贡献须知
+
 - 提交 Issue 前请附上：fnOS 版本、`uname -m`、`sudo /usr/local/bin/fnwg-cli netcheck` 输出、相关日志。
 - 涉及网络行为的改动，请务必补充 `internal/wgback/routesafety_test.go` 与 `internal/wgback/natplan_test.go` 中的回归用例。
 - 修改配置项文案只需编辑 `frontend/src/constants/fields.ts`，界面会自动同步。
