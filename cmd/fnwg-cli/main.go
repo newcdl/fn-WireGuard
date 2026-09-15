@@ -38,7 +38,7 @@ func main() {
 
 	switch cmd {
 	case "version", "-v", "--version":
-		fmt.Println("fn-WireGuard", cfg.Version)
+		fmt.Println("WireGuard 管理工具", cfg.Version)
 	case "status":
 		runStatus(cfg)
 	case "reconcile":
@@ -65,7 +65,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Print(`fn-WireGuard 命令行工具
+	fmt.Print(`WireGuard 管理工具 命令行工具
 
 用法:
   fnwg-cli status                 查看接口与节点实时状态

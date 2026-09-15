@@ -1,7 +1,7 @@
 {
     ".url": {
         "fn-wireguard.Application": {
-            "title": "WireGuard 管理",
+            "title": "WireGuard 管理工具",
             "icon": "images/icon_{0}.png",
             "type": "iframe",
             "protocol": "http",

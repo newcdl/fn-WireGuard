@@ -1,8 +1,8 @@
-# fn-WireGuard
+# WireGuard 管理工具
 
 <div align="center">
 
-**飞牛 NAS 原生 WireGuard 可视化管理工具**
+**飞牛 NAS 原生的 WireGuard 可视化管理工具**（包名 `fn-wireguard`）
 
 [![version](https://img.shields.io/github/v/release/newcdl/fn-WireGuard?label=version&color=blue)](https://github.com/newcdl/fn-WireGuard/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](#license)

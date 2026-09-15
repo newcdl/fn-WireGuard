@@ -174,7 +174,7 @@ func splitList(v string) []string {
 // RenderServer 渲染服务端 wg-quick 配置（可直接被 wg-quick 加载）。
 func RenderServer(it *model.Interface, peers []model.Peer) string {
 	var b strings.Builder
-	b.WriteString("# 由 fn-WireGuard 生成，请勿直接手工修改（改动会被收敛引擎覆盖）\n")
+	b.WriteString("# 由 WireGuard 管理工具生成，请勿直接手工修改（改动会被收敛引擎覆盖）\n")
 	b.WriteString("[Interface]\n")
 	fmt.Fprintf(&b, "PrivateKey = %s\n", it.PrivateKey)
 	if len(it.Addresses) > 0 {
@@ -261,7 +261,7 @@ func RenderClient(serverPublicKey string, it *model.Interface, p *model.Peer, op
 		opt.DNS = it.DNS
 	}
 	var b strings.Builder
-	b.WriteString("# 由 fn-WireGuard 生成\n")
+	b.WriteString("# 由 WireGuard 管理工具生成\n")
 	b.WriteString("[Interface]\n")
 	fmt.Fprintf(&b, "PrivateKey = %s\n", opt.ClientPrivateKey)
 	if len(opt.ClientAddress) > 0 {

@@ -25,8 +25,15 @@
             </el-form-item>
 
             <el-form-item>
-              <template #label><FieldLabel :meta="S.notify_webhook" /></template>
-              <el-input v-model="settings.notify_webhook" placeholder="可留空" />
+              <template #label>
+                <FieldLabel :meta="S.notify_webhook" />
+                <el-tag size="small" type="warning" effect="plain" style="margin-left: 6px">暂未生效</el-tag>
+              </template>
+              <el-input v-model="settings.notify_webhook" placeholder="可留空（当前版本暂不生效）" />
+              <!-- 界面不能说假话：这一项后端还没有发送逻辑，必须让用户当场看到 -->
+              <div class="fnwg-row-warn">
+                该功能尚未生效：事件通知已排入 0.7.0，现在填写不会被推送，只会保存下来备用。
+              </div>
               <FieldTips :meta="S.notify_webhook" example />
             </el-form-item>
 
@@ -185,7 +192,7 @@
       <!-- 关于 -->
       <el-tab-pane label="关于" name="about">
         <div class="fnwg-card" style="max-width: 760px">
-          <h3 style="margin-top: 0">fn-WireGuard</h3>
+          <h3 style="margin-top: 0">WireGuard 管理工具</h3>
           <p class="fnwg-about-text">
             这是一个运行在飞牛 NAS 上的 WireGuard 管理工具。你不需要记住任何命令，只要在界面上点几下，
             就能让手机、笔记本在外网安全地连回家里，或把两处网络连成一张网。
