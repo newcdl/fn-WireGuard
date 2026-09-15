@@ -37,6 +37,14 @@
         </div>
 
         <div style="display: flex; align-items: center; gap: 8px">
+          <!-- 系统状态栏：任意页面都能看到当前是否正常，点击直达处理入口 -->
+          <el-tooltip :content="toneLabel" placement="bottom">
+            <button type="button" class="fnwg-health-chip" :class="tone" @click="goMaintenance">
+              <span :class="['fnwg-dot', tone]" />
+              <span v-if="!isMobile">{{ chipText }}</span>
+            </button>
+          </el-tooltip>
+
           <el-tooltip :content="syncTip" placement="bottom">
             <el-tag size="small" :type="realtime.connected ? 'success' : 'info'" effect="plain">
               <span :class="['fnwg-dot', realtime.connected ? 'ok' : 'off']" style="margin-right: 4px" />
@@ -68,6 +76,24 @@
           </el-dropdown>
         </div>
       </header>
+
+      <!--
+        全局异常横幅：只要存在「功能确实没在工作」的问题就出现（warning 不打扰，只进状态栏）。
+        放在内容区之外，因此在任何页面、任何滚动位置都能第一时间看到。
+      -->
+      <div v-if="errors.length" class="fnwg-banner down">
+        <el-icon class="fnwg-banner-icon"><WarningFilled /></el-icon>
+        <div class="fnwg-banner-body">
+          <strong>{{ bannerTitle }}</strong>
+          <span class="fnwg-banner-detail">{{ bannerDetail }}</span>
+        </div>
+        <div class="fnwg-banner-actions">
+          <el-button v-if="canRepair" size="small" type="danger" :loading="repairing" @click="quickRepair">
+            立即修复
+          </el-button>
+          <el-button size="small" @click="goMaintenance">去处理</el-button>
+        </div>
+      </div>
 
       <main class="fnwg-content">
         <router-view v-slot="{ Component }">
@@ -128,7 +154,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -137,16 +163,19 @@ import {
   User,
   Document,
   Setting,
+  Tools,
   Avatar,
   ArrowDown,
   Menu,
   Reading,
   Connection,
+  WarningFilled,
 } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
+import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 
@@ -156,11 +185,14 @@ const session = useSession()
 const realtime = useRealtime()
 const { isMobile, dialogWidth } = useBreakpoint()
 
+const { errors, warnings, tone, toneLabel, start: startHealth, stop: stopHealth } = useSystemHealth()
+
 const navs = [
   { name: 'dashboard', label: '总览', short: '总览', icon: Odometer },
   { name: 'interfaces', label: '我的连接', short: '连接', icon: Link },
   { name: 'peers', label: '我的设备', short: '设备', icon: User },
   { name: 'logs', label: '运行记录', short: '记录', icon: Document },
+  { name: 'maintenance', label: '系统维护', short: '维护', icon: Tools },
   { name: 'settings', label: '系统设置', short: '设置', icon: Setting },
 ]
 
@@ -169,7 +201,47 @@ const titles: Record<string, string> = {
   interfaces: '我的连接',
   peers: '我的设备',
   logs: '运行记录',
+  maintenance: '系统维护',
   settings: '系统设置',
+}
+
+const repairing = ref(false)
+
+/** 顶栏状态栏文字：异常数量最优先，其次待确认，全部通过时给正向反馈 */
+const chipText = computed(() => {
+  if (errors.value.length) return `${errors.value.length} 项异常`
+  if (warnings.value.length) return `${warnings.value.length} 项待确认`
+  return '系统正常'
+})
+
+const bannerTitle = computed(() => `${errors.value.length} 项异常需要处理`)
+
+/** 横幅只放第一条的详情 + 剩余条数，保证在手机上也不会撑成一大块 */
+const bannerDetail = computed(() => {
+  const first = errors.value[0]
+  if (!first) return ''
+  const rest = errors.value.length > 1 ? `（另有 ${errors.value.length - 1} 项，点「去处理」查看全部）` : ''
+  return `${first.title}：${first.detail}${rest}`
+})
+
+const canRepair = computed(() => errors.value.some((i) => i.repairable) && session.can('iface.write'))
+
+function goMaintenance() {
+  router.push({ name: 'maintenance' })
+}
+
+/** 横幅上的「立即修复」：与维护页同一个接口，避免用户为了修一个问题先跳页面 */
+async function quickRepair() {
+  repairing.value = true
+  try {
+    const res = await api.post<{ actions: string[] }>('/system/network/repair')
+    ElMessage.success(res.actions?.length ? `已修复 ${res.actions.length} 项` : '没有需要修复的内容')
+    await refreshSystemHealth()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    repairing.value = false
+  }
 }
 const title = computed(() => titles[route.name as string] || 'WireGuard 管理')
 const roleLabel = computed(
@@ -206,6 +278,12 @@ function openHelp() {
 
 onMounted(() => {
   realtime.connect()
+  // 全局体检：顶栏状态栏与异常横幅都读它，任意页面都能即时感知
+  startHealth()
+})
+
+onUnmounted(() => {
+  stopHealth()
 })
 
 async function onCommand(cmd: string) {
@@ -278,9 +356,101 @@ async function submitPassword() {
   background: var(--el-color-primary-light-9);
 }
 
+/* 顶栏系统状态栏：颜色跟随总体状态，点击直达系统维护 */
+.fnwg-health-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px;
+  border: 1px solid var(--fnwg-border);
+  background: transparent;
+  color: var(--el-text-color-regular);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.fnwg-health-chip .fnwg-dot {
+  margin-right: 0;
+}
+
+.fnwg-health-chip:hover {
+  border-color: var(--el-color-primary-light-5);
+  color: var(--el-color-primary);
+}
+
+.fnwg-health-chip.ok {
+  border-color: var(--el-color-success-light-5);
+  color: var(--el-color-success);
+}
+
+.fnwg-health-chip.warn {
+  border-color: var(--el-color-warning-light-5);
+  color: var(--el-color-warning);
+}
+
+.fnwg-health-chip.down {
+  border-color: var(--el-color-danger-light-5);
+  color: var(--el-color-danger);
+}
+
+/* 全局异常横幅：只在「功能确实没在工作」时出现，位于内容区之外，任何页面都能看到 */
+.fnwg-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--el-color-danger-light-7);
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+  font-size: 12.5px;
+}
+
+.fnwg-banner-icon {
+  font-size: 16px;
+  flex: 0 0 auto;
+}
+
+.fnwg-banner-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.6;
+}
+
+.fnwg-banner-body strong {
+  font-size: 13px;
+}
+
+.fnwg-banner-detail {
+  color: var(--el-text-color-regular);
+  word-break: break-word;
+}
+
+.fnwg-banner-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 @media (max-width: 767px) {
   .fnwg-header-title {
     font-size: 14px;
+  }
+
+  .fnwg-banner {
+    flex-wrap: wrap;
+    padding: 8px 12px;
+  }
+
+  .fnwg-banner-actions {
+    width: 100%;
+    justify-content: flex-end;
   }
 }
 </style>

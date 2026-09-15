@@ -1,57 +1,37 @@
 <template>
   <div>
-    <!-- 最高优先级：NAS 系统网络异常（本应用唯一可能影响系统的地方） -->
-    <el-alert
-      v-if="netResult && !netResult.healthy"
-      type="error"
-      show-icon
-      :closable="false"
-      title="发现影响 NAS 系统网络的异常，建议立即修复"
-      style="margin-bottom: 12px"
-    >
-      <template #default>
-        <div v-for="(m, i) in netResult.messages" :key="i" style="line-height: 1.8">{{ m }}</div>
-        <el-button
-          v-if="session.can('iface.write')"
-          type="danger"
+    <!--
+      系统状态：与顶栏状态栏、系统维护同源（useSystemHealth）。
+      以前这里堆了 4 条各自判断的告警，现在统一成一份清单，口径一致、点一下就能去处理。
+    -->
+    <div class="fnwg-card" style="margin-bottom: 12px">
+      <div class="fnwg-card-head">
+        <div>
+          <strong>系统状态</strong>
+          <span class="fnwg-card-desc">每 60 秒自动复查；有异常时会一直显示在页面顶部</span>
+        </div>
+        <el-tag
           size="small"
-          style="margin-top: 8px"
-          :loading="repairingNet"
-          @click="repairNetwork"
+          :type="!issues.length ? 'success' : errors.length ? 'danger' : 'warning'"
+          effect="plain"
         >
-          立即修复
-        </el-button>
-      </template>
-    </el-alert>
+          {{ !issues.length ? '全部正常' : `${issues.length} 项待处理` }}
+        </el-tag>
+        <el-button size="small" @click="goMaintenance">打开系统维护</el-button>
+      </div>
 
-    <!-- 异常提示：用直白语言说明问题与解决办法 -->
-    <el-alert
-      v-if="overview && !overview.health.agent_up"
-      type="error"
-      show-icon
-      :closable="false"
-      title="后台服务未就绪"
-      description="负责实际建立连接的组件（fnwg-agent）没有运行，现在修改配置不会生效。可尝试在「系统设置」中重启应用，或查看运行记录。"
-      style="margin-bottom: 12px"
-    />
-    <el-alert
-      v-else-if="overview && !overview.health.kernel_module"
-      type="warning"
-      show-icon
-      :closable="false"
-      title="当前系统未开启标准加速模式"
-      description="系统的加密网络功能未启用，新建的连接可能无法工作。请确认 NAS 内核版本较新（一般 0.9.0 以上系统均可），或到「系统设置 → 运行诊断」查看详情。"
-      style="margin-bottom: 12px"
-    />
-    <el-alert
-      v-if="overview && overview.interface_count > 0 && !overview.server_endpoint"
-      type="warning"
-      show-icon
-      :closable="false"
-      title="还没有填写「对外访问地址」"
-      description="手机在外网时需要一个能连回家的地址。请到「系统设置」填写家里的公网域名或 IP，否则二维码里的地址在外网无法使用。"
-      style="margin-bottom: 12px"
-    />
+      <div v-if="!issues.length" class="fnwg-hint">系统上网路线、连接状态、内网访问与转发规则都已就绪。</div>
+
+      <div v-for="it in issues" :key="it.key" class="fnwg-issue-line" :class="it.level">
+        <span :class="['fnwg-dot', it.level === 'error' ? 'down' : 'warn']" />
+        <div class="fnwg-issue-line-body">
+          <strong>{{ it.title }}</strong>
+          <div class="fnwg-hint">{{ it.detail }}</div>
+          <div v-if="it.fix" class="fnwg-hint">处理建议：{{ it.fix }}</div>
+        </div>
+        <el-button v-if="it.to" link type="primary" @click="router.push({ name: it.to })">去处理</el-button>
+      </div>
+    </div>
 
     <!-- 新手引导：没有任何连接时出现 -->
     <div v-if="overview && overview.interface_count === 0" class="fnwg-card fnwg-onboarding">
@@ -289,11 +269,12 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as echarts from 'echarts'
 import { api } from '@/api/client'
-import type { NetworkCheckResult, Overview, Status } from '@/api/types'
+import type { Overview, Status } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import ItemCard from '@/components/ItemCard.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
+import { useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes, formatRate, timeAgo } from '@/utils/format'
@@ -306,8 +287,6 @@ const { isMobile } = useBreakpoint()
 const overview = ref<Overview | null>(null)
 const helpVisible = ref(false)
 const quickStarting = ref(false)
-const netResult = ref<NetworkCheckResult | null>(null)
-const repairingNet = ref(false)
 const chartEl = ref<HTMLElement | null>(null)
 let chart: echarts.ECharts | null = null
 let timer: number | null = null
@@ -316,26 +295,11 @@ const series = ref<{ t: string[]; rx: number[]; tx: number[] }>({ t: [], rx: [],
 
 const helpGroups = allHelpGroups
 
-/** 每次打开总览都做一次只读的网络安全自检，一旦发现异常立刻显性提示 */
-async function checkNetwork() {
-  try {
-    netResult.value = await api.get<NetworkCheckResult>('/system/network')
-  } catch {
-    /* 忽略瞬时错误 */
-  }
-}
+// 系统状态统一由全局健康源提供（顶栏、系统维护与本页同源）
+const { issues, errors } = useSystemHealth()
 
-async function repairNetwork() {
-  repairingNet.value = true
-  try {
-    await api.post('/system/network/repair')
-    ElMessage.success('已修复，NAS 系统网络应立即恢复')
-    await checkNetwork()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  } finally {
-    repairingNet.value = false
-  }
+function goMaintenance() {
+  router.push({ name: 'maintenance' })
 }
 
 // 后端在无数据时可能返回 null（Go 的 nil 切片），这里统一按空数组处理，
@@ -454,7 +418,6 @@ function handleResize() {
 
 onMounted(async () => {
   await load()
-  await checkNetwork()
   await nextTick()
   renderChart()
   window.addEventListener('resize', handleResize)
@@ -473,22 +436,6 @@ onUnmounted(() => {
 .fnwg-stat-sub {
   font-size: 14px;
   opacity: 0.6;
-}
-
-.fnwg-card-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 10px;
-}
-
-.fnwg-card-desc {
-  display: block;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-top: 2px;
-  line-height: 1.5;
 }
 
 .fnwg-onboarding {

@@ -16,6 +16,8 @@ const router = createRouter({
         { path: 'interfaces', name: 'interfaces', component: () => import('@/views/Interfaces.vue') },
         { path: 'peers', name: 'peers', component: () => import('@/views/Peers.vue') },
         { path: 'logs', name: 'logs', component: () => import('@/views/Logs.vue') },
+        // 系统维护：体检与修复类动作集中在这里；系统设置只负责「改配置」
+        { path: 'maintenance', name: 'maintenance', component: () => import('@/views/Maintenance.vue') },
         { path: 'settings', name: 'settings', component: () => import('@/views/Settings.vue') },
       ],
     },

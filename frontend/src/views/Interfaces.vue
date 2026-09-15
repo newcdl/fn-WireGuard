@@ -29,6 +29,7 @@
             <el-tag v-if="!row.enabled" size="small" type="info" effect="plain" style="margin-left: 4px">
               已停用
             </el-tag>
+            <div v-if="rowIssue(row)" class="fnwg-row-warn">{{ rowIssue(row) }}</div>
           </template>
         </el-table-column>
         <el-table-column label="内部地址" min-width="170">
@@ -133,6 +134,8 @@
             />
           </span>
         </div>
+
+        <div v-if="rowIssue(row)" class="fnwg-row-warn">{{ rowIssue(row) }}</div>
 
         <template #actions>
           <el-button size="small" @click="gotoPeers(row)">设备</el-button>
@@ -337,7 +340,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Upload, Download, Refresh, ArrowDown, Reading } from '@element-plus/icons-vue'
@@ -350,6 +353,7 @@ import ItemCard from '@/components/ItemCard.vue'
 import ScenarioPicker from '@/components/ScenarioPicker.vue'
 import { allHelpGroups, interfaceFields, interfacePresets } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
+import { useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes } from '@/utils/format'
@@ -375,6 +379,16 @@ const confTitle = ref('')
 const confText = ref('')
 const helpVisible = ref(false)
 const scenario = ref('home')
+
+// 连接级异常提示：与全局「系统状态」同源，避免连接页与总览给出互相矛盾的结论
+const { issues } = useSystemHealth()
+const natBlocked = computed(() => issues.value.some((i) => i.key === 'nat'))
+
+function rowIssue(row: WgInterface): string {
+  if (row.enabled && !row.up) return '已启用但当前未工作：设备无法连接。点「立即应用」重新下发配置。'
+  if (row.allow_lan && natBlocked.value) return '内网访问已开启但链路未就绪，到「系统维护」查看卡在哪一层。'
+  return ''
+}
 
 // 名称、专用地址与服务端口刻意留空：由后端按连接序号自动分配，
 // 并避开已有连接占用的端口与网段（见 service.applyInterfaceDefaults）。

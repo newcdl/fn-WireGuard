@@ -95,6 +95,52 @@ body {
   padding: 16px;
 }
 
+/* 卡片标题行（总览 / 系统维护通用） */
+.fnwg-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.fnwg-card-desc {
+  display: block;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-top: 2px;
+  line-height: 1.5;
+}
+
+/* 状态清单条目（总览 / 系统维护通用） */
+.fnwg-issue-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.fnwg-issue-line:first-of-type {
+  border-top: none;
+}
+
+.fnwg-issue-line-body {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.8;
+}
+
+/* 表格行 / 连接卡片内的异常提示（与全局状态同源） */
+.fnwg-row-warn {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--el-color-warning);
+}
+
 .fnwg-stat {
   display: flex;
   flex-direction: column;

@@ -40,151 +40,6 @@
         </div>
       </el-tab-pane>
 
-      <!-- 运行状态 -->
-      <el-tab-pane label="运行状态" name="health">
-        <!-- NAS 系统网络安全自检：本应用唯一可能影响系统的地方，单列出来并可一键修复 -->
-        <div class="fnwg-card" style="max-width: 760px; margin-bottom: 12px">
-          <div class="fnwg-safety">
-            <el-icon class="fnwg-safety-icon" :color="netTone"><CircleCheck /></el-icon>
-            <div style="flex: 1; min-width: 0">
-              <strong>NAS 系统网络安全检查</strong>
-              <div class="fnwg-hint">
-                确认本应用没有影响 NAS 自身的上网路线。FN Connect、Docker、应用市场与系统更新都依赖它。
-                本应用只会清理自己造成的残留，绝不修改系统设置。
-              </div>
-            </div>
-            <el-button :icon="Search" :loading="checkingNet" @click="checkNetwork">立即检查</el-button>
-          </div>
-
-          <template v-if="netResult">
-            <el-alert
-              :type="netAlert.type"
-              :closable="false"
-              show-icon
-              :title="netAlert.title"
-              style="margin-top: 12px"
-            />
-            <ul class="fnwg-net-list">
-              <li v-for="(m, i) in netResult.messages" :key="i">{{ m }}</li>
-            </ul>
-            <el-button
-              v-if="!netResult.healthy && session.can('iface.write')"
-              type="danger"
-              :icon="Refresh"
-              :loading="repairingNet"
-              @click="repairNetwork"
-            >
-              立即修复
-            </el-button>
-
-            <!-- 内网访问逐层诊断：把「连上了但访问不了家里其它设备」定位到具体环节 -->
-            <div v-if="netResult.nat?.checks?.length" class="fnwg-nat-checks">
-              <div class="fnwg-foreign-title">
-                内网访问诊断（设备访问家里其它设备）
-                <span v-if="natFailed" class="fnwg-nat-badge">有 {{ natFailed }} 项未通过</span>
-              </div>
-              <div v-for="c in netResult.nat.checks" :key="c.key" class="fnwg-nat-check">
-                <el-tag size="small" :type="c.ok ? 'success' : 'danger'" effect="plain">
-                  {{ c.ok ? '通过' : '未通过' }}
-                </el-tag>
-                <div class="fnwg-nat-check-body">
-                  <strong>{{ c.label }}</strong>
-                  <div class="fnwg-nat-check-detail">{{ c.detail }}</div>
-                  <div v-if="!c.ok && c.fix" class="fnwg-nat-check-fix">处理建议：{{ c.fix }}</div>
-                </div>
-              </div>
-            </div>
-
-            <!-- 疑似残留：内核里有、但本应用不认的 WireGuard 网卡。只提示，删除需用户手工确认名称 -->
-            <div v-if="netResult.foreign_interfaces?.length" class="fnwg-foreign-box">
-              <div class="fnwg-foreign-title">疑似残留网卡</div>
-              <div v-for="fi in netResult.foreign_interfaces" :key="fi.name" class="fnwg-foreign-item">
-                <div class="fnwg-foreign-main">
-                  <el-tag size="small" effect="plain" :type="fi.up ? 'warning' : 'info'">
-                    {{ fi.up ? '运行中' : '已停止' }}
-                  </el-tag>
-                  <strong>{{ fi.name }}</strong>
-                  <span class="fnwg-foreign-meta">
-                    {{ fi.listen_port > 0 ? `占用 UDP 端口 ${fi.listen_port}` : '未监听端口' }}
-                    · {{ fi.peer_count }} 个节点
-                    <template v-if="fi.addresses?.length">· {{ fi.addresses.join('、') }}</template>
-                  </span>
-                </div>
-                <el-button
-                  v-if="session.can('iface.write')"
-                  size="small"
-                  type="danger"
-                  plain
-                  :loading="removingForeign === fi.name"
-                  @click="removeForeign(fi)"
-                >
-                  清理
-                </el-button>
-              </div>
-              <div class="fnwg-foreign-hint">
-                这些网卡<b>不是本应用创建的</b>：可能是早期版本卸载时没清理干净的残留，
-                也可能是你用 wg-quick 等工具手工建的。残留会一直占着上面标注的端口，
-                导致新连接无法使用这些端口。<b>无法确认来源时请不要清理。</b>
-              </div>
-            </div>
-          </template>
-        </div>
-
-        <div class="fnwg-card" style="max-width: 760px">
-          <el-descriptions :column="isMobile ? 1 : 2" border size="small">
-            <el-descriptions-item label="后台服务">
-              <el-tag size="small" :type="health?.agent_up ? 'success' : 'danger'" effect="plain">
-                {{ health?.agent_up ? '运行中' : '未运行' }}
-              </el-tag>
-            </el-descriptions-item>
-            <el-descriptions-item label="工作模式">{{ backendLabel }}</el-descriptions-item>
-            <el-descriptions-item label="加密网络支持">
-              <el-tag size="small" :type="health?.kernel_module ? 'success' : 'warning'" effect="plain">
-                {{ health?.kernel_module ? '已开启' : '未开启' }}
-              </el-tag>
-            </el-descriptions-item>
-            <el-descriptions-item label="兼容模式支持">
-              <el-tag size="small" :type="health?.tun_device ? 'success' : 'warning'" effect="plain">
-                {{ health?.tun_device ? '可用' : '不可用' }}
-              </el-tag>
-            </el-descriptions-item>
-            <el-descriptions-item label="已运行时长">{{ uptime }}</el-descriptions-item>
-            <el-descriptions-item label="软件版本">{{ session.version || '-' }}</el-descriptions-item>
-          </el-descriptions>
-
-          <el-alert
-            v-if="health?.error"
-            type="error"
-            :closable="false"
-            show-icon
-            :title="health.error"
-            style="margin-top: 12px"
-          />
-
-          <div class="fnwg-explain">
-            <div><strong>加密网络支持</strong>：标准模式，速度最快、资源占用最低。若显示「未开启」，新建的连接将无法工作。</div>
-            <div><strong>兼容模式支持</strong>：当系统内核不支持标准模式时的备选方案，速度稍慢，目前版本尚未启用。</div>
-          </div>
-
-          <el-button
-            v-if="session.can('iface.write')"
-            :icon="Refresh"
-            style="margin-top: 14px"
-            @click="forceReconcile"
-          >
-            重新应用全部配置
-          </el-button>
-          <FieldTips
-            :meta="{
-              label: '重新应用全部配置',
-              what: '让系统按照当前保存的设置，重新建立一次所有连接与设备。',
-              why: '当你怀疑实际状态与界面显示不一致（例如手工改过系统设置、或连接异常）时使用。',
-              effect: '不会改动你的任何配置，只会把系统状态纠正回配置描述的样子，通常几秒内完成。',
-            }"
-          />
-        </div>
-      </el-tab-pane>
-
       <!-- 账号管理 -->
       <el-tab-pane v-if="session.isAdmin" label="账号管理" name="users">
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
@@ -347,6 +202,7 @@
           <el-alert type="info" :closable="false" show-icon style="margin-top: 12px">
             <template #title>
               忘记某项设置是什么意思？点击「配置说明大全」，或直接点任意设置项旁边的问号图标。
+              这里只管「改配置」；查看系统状态、做体检与修复请到左侧「系统维护」。
             </template>
           </el-alert>
           <el-button style="margin-top: 12px" :icon="Reading" @click="helpVisible = true">打开配置说明大全</el-button>
@@ -387,9 +243,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Download, Refresh, Reading, CircleCheck, Search } from '@element-plus/icons-vue'
+import { Plus, Download, Reading } from '@element-plus/icons-vue'
 import { api, download } from '@/api/client'
-import type { BackupRecord, ForeignInterface, Health, NetworkCheckResult, User } from '@/api/types'
+import type { BackupRecord, Health, User } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
@@ -407,93 +263,6 @@ const { isMobile, dialogWidth } = useBreakpoint()
 const S = settingFields
 const U = userFields
 const helpGroups = allHelpGroups
-
-const netResult = ref<NetworkCheckResult | null>(null)
-const checkingNet = ref(false)
-const repairingNet = ref(false)
-const removingForeign = ref('')
-
-/**
- * 自检结论的呈现方式。
- * 疑似残留网卡不算「异常」—— 它也可能真的在被别的工具使用，
- * 因此只给中性提醒，不把整块自检标成红色。
- */
-const netAlert = computed<{ type: 'success' | 'warning' | 'error' | 'info'; title: string }>(() => {
-  const r = netResult.value
-  if (!r) return { type: 'info', title: '' }
-  if (!r.healthy) return { type: 'error', title: '发现异常，建议立即修复' }
-  if (r.foreign_interfaces?.length) {
-    return { type: 'warning', title: '未发现路由异常，但有疑似残留网卡待你确认' }
-  }
-  return { type: 'success', title: '未发现影响 NAS 系统网络的问题' }
-})
-const netTone = computed(() =>
-  !netResult.value ? '#909399' : netResult.value.healthy ? '#22c55e' : '#ef4444',
-)
-
-/** 内网访问自检里未通过的项数，0 表示这条链路完全就绪 */
-const natFailed = computed(
-  () => (netResult.value?.nat?.checks || []).filter((c) => !c.ok).length,
-)
-
-/**
- * 清理疑似残留网卡。
- * 这是应用里唯一能删除「非本应用创建」对象的操作，
- * 因此强制用户手工输入网卡名二次确认；后端还会再校验一次名称与网卡类型。
- */
-async function removeForeign(fi: ForeignInterface) {
-  const portTip = fi.listen_port > 0 ? `，并释放 UDP 端口 ${fi.listen_port}` : ''
-  try {
-    const { value } = await ElMessageBox.prompt(
-      `将删除系统上的 WireGuard 网卡「${fi.name}」${portTip}。\n` +
-        '如果它其实正被其它工具（例如你自己写的 wg-quick 配置）使用，删除会中断该连接。\n\n' +
-        `请输入网卡名称「${fi.name}」以确认：`,
-      '清理疑似残留网卡',
-      {
-        confirmButtonText: '确认删除',
-        cancelButtonText: '取消',
-        type: 'warning',
-        inputPlaceholder: fi.name,
-        inputValidator: (v: string) => (v === fi.name ? true : `请输入「${fi.name}」以确认`),
-      },
-    )
-    removingForeign.value = fi.name
-    const res = await api.post<{ actions: string[] }>('/system/network/foreign-interface/delete', {
-      name: fi.name,
-      confirm: value,
-    })
-    ElMessage.success(res.actions?.[0] || `已清理 ${fi.name}`)
-    await checkNetwork()
-  } catch (e) {
-    if (e !== 'cancel' && e !== 'close') ElMessage.error((e as Error).message)
-  } finally {
-    removingForeign.value = ''
-  }
-}
-
-async function checkNetwork() {
-  checkingNet.value = true
-  try {
-    netResult.value = await api.get<NetworkCheckResult>('/system/network')
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  } finally {
-    checkingNet.value = false
-  }
-}
-
-async function repairNetwork() {
-  repairingNet.value = true
-  try {
-    const res = await api.post<{ actions: string[] }>('/system/network/repair')
-    ElMessage.success(res.actions?.length ? `已修复 ${res.actions.length} 项` : '没有需要修复的内容')
-    await checkNetwork()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  } finally {
-    repairingNet.value = false
-  }
-}
 
 const tab = ref('general')
 const settings = reactive<Record<string, string>>({
@@ -519,13 +288,6 @@ const backendLabel = computed(() => {
     b ||
     '-'
   )
-})
-
-const uptime = computed(() => {
-  const s = health.value?.uptime_sec || 0
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  return h > 0 ? `${h} 小时 ${m} 分钟` : `${m} 分钟`
 })
 
 function roleLabel(role: string) {
@@ -708,7 +470,6 @@ function exportAll() {
 
 onMounted(async () => {
   await loadAll()
-  await checkNetwork()
 })
 </script>
 
@@ -719,111 +480,10 @@ onMounted(async () => {
   line-height: 1.6;
 }
 
-.fnwg-explain {
-  margin-top: 12px;
-  font-size: 12.5px;
-  color: var(--el-text-color-secondary);
-  line-height: 1.9;
-}
-
 .fnwg-about-text {
   color: var(--el-text-color-regular);
   line-height: 1.9;
   font-size: 13.5px;
 }
 
-.fnwg-net-list {
-  margin: 10px 0 0;
-  padding-left: 18px;
-  font-size: 12.5px;
-  line-height: 1.9;
-  color: var(--el-text-color-regular);
-}
-
-.fnwg-foreign-box {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 10px;
-  background: var(--el-fill-color-lighter);
-}
-
-.fnwg-foreign-title {
-  font-size: 13px;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-
-.fnwg-foreign-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 7px 0;
-  border-top: 1px solid var(--el-border-color-lighter);
-  flex-wrap: wrap;
-}
-
-.fnwg-foreign-main {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 12.5px;
-}
-
-.fnwg-foreign-meta {
-  color: var(--el-text-color-secondary);
-}
-
-.fnwg-foreign-hint {
-  margin-top: 8px;
-  font-size: 12.5px;
-  line-height: 1.85;
-  color: var(--el-text-color-regular);
-}
-
-.fnwg-nat-checks {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 10px;
-  background: var(--el-fill-color-lighter);
-}
-
-.fnwg-nat-check {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 8px 0;
-  border-top: 1px solid var(--el-border-color-lighter);
-}
-
-.fnwg-nat-check:first-of-type {
-  border-top: none;
-}
-
-.fnwg-nat-check-body {
-  font-size: 12.5px;
-  line-height: 1.8;
-  flex: 1;
-  min-width: 0;
-}
-
-.fnwg-nat-check-detail {
-  color: var(--el-text-color-regular);
-  word-break: break-word;
-}
-
-.fnwg-nat-check-fix {
-  color: var(--el-color-danger);
-  margin-top: 2px;
-}
-
-.fnwg-nat-badge {
-  margin-left: 8px;
-  font-weight: 400;
-  font-size: 12px;
-  color: var(--el-color-danger);
-}
 </style>
