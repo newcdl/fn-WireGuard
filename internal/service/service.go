@@ -14,6 +14,7 @@ import (
 
 	"fnwg/internal/agentapi"
 	"fnwg/internal/model"
+	"fnwg/internal/notify"
 	"fnwg/internal/store"
 )
 
@@ -35,6 +36,10 @@ type Service struct {
 	Cache   *StatusCache
 	Log     *slog.Logger
 	Version string
+	// notifier 只用于读取通知状态与发送测试消息。
+	// 真正的事件投递在代理进程的收敛引擎里（那里才知道设备上下线），
+	// Web 进程不启动队列，避免同一事件被两个进程各发一遍。
+	notifier *notify.Sender
 }
 
 // New 创建服务。
@@ -42,7 +47,14 @@ func New(st *store.Store, core agentapi.Core, logger *slog.Logger, version strin
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{Store: st, Core: core, Cache: NewStatusCache(core, logger), Log: logger, Version: version}
+	return &Service{
+		Store:    st,
+		Core:     core,
+		Cache:    NewStatusCache(core, logger),
+		Log:      logger,
+		Version:  version,
+		notifier: notify.New(st, logger),
+	}
 }
 
 // ---------------------------------------------------------------- 状态缓存

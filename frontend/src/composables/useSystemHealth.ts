@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { api } from '@/api/client'
-import type { Health, NetworkCheckResult, Overview } from '@/api/types'
+import type { Health, NetworkCheckResult, NotifyStatus, Overview } from '@/api/types'
 
 /**
  * 全局「系统健康」数据源与异常清单推导。
@@ -42,6 +42,7 @@ const loaded = ref(false)
 const net = ref<NetworkCheckResult | null>(null)
 const health = ref<Health | null>(null)
 const overview = ref<Overview | null>(null)
+const notifyStatus = ref<NotifyStatus | null>(null)
 const failedReason = ref('')
 const checkedAt = ref('')
 
@@ -50,10 +51,11 @@ let timer: number | null = null
 async function refresh(): Promise<void> {
   loading.value = true
   try {
-    const [n, h, o] = await Promise.allSettled([
+    const [n, h, o, nt] = await Promise.allSettled([
       api.get<NetworkCheckResult>('/system/network'),
       api.get<Health>('/health'),
       api.get<Overview>('/overview'),
+      api.get<NotifyStatus>('/system/notify'),
     ])
     if (n.status === 'fulfilled') {
       net.value = n.value
@@ -63,6 +65,7 @@ async function refresh(): Promise<void> {
     }
     if (h.status === 'fulfilled') health.value = h.value
     if (o.status === 'fulfilled') overview.value = o.value
+    if (nt.status === 'fulfilled') notifyStatus.value = nt.value
     checkedAt.value = new Date().toLocaleTimeString()
     loaded.value = true
   } finally {
@@ -135,8 +138,10 @@ const issues = computed<HealthIssue[]>(() => {
     })
   }
 
-  // ⑤ 内网访问：开关开着但链路没就绪。判定依据是后端逐层自检，避免前端自己猜
-  const natFailed = (n?.nat?.checks || []).filter((c) => !c.ok)
+  // ⑤ 内网访问：开关开着但链路没就绪。判定依据是后端逐层自检，避免前端自己猜。
+  //    设备间隔离单独成条（见下），否则一条隔离故障会被挂在「内网访问」标题下，
+  //    用户会去检查一个与故障无关的开关。
+  const natFailed = (n?.nat?.checks || []).filter((c) => !c.ok && c.key !== 'isolate')
   if (natFailed.length) {
     out.push({
       key: 'nat',
@@ -145,6 +150,34 @@ const issues = computed<HealthIssue[]>(() => {
       detail: natFailed.map((c) => `${c.label}：${c.detail}`).join('；'),
       fix: natFailed.find((c) => c.fix)?.fix,
       to: 'maintenance',
+    })
+  }
+
+  // ⑤′ 设备间隔离：开着却没真正生效。这类故障用户完全看不见
+  //     （设备之间还能互访，看起来一切正常），必须主动说出来。
+  const isolateFailed = (n?.nat?.checks || []).find((c) => c.key === 'isolate' && !c.ok)
+  if (isolateFailed) {
+    out.push({
+      key: 'isolate',
+      level: 'warning',
+      title: '「设备间隔离」已开启，但还没真正生效',
+      detail: isolateFailed.detail,
+      fix: isolateFailed.fix,
+      to: 'maintenance',
+    })
+  }
+
+  // ⑤″ 访问控制配置互相矛盾：三项设置各自都对，组合起来互相抵消。
+  //     这类问题只能靠汇总式诊断说出来 —— 现象只是一个模糊的「配了却访问不了」，
+  //     用户不可能自己推出矛盾藏在另一个页面的另一个开关里。
+  for (const a of n?.access_issues || []) {
+    out.push({
+      key: `access:${a.key}:${a.interface_id ?? 0}`,
+      level: 'warning',
+      title: a.title,
+      detail: a.detail,
+      fix: a.fix,
+      to: a.to || 'interfaces',
     })
   }
 
@@ -169,6 +202,29 @@ const issues = computed<HealthIssue[]>(() => {
       title: '还没有填写「对外访问地址」',
       detail: '手机在外网需要一个能连回家的地址，现在生成的二维码只在内网可用。',
       fix: '到「系统设置 → 接入设置」填写家里的公网域名或 IP。',
+      to: 'settings',
+    })
+  }
+
+  // ⑧ 通知配了但发不出去：这类故障完全静默（用户以为配好了在等消息），
+  //    必须主动说清「最近一次是什么时候、为什么失败」。
+  const nt = notifyStatus.value
+  if (nt?.configured && nt.problem) {
+    out.push({
+      key: 'notify',
+      level: 'warning',
+      title: '通知地址无法使用',
+      detail: `配置的通知地址有问题：${nt.problem}`,
+      fix: '到「系统设置 → 事件通知」修正地址后点「发送测试通知」验证。',
+      to: 'settings',
+    })
+  } else if (nt?.configured && nt.last && !nt.last.ok) {
+    out.push({
+      key: 'notify',
+      level: 'warning',
+      title: '通知发送失败',
+      detail: `最近一次尝试（${new Date(nt.last.at).toLocaleString()}）未送达：${nt.last.message}`,
+      fix: '确认通知地址可访问、令牌未过期，然后到「系统设置 → 事件通知」点「发送测试通知」重试。',
       to: 'settings',
     })
   }
@@ -221,6 +277,7 @@ export function useSystemHealth() {
     net,
     health,
     overview,
+    notifyStatus,
     checkedAt,
     failedReason,
     issues,

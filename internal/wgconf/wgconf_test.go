@@ -7,6 +7,60 @@ import (
 	"fnwg/internal/model"
 )
 
+// TestClientFingerprint 指纹是「设备里那份配置是否过期」的唯一依据，
+// 因此它必须同时满足三件事：与列表顺序无关、对每个影响设备侧内容的字段敏感、
+// 完全不含密钥。任何一条不成立，用户看到的就是错误的过期提示。
+func TestClientFingerprint(t *testing.T) {
+	base := ClientConfigInputs{
+		Endpoint:    "home.example.com:51820",
+		ClientAddrs: []string{"10.10.0.2/32"},
+		AllowedIPs:  []string{"192.168.3.0/24", "10.10.0.0/24"},
+		DNS:         []string{"223.5.5.5", "119.29.29.29"},
+		MTU:         1420,
+		Keepalive:   25,
+		ServerPub:   "SERVERPUBKEY",
+	}
+	want := ClientFingerprint(base)
+
+	// ① 顺序无关：界面上调整范围顺序不该被当成「配置变了」
+	reordered := base
+	reordered.AllowedIPs = []string{"10.10.0.0/24", "192.168.3.0/24"}
+	reordered.DNS = []string{"119.29.29.29", "223.5.5.5"}
+	if got := ClientFingerprint(reordered); got != want {
+		t.Fatalf("顺序不同不应改变指纹：%s vs %s", got, want)
+	}
+
+	// ② 心跳为 0 时按默认值归一，与渲染出来的配置保持一致
+	zeroKeepalive := base
+	zeroKeepalive.Keepalive = 0
+	defKeepalive := base
+	defKeepalive.Keepalive = DefaultKeepalive
+	if ClientFingerprint(zeroKeepalive) != ClientFingerprint(defKeepalive) {
+		t.Fatal("心跳为 0 应按默认值归一，否则会出现「没改配置却提示过期」")
+	}
+
+	// ③ 每个影响设备侧内容的字段都要敏感
+	cases := map[string]func(ClientConfigInputs) ClientConfigInputs{
+		"对外地址":  func(in ClientConfigInputs) ClientConfigInputs { in.Endpoint = "other.example.com:51820"; return in },
+		"隧道地址":  func(in ClientConfigInputs) ClientConfigInputs { in.ClientAddrs = []string{"10.10.0.3/32"}; return in },
+		"通行范围":  func(in ClientConfigInputs) ClientConfigInputs { in.AllowedIPs = []string{"0.0.0.0/0"}; return in },
+		"DNS":   func(in ClientConfigInputs) ClientConfigInputs { in.DNS = []string{"1.1.1.1"}; return in },
+		"MTU":   func(in ClientConfigInputs) ClientConfigInputs { in.MTU = 1380; return in },
+		"心跳":    func(in ClientConfigInputs) ClientConfigInputs { in.Keepalive = 15; return in },
+		"服务端公钥": func(in ClientConfigInputs) ClientConfigInputs { in.ServerPub = "OTHERPUBKEY"; return in },
+	}
+	for name, mutate := range cases {
+		if ClientFingerprint(mutate(base)) == want {
+			t.Fatalf("%s 变化后指纹必须变化，否则设备上的旧配置不会被标记为过期", name)
+		}
+	}
+
+	// ④ 指纹是定长的短串：它要落库、要下发给前端，不能携带任何可用于还原密钥的信息
+	if len(want) != 16 {
+		t.Fatalf("指纹应为 16 位十六进制短串，实际 %d 位: %s", len(want), want)
+	}
+}
+
 const sample = `# 服务端配置
 [Interface]
 PrivateKey = aGVsbG8gd29ybGQgdGhpcyBpcyBhIHRlc3Qga2V5ISE=

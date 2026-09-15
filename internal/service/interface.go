@@ -68,6 +68,12 @@ type CreateInterfaceInput struct {
 	// AllowLAN 控制「允许设备访问家里内网」。
 	// 新建连接时为 nil 表示采用默认值（开启）；编辑时为 nil 表示保持原值。
 	AllowLAN *bool `json:"allow_lan"`
+	// IsolatePeers 控制「设备间隔离」。
+	// 新建连接时为 nil 表示采用默认值（**关闭**）；编辑时为 nil 表示保持原值。
+	//
+	// 与 AllowLAN 的默认值取向相反是有意的：隔离是「新增限制」，
+	// 默认打开会在用户没做任何操作的情况下切断已有的设备互访。
+	IsolatePeers *bool `json:"isolate_peers"`
 	// PrivateKey 仅在导入已有配置时使用；为空表示自动生成。
 	PrivateKey string `json:"private_key"`
 }
@@ -114,6 +120,8 @@ func (s *Service) CreateInterface(ctx context.Context, in CreateInterfaceInput, 
 		// 新建连接默认开启内网访问：设备连回家就是为了访问 NAS 与家里其它设备，
 		// 不开的话表现是「能连上 NAS，但访问不了家里的机器」。
 		AllowLAN: in.AllowLAN == nil || *in.AllowLAN,
+		// 设备间隔离默认关闭：它是新增限制，默认打开会静默改变已有设备的可达性。
+		IsolatePeers: in.IsolatePeers != nil && *in.IsolatePeers,
 	}
 	if err := s.applyInterfaceDefaults(ctx, it, 0); err != nil {
 		return nil, err
@@ -156,6 +164,9 @@ func (s *Service) UpdateInterface(ctx context.Context, id int64, in CreateInterf
 	it.Autostart = in.Autostart
 	if in.AllowLAN != nil {
 		it.AllowLAN = *in.AllowLAN
+	}
+	if in.IsolatePeers != nil {
+		it.IsolatePeers = *in.IsolatePeers
 	}
 	// 私钥仅在显式传入时覆盖，避免前端表单未携带该字段导致密钥丢失
 	if in.PrivateKey != "" {
@@ -235,6 +246,35 @@ func (s *Service) SetLanAccess(ctx context.Context, id int64, enabled bool, a Ac
 	action := "iface.lan_access_off"
 	if enabled {
 		action = "iface.lan_access_on"
+	}
+	s.audit(ctx, a, action, "interface", fmt.Sprint(id), "", fmt.Sprint(enabled), "ok", "")
+	if err := s.reconcile(ctx); err != nil {
+		return nil, err
+	}
+	it.PrivateKey = ""
+	return it, nil
+}
+
+// SetPeerIsolation 一键切换「设备间隔离」。
+//
+// 与 SetLanAccess 同构：不必进编辑表单就能开关。打开后这条连接里的设备
+// 互相访问的流量会在 NAS 上被丢弃，但它们访问 NAS 与家里内网不受影响。
+func (s *Service) SetPeerIsolation(ctx context.Context, id int64, enabled bool, a Actor) (*model.Interface, error) {
+	it, err := s.Store.GetInterface(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if it.IsolatePeers == enabled {
+		it.PrivateKey = ""
+		return it, nil
+	}
+	it.IsolatePeers = enabled
+	if err := s.Store.UpdateInterface(ctx, it); err != nil {
+		return nil, err
+	}
+	action := "iface.isolate_off"
+	if enabled {
+		action = "iface.isolate_on"
 	}
 	s.audit(ctx, a, action, "interface", fmt.Sprint(id), "", fmt.Sprint(enabled), "ok", "")
 	if err := s.reconcile(ctx); err != nil {

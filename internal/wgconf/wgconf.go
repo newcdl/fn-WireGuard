@@ -2,6 +2,8 @@
 package wgconf
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"sort"
@@ -231,6 +233,11 @@ func splitScripts(s string) []string {
 	return out
 }
 
+// DefaultKeepalive 是未显式设置心跳时的默认值。
+// 单独定义是因为「配置指纹」必须与实际渲染出来的内容一致，
+// 两边各写一次 25 的话，改了一处就会出现「没改配置却提示过期」。
+const DefaultKeepalive = 25
+
 // RenderClientOptions 控制客户端配置渲染。
 type RenderClientOptions struct {
 	// Endpoint 是服务端对外地址（host:port）。
@@ -252,7 +259,7 @@ type RenderClientOptions struct {
 // RenderClient 渲染客户端配置。
 func RenderClient(serverPublicKey string, it *model.Interface, p *model.Peer, opt RenderClientOptions) string {
 	if opt.Keepalive == 0 {
-		opt.Keepalive = 25
+		opt.Keepalive = DefaultKeepalive
 	}
 	if len(opt.AllowedIPs) == 0 {
 		opt.AllowedIPs = []string{"0.0.0.0/0", "::/0"}
@@ -289,6 +296,53 @@ func RenderClient(serverPublicKey string, it *model.Interface, p *model.Peer, op
 		fmt.Fprintf(&b, "PersistentKeepalive = %d\n", opt.Keepalive)
 	}
 	return b.String()
+}
+
+// ClientConfigInputs 是「设备里那份配置」的全部输入（刻意不含任何私钥）。
+type ClientConfigInputs struct {
+	// Endpoint 对外访问地址（host:port）。
+	Endpoint string
+	// ClientAddrs 分配给设备的隧道地址。
+	ClientAddrs []string
+	// AllowedIPs 设备侧通行范围（决定哪些流量走隧道）。
+	AllowedIPs []string
+	// DNS 下发给设备的 DNS。
+	DNS []string
+	// MTU 可选。
+	MTU int
+	// Keepalive 心跳间隔（已按默认值归一）。
+	Keepalive int
+	// ServerPub 服务端公钥。
+	ServerPub string
+}
+
+// ClientFingerprint 计算客户端配置的稳定指纹，用于判断设备里那份配置是否已过期。
+//
+// 三条约束：
+//  1. **不含私钥**。指纹要落库、要通过接口下发给前端做比较，
+//     绝不能让它带上任何可用于还原密钥的信息；
+//  2. **与列表顺序无关**。通行范围在界面上可以任意调整顺序，那不该被算成「配置变了」；
+//  3. **只反映会影响设备侧内容的字段**。改对外地址、DNS、MTU、通行范围、心跳都会变；
+//     改设备名、备注、配额都不会变 —— 后者改了不影响设备里那份配置。
+func ClientFingerprint(in ClientConfigInputs) string {
+	dns := append([]string{}, in.DNS...)
+	sort.Strings(dns)
+	keepalive := in.Keepalive
+	if keepalive == 0 {
+		keepalive = DefaultKeepalive
+	}
+	parts := []string{
+		"v1",
+		"ep=" + strings.TrimSpace(in.Endpoint),
+		"addr=" + strings.Join(MergeCIDRs(in.ClientAddrs), ","),
+		"ips=" + strings.Join(MergeCIDRs(in.AllowedIPs), ","),
+		"dns=" + strings.Join(dns, ","),
+		"mtu=" + strconv.Itoa(in.MTU),
+		"ka=" + strconv.Itoa(keepalive),
+		"spk=" + strings.TrimSpace(in.ServerPub),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return hex.EncodeToString(sum[:8])
 }
 
 // SplitClientAndServerIPs 把节点的 AllowedIPs 拆成「客户端自身地址」与「客户端可见网段」。

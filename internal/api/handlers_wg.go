@@ -115,6 +115,27 @@ func (s *Server) handleSetLanAccess(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, it)
 }
 
+// handleSetPeerIsolation 切换「设备间隔离」。
+func (s *Server) handleSetPeerIsolation(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	it, err := s.svc.SetPeerIsolation(r.Context(), id, in.Enabled, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, it)
+}
+
 func (s *Server) handleApplyInterface(w http.ResponseWriter, r *http.Request) {
 	actions, err := s.svc.ReconcileNow(r.Context())
 	if err != nil {

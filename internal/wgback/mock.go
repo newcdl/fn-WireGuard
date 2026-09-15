@@ -29,11 +29,17 @@ type mockBackend struct {
 	mu    sync.Mutex
 	devs  map[string]*mockDevice
 	state *State
+	// applyErr 非空时 Apply 直接失败，用于测试「配置下发失败」的通知链路。
+	applyErr error
+	// healActions 非空时 Heal 返回它，用于测试「残留网络自愈」的通知链路。
+	healActions []string
 }
 
 type mockDevice struct {
 	spec  model.InterfaceSpec
 	peers map[string]*mockPeer
+	// linkDown 让网卡在快照里显示为「未工作」，用于测试连接掉线这一类场景。
+	linkDown bool
 }
 
 type mockPeer struct {
@@ -57,8 +63,20 @@ func (b *mockBackend) Caps() Capabilities {
 func (b *mockBackend) ManagedInterfaces() []string { return b.state.ManagedCopy() }
 
 func (b *mockBackend) Heal(ctx context.Context) ([]string, error) {
-	// 内存后端不存在系统路由，无需修复。
-	return nil, nil
+	// 内存后端不存在系统路由，默认无需修复；测试可用 SetHealActions 指定结果。
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string{}, b.healActions...), nil
+}
+
+// SetHealActions 指定 Heal 的返回值，用于测试「残留网络自愈」的通知链路。
+//
+// 只有内存后端提供：真实环境里这类残留来自上一次异常退出或升级，
+// 单元测试没法真的造一条系统路由出来。
+func (b *mockBackend) SetHealActions(actions []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.healActions = append([]string{}, actions...)
 }
 
 func (b *mockBackend) Cleanup(ctx context.Context) ([]string, error) {
@@ -131,11 +149,40 @@ func (b *mockBackend) NATStatus() model.NATStatus {
 	}
 }
 
+// SetApplyError 让后续 Apply 直接返回该错误（传 nil 恢复正常）。
+//
+// 只有内存后端提供：真实环境里这类失败来自内核调用（权限、模块、
+// 设备名冲突……），而单元测试需要一个可控的失败开关。
+func (b *mockBackend) SetApplyError(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.applyErr = err
+}
+
+// SetLinkDown 让指定网卡在状态快照里显示为「未工作」，模拟内核侧掉线
+// （网卡被其它工具停用或删除）。返回是否找到该网卡。
+//
+// 只有内存后端提供：真实内核里掉不掉线由内核决定，
+// 而单元测试需要一个可控的「本应工作但没工作」场景。
+func (b *mockBackend) SetLinkDown(name string, down bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	dev, ok := b.devs[name]
+	if !ok {
+		return false
+	}
+	dev.linkDown = down
+	return true
+}
+
 func (b *mockBackend) Apply(specs []model.InterfaceSpec, opts ApplyOptions) (Diff, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	var diff Diff
+	if b.applyErr != nil {
+		return diff, b.applyErr
+	}
 	seen := map[string]bool{}
 	for _, spec := range specs {
 		seen[spec.Name] = true
@@ -226,7 +273,7 @@ func (b *mockBackend) Snapshot(names []string) ([]model.InterfaceStatus, error) 
 		}
 		st := model.InterfaceStatus{
 			Name:       name,
-			Up:         dev.spec.Up,
+			Up:         dev.spec.Up && !dev.linkDown,
 			ListenPort: dev.spec.ListenPort,
 			FWMark:     dev.spec.FWMark,
 			MTU:        dev.spec.MTU,

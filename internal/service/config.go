@@ -124,18 +124,35 @@ func (s *Service) ExportAllZip(ctx context.Context) ([]byte, string, error) {
 	return buf.Bytes(), fmt.Sprintf("fn-wireguard-%s.zip", time.Now().Format("20060102-150405")), nil
 }
 
-// BackupPayload 是备份文件内容。
+// BackupUser 是备份里的账号快照。
+//
+// 不复用 model.User：那里 PasswordHash / TOTPSecret 打了 `json:"-"`，
+// 目的是不让它们出现在 /users 的接口响应里；但备份恰恰需要这两项，
+// 否则还原后管理员密码与二次验证密钥就丢了，全量备份名不副实。
+type BackupUser struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	TOTPSecret   string `json:"totp_secret,omitempty"`
+	Role         string `json:"role"`
+	Status       int    `json:"status"` // 1 启用 0 禁用
+}
+
+// BackupPayload 是备份文件内容（全量：连接、设备、设置、账号与密钥）。
 type BackupPayload struct {
 	Version    string            `json:"version"`
 	CreatedAt  time.Time         `json:"created_at"`
-	IncludeKey bool              `json:"include_key"`
+	IncludeKey bool              `json:"include_key"` // 新备份恒为 true，仅用于兼容读取旧备份
 	Interfaces []model.Interface `json:"interfaces"`
 	Peers      []model.Peer      `json:"peers"`
 	Settings   map[string]string `json:"settings"`
+	Users      []BackupUser      `json:"users"`
 }
 
-// CreateBackup 生成备份文件并落盘到共享目录。
-func (s *Service) CreateBackup(ctx context.Context, dir, note string, includeKey bool, a Actor) (*store.BackupRecord, error) {
+// CreateBackup 生成全量备份并落盘到共享目录。
+//
+// 全量意味着：连接私钥、设备预共享密钥与代管私钥、全部设置、全部账号
+// （含管理员密码哈希与 TOTP 密钥）一并写入，还原时能原样恢复。
+func (s *Service) CreateBackup(ctx context.Context, dir, note string, a Actor) (*store.BackupRecord, error) {
 	ifaces, err := s.Store.ListInterfaces(ctx)
 	if err != nil {
 		return nil, err
@@ -143,29 +160,37 @@ func (s *Service) CreateBackup(ctx context.Context, dir, note string, includeKey
 	payload := BackupPayload{
 		Version:    s.Version,
 		CreatedAt:  time.Now(),
-		IncludeKey: includeKey,
+		IncludeKey: true,
 		Interfaces: []model.Interface{},
 		Peers:      []model.Peer{},
+		Users:      []BackupUser{},
 	}
-	settings, _ := s.Store.AllSettings(ctx)
+	settings, err := s.Store.AllSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
 	payload.Settings = settings
 	for _, it := range ifaces {
 		it.Revision = 0
-		if !includeKey {
-			it.PrivateKey = ""
-		}
 		payload.Interfaces = append(payload.Interfaces, it)
 		peers, err := s.Store.ListPeers(ctx, it.ID)
 		if err != nil {
 			continue
 		}
-		for _, p := range peers {
-			if !includeKey {
-				p.PresharedKey = ""
-				p.ClientPrivateKey = ""
-			}
-			payload.Peers = append(payload.Peers, p)
-		}
+		payload.Peers = append(payload.Peers, peers...)
+	}
+	users, err := s.Store.ListUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		payload.Users = append(payload.Users, BackupUser{
+			Username:     u.Username,
+			PasswordHash: u.PasswordHash,
+			TOTPSecret:   u.TOTPSecret,
+			Role:         u.Role,
+			Status:       u.Status,
+		})
 	}
 	raw, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -186,7 +211,7 @@ func (s *Service) CreateBackup(ctx context.Context, dir, note string, includeKey
 		SHA256:     hex.EncodeToString(sum[:]),
 		Kind:       "manual",
 		Note:       note,
-		IncludeKey: includeKey,
+		IncludeKey: true,
 	}
 	if err := s.Store.CreateBackupRecord(ctx, rec); err != nil {
 		return nil, err
@@ -219,7 +244,68 @@ func (s *Service) DeleteBackup(ctx context.Context, dir string, id int64, a Acto
 	return nil
 }
 
-// RestoreBackup 从备份文件恢复配置（覆盖式）。
+// DownloadBackup 返回备份文件原始内容与文件名，供界面下载（导出备份）。
+func (s *Service) DownloadBackup(ctx context.Context, dir string, id int64) ([]byte, string, error) {
+	recs, err := s.Store.ListBackups(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	for i := range recs {
+		if recs[i].ID == id {
+			raw, err := os.ReadFile(filepath.Join(dir, recs[i].Filename))
+			if err != nil {
+				return nil, "", fmt.Errorf("读取备份文件失败: %w", err)
+			}
+			return raw, recs[i].Filename, nil
+		}
+	}
+	return nil, "", fmt.Errorf("备份记录不存在")
+}
+
+// ImportBackup 导入一份备份文件：校验内容后落盘到共享目录并登记记录，随后即可在列表里还原。
+//
+// 只登记、不立刻还原——导入后由用户决定是否点「还原」，避免误操作直接把线上配置覆盖。
+func (s *Service) ImportBackup(ctx context.Context, dir string, raw []byte, filename, note string, a Actor) (*store.BackupRecord, error) {
+	var payload BackupPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("不是有效的备份文件：%w", err)
+	}
+	if payload.Version == "" && len(payload.Interfaces) == 0 && len(payload.Peers) == 0 &&
+		len(payload.Settings) == 0 && len(payload.Users) == 0 {
+		return nil, fmt.Errorf("备份文件缺少有效内容")
+	}
+	if err := os.MkdirAll(dir, 0o770); err != nil {
+		return nil, err
+	}
+	// 文件名安全化：只接受纯文件名，出现路径成分一律回退到时间戳命名，杜绝路径穿越。
+	name := strings.TrimSpace(filename)
+	if name == "" || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+		name = fmt.Sprintf("fn-wireguard-backup-%s.json", time.Now().Format("20060102-150405"))
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+		name += ".json"
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(raw)
+	rec := &store.BackupRecord{
+		Filename:   name,
+		Size:       int64(len(raw)),
+		SHA256:     hex.EncodeToString(sum[:]),
+		Kind:       "imported",
+		Note:       note,
+		IncludeKey: payload.IncludeKey,
+	}
+	if err := s.Store.CreateBackupRecord(ctx, rec); err != nil {
+		return nil, err
+	}
+	s.audit(ctx, a, "backup.import", "backup", name, "", fmt.Sprint(len(raw)), "ok", note)
+	return rec, nil
+}
+
+// RestoreBackup 从备份文件全量恢复（覆盖式）：连接、设备、设置与账号一并还原。
 func (s *Service) RestoreBackup(ctx context.Context, dir string, id int64, a Actor) (int, error) {
 	recs, err := s.Store.ListBackups(ctx)
 	if err != nil {
@@ -255,6 +341,7 @@ func (s *Service) RestoreBackup(ctx context.Context, dir string, id int64, a Act
 		src := it
 		src.ID = 0
 		if src.PrivateKey == "" {
+			// 只有旧版「不含密钥」的备份才会出现空私钥，这种连接无法恢复
 			continue
 		}
 		if err := s.Store.CreateInterface(ctx, &src); err != nil {
@@ -272,16 +359,74 @@ func (s *Service) RestoreBackup(ctx context.Context, dir string, id int64, a Act
 			continue
 		}
 		if src.PresharedKey == "" && !payload.IncludeKey {
-			// 不含密钥的备份需要重新生成预共享密钥以保持可用
+			// 旧版不含密钥的备份需要重新生成预共享密钥以保持可用
 			if psk, err := newPSK(); err == nil {
 				src.PresharedKey = psk
 			}
 		}
 		_ = s.Store.CreatePeer(ctx, &src)
 	}
+	// 恢复设置：全量备份包含全部设置项，逐项覆盖写入。
+	for k, v := range payload.Settings {
+		if k == "" {
+			continue
+		}
+		if err := s.Store.SetSetting(ctx, k, v); err != nil {
+			return 0, fmt.Errorf("恢复设置 %s 失败: %w", k, err)
+		}
+	}
+	// 恢复账号（含管理员密码哈希与 TOTP）。
+	// 账号恢复失败不应阻断网络配置恢复，但必须留痕，否则用户以为密码已经还原、实则没有。
+	if err := s.restoreUsers(ctx, payload.Users); err != nil {
+		_ = s.Store.AddLog(ctx, "warn", "backup", "备份还原时账号恢复失败", err.Error())
+	}
 	s.audit(ctx, a, "backup.restore", "backup", fmt.Sprint(id), "", fmt.Sprint(n), "ok", target.Filename)
 	_ = s.reconcile(ctx)
 	return n, nil
+}
+
+// restoreUsers 按备份恢复账号。按用户名 upsert：同名的走 UPDATE（保留主键，
+// 正在执行还原的会话不会因为用户被删重建而失效），不存在的走 INSERT。
+func (s *Service) restoreUsers(ctx context.Context, users []BackupUser) error {
+	existing, err := s.Store.ListUsers(ctx)
+	if err != nil {
+		return err
+	}
+	byName := map[string]*model.User{}
+	for i := range existing {
+		byName[existing[i].Username] = &existing[i]
+	}
+	for _, bu := range users {
+		if bu.Username == "" {
+			continue
+		}
+		if cur, ok := byName[bu.Username]; ok {
+			cur.PasswordHash = bu.PasswordHash
+			cur.TOTPSecret = bu.TOTPSecret
+			cur.Role = bu.Role
+			if bu.Status != 0 {
+				cur.Status = bu.Status
+			}
+			if err := s.Store.UpdateUser(ctx, cur); err != nil {
+				return err
+			}
+			continue
+		}
+		status := bu.Status
+		if status == 0 {
+			status = 1 // 备份里缺省状态一律视为启用，避免误把账号恢复成禁用
+		}
+		if err := s.Store.CreateUser(ctx, &model.User{
+			Username:     bu.Username,
+			PasswordHash: bu.PasswordHash,
+			TOTPSecret:   bu.TOTPSecret,
+			Role:         bu.Role,
+			Status:       status,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func shortKey(k string) string {

@@ -60,6 +60,13 @@ func PermissionsOf(role string) map[string]bool {
 	}
 }
 
+// OnlineWindow 是判定设备在线的时间窗：最近一次握手落在窗口内视为在线。
+//
+// 单点定义。此前这个阈值在收敛引擎与状态缓存里各写了一遍，
+// 现在还要供「上下线通知」使用——三处各写一遍迟早会出现
+// 「界面显示在线、通知却说设备已离线」这种自相矛盾的提示。
+const OnlineWindow = 3 * time.Minute
+
 // Interface 表示一个 WireGuard 接口（内核 link）。
 type Interface struct {
 	ID         int64    `json:"id"`
@@ -81,10 +88,16 @@ type Interface struct {
 	Autostart  bool     `json:"autostart"`
 	// AllowLAN 为真时启用「允许设备访问家里内网」：
 	// 为这条连接的隧道网段做源地址改写，让连进来的设备能访问局域网中的其它设备。
-	AllowLAN  bool      `json:"allow_lan"`
-	Revision  int64     `json:"revision"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	AllowLAN bool `json:"allow_lan"`
+	// IsolatePeers 为真时启用「设备间隔离」：
+	// 这条连接里的设备之间不能互相访问，但都能访问 NAS 与内网。
+	//
+	// 与 AllowLAN 相互独立：隔离只依赖隧道网段，不依赖出口网卡，
+	// 因此内网访问因为探测不到出口网卡而无法启用时，隔离仍然照常生效。
+	IsolatePeers bool      `json:"isolate_peers"`
+	Revision     int64     `json:"revision"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 
 	// 以下为运行时字段，不落库
 	PublicKey  string  `json:"public_key,omitempty"`
@@ -126,6 +139,13 @@ type Peer struct {
 	Enabled      bool       `json:"enabled"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
+	// ConfigFingerprint 是这台设备**上次拿到配置时**的客户端配置指纹
+	// （由 wgconf.ClientFingerprint 计算，不含任何密钥）。空表示从未生成过配置。
+	//
+	// 为什么需要它：改通行范围、对外地址、DNS 都只影响「之后新生成」的配置，
+	// 设备里已经导入的那份不会自动变。没有这个指纹，用户会以为改完就生效了，
+	// 然后对着「明明改了范围却还是访问不了」困惑很久。
+	ConfigFingerprint string `json:"config_fingerprint,omitempty"`
 
 	// 运行时字段
 	Online        bool      `json:"online,omitempty"`
@@ -135,6 +155,9 @@ type Peer struct {
 	TxBytes       int64     `json:"tx_bytes,omitempty"`
 	RxRate        float64   `json:"rx_rate,omitempty"`
 	TxRate        float64   `json:"tx_rate,omitempty"`
+	// ConfigStale 表示设备里那份配置与当前设置已经不一致，需要重新扫码导入。
+	// 仅在读取设备列表/详情时计算，不落库。
+	ConfigStale bool `json:"config_stale,omitempty"`
 }
 
 // Endpoint 返回 "host:port" 形式的端点地址。
@@ -341,8 +364,10 @@ type InterfaceSpec struct {
 	// AllowLAN 为真时启用内网访问：为这条连接的隧道网段做源地址改写，
 	// 让连进来的设备能够访问 NAS 所在局域网中的其它设备。
 	AllowLAN bool
-	Up       bool
-	Peers    []PeerSpec
+	// IsolatePeers 为真时禁止这条连接里的设备互相访问。
+	IsolatePeers bool
+	Up           bool
+	Peers        []PeerSpec
 }
 
 // NATStatus 描述内网访问（NAT 转发）的当前状态，用于界面诊断。
@@ -360,6 +385,12 @@ type NATStatus struct {
 	IPForwardEnabledByUs bool `json:"ip_forward_enabled_by_us"`
 	// Note 异常说明（为空表示正常）。
 	Note string `json:"note,omitempty"`
+	// IsolateActive 设备间隔离规则是否已生效。
+	IsolateActive bool `json:"isolate_active"`
+	// IsolateNets 当前被隔离的隧道网段（为空表示没有连接开启隔离或规则未生效）。
+	IsolateNets []string `json:"isolate_nets"`
+	// IsolateRules 内核里实际的阻断规则条数，便于对照 `nft list table` 核对。
+	IsolateRules int `json:"isolate_rules"`
 	// Checks 是内网访问链路的逐项自检结果。
 	// 「设备连上了但访问不了家里其它设备」在界面上只是一个现象，
 	// 成因可能有好几层，这里把每层都查一遍并给出修复建议。

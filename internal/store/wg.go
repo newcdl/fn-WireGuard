@@ -31,7 +31,7 @@ func jsonStrings(s string) []string {
 // ---------------------------------------------------------------- 接口
 
 const ifaceCols = `id,name,uuid,private_key,listen_port,fwmark,mtu,addresses,dns,dns_mode,route_table,
-	pre_up,post_up,pre_down,post_down,enabled,autostart,allow_lan,revision,created_at,updated_at`
+	pre_up,post_up,pre_down,post_down,enabled,autostart,allow_lan,isolate_peers,revision,created_at,updated_at`
 
 func (s *Store) scanInterface(sc interface{ Scan(...any) error }) (*model.Interface, error) {
 	var (
@@ -42,13 +42,14 @@ func (s *Store) scanInterface(sc interface{ Scan(...any) error }) (*model.Interf
 		enabled   int
 		autostart int
 		allowLAN  int
+		isolate   int
 		createdAt string
 		updatedAt string
 	)
 	err := sc.Scan(&it.ID, &it.Name, &it.UUID, &privKey, &it.ListenPort, &it.FWMark, &it.MTU,
 		&addrs, &dns, &it.DNSMode, &it.RouteTable,
 		&it.PreUp, &it.PostUp, &it.PreDown, &it.PostDown,
-		&enabled, &autostart, &allowLAN, &it.Revision, &createdAt, &updatedAt)
+		&enabled, &autostart, &allowLAN, &isolate, &it.Revision, &createdAt, &updatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +58,7 @@ func (s *Store) scanInterface(sc interface{ Scan(...any) error }) (*model.Interf
 	it.Enabled = enabled == 1
 	it.Autostart = autostart == 1
 	it.AllowLAN = allowLAN == 1
+	it.IsolatePeers = isolate == 1
 	it.CreatedAt = parseTS(createdAt)
 	it.UpdatedAt = parseTS(updatedAt)
 	if s.box != nil && len(privKey) > 0 {
@@ -116,12 +118,12 @@ func (s *Store) CreateInterface(ctx context.Context, it *model.Interface) error 
 	it.Revision = 1
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO wg_interface(name,uuid,private_key,listen_port,fwmark,mtu,addresses,dns,dns_mode,route_table,
-		 pre_up,post_up,pre_down,post_down,enabled,autostart,allow_lan,revision,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 pre_up,post_up,pre_down,post_down,enabled,autostart,allow_lan,isolate_peers,revision,created_at,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		it.Name, it.UUID, key, it.ListenPort, it.FWMark, it.MTU,
 		mustJSON(it.Addresses), mustJSON(it.DNS), it.DNSMode, it.RouteTable,
 		it.PreUp, it.PostUp, it.PreDown, it.PostDown,
-		b2i(it.Enabled), b2i(it.Autostart), b2i(it.AllowLAN), it.Revision, ts(now), ts(now))
+		b2i(it.Enabled), b2i(it.Autostart), b2i(it.AllowLAN), b2i(it.IsolatePeers), it.Revision, ts(now), ts(now))
 	if err != nil {
 		return err
 	}
@@ -139,12 +141,12 @@ func (s *Store) UpdateInterface(ctx context.Context, it *model.Interface) error 
 	it.UpdatedAt = now
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE wg_interface SET name=?,private_key=?,listen_port=?,fwmark=?,mtu=?,addresses=?,dns=?,dns_mode=?,
-		 route_table=?,pre_up=?,post_up=?,pre_down=?,post_down=?,enabled=?,autostart=?,allow_lan=?,
+		 route_table=?,pre_up=?,post_up=?,pre_down=?,post_down=?,enabled=?,autostart=?,allow_lan=?,isolate_peers=?,
 		 revision=revision+1,updated_at=?
 		 WHERE id=?`,
 		it.Name, key, it.ListenPort, it.FWMark, it.MTU, mustJSON(it.Addresses), mustJSON(it.DNS), it.DNSMode,
 		it.RouteTable, it.PreUp, it.PostUp, it.PreDown, it.PostDown, b2i(it.Enabled), b2i(it.Autostart),
-		b2i(it.AllowLAN), ts(now), it.ID)
+		b2i(it.AllowLAN), b2i(it.IsolatePeers), ts(now), it.ID)
 	if err != nil {
 		return err
 	}
@@ -191,7 +193,7 @@ func (s *Store) InterfaceNames(ctx context.Context) (map[string]bool, error) {
 const peerCols = `p.id,p.interface_id,IFNULL(i.name,''),p.name,p.public_key,p.preshared_key,p.client_priv,
 	IFNULL(p.route_mode,'lan'),IFNULL(p.client_ips,'[]'),p.endpoint_host,
 	p.endpoint_port,p.allowed_ips,p.keepalive,p.group_tag,p.remark,p.quota_rx,p.quota_tx,p.expire_at,p.enabled,
-	p.created_at,p.updated_at`
+	p.created_at,p.updated_at,IFNULL(p.config_fp,'')`
 
 const peerFrom = ` FROM wg_peer p LEFT JOIN wg_interface i ON i.id = p.interface_id`
 
@@ -210,7 +212,7 @@ func (s *Store) scanPeer(sc interface{ Scan(...any) error }) (*model.Peer, error
 	err := sc.Scan(&p.ID, &p.InterfaceID, &p.InterfaceName, &p.Name, &p.PublicKey, &psk, &clientKey,
 		&p.RouteMode, &clientIPs, &p.EndpointHost,
 		&p.EndpointPort, &allowed, &p.Keepalive, &p.GroupTag, &p.Remark, &p.QuotaRx, &p.QuotaTx, &expireAt,
-		&enabled, &createdAt, &updatedAt)
+		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint)
 	if err != nil {
 		return nil, err
 	}
@@ -289,11 +291,12 @@ func (s *Store) CreatePeer(ctx context.Context, p *model.Peer) error {
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO wg_peer(interface_id,name,public_key,preshared_key,client_priv,route_mode,client_ips,
 		 endpoint_host,endpoint_port,allowed_ips,
-		 keepalive,group_tag,remark,quota_rx,quota_tx,expire_at,enabled,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 keepalive,group_tag,remark,quota_rx,quota_tx,expire_at,enabled,config_fp,created_at,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
 		p.EndpointHost, p.EndpointPort, mustJSON(p.AllowedIPs),
-		p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx, expireArg(p.ExpireAt), b2i(p.Enabled), ts(now), ts(now))
+		p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx, expireArg(p.ExpireAt), b2i(p.Enabled),
+		p.ConfigFingerprint, ts(now), ts(now))
 	if err != nil {
 		return err
 	}
@@ -309,6 +312,10 @@ func expireArg(t *time.Time) any {
 }
 
 // UpdatePeer 全量更新节点。
+//
+// 注意：它是全量更新，调用方必须传入从库里读出的 p（ConfigFingerprint 等
+// 非表单字段会随之保留）。从零构造一个 Peer 再调用会把指纹清空，
+// 表现为「配置过期」标记凭空消失 —— 那是假阴性，比不提示更糟。
 func (s *Store) UpdatePeer(ctx context.Context, p *model.Peer) error {
 	psk, err := s.box.SealString(p.PresharedKey)
 	if err != nil {
@@ -326,12 +333,13 @@ func (s *Store) UpdatePeer(ctx context.Context, p *model.Peer) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE wg_peer SET interface_id=?,name=?,public_key=?,preshared_key=?,client_priv=?,route_mode=?,client_ips=?,
 		 endpoint_host=?,endpoint_port=?,
-		 allowed_ips=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,updated_at=?
+		 allowed_ips=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,
+		 config_fp=?,updated_at=?
 		 WHERE id=?`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
 		p.EndpointHost, p.EndpointPort,
 		mustJSON(p.AllowedIPs), p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx,
-		expireArg(p.ExpireAt), b2i(p.Enabled), ts(now), p.ID)
+		expireArg(p.ExpireAt), b2i(p.Enabled), p.ConfigFingerprint, ts(now), p.ID)
 	if err != nil {
 		return err
 	}

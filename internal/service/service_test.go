@@ -383,7 +383,7 @@ PersistentKeepalive = 25
 		t.Fatalf("打包导出异常: %s (%d 字节)", zipName, len(raw))
 	}
 
-	rec, err := svc.CreateBackup(ctx, dir, "单元测试备份", true, actor)
+	rec, err := svc.CreateBackup(ctx, dir, "单元测试备份", actor)
 	if err != nil {
 		t.Fatalf("创建备份失败: %v", err)
 	}
@@ -408,6 +408,123 @@ PersistentKeepalive = 25
 	peers, _ := svc.ListPeers(ctx, 0)
 	if len(peers) != 1 || peers[0].Name != "导入的节点" {
 		t.Fatalf("恢复的节点不正确: %+v", peers)
+	}
+}
+
+func TestBackupFullRestore(t *testing.T) {
+	svc, st := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+	dir := t.TempDir()
+
+	// 准备现场：一个管理员账号 + 一个设置项
+	hash, err := service.HashPassword("s3cret-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateUser(ctx, &model.User{
+		Username:     "admin",
+		PasswordHash: hash,
+		TOTPSecret:   "JBSWY3DPEHPK3PXP",
+		Role:         model.RoleAdmin,
+		Status:       1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSetting(ctx, "notify_webhook", "https://example.com/hook"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := svc.CreateBackup(ctx, dir, "全量备份", actor)
+	if err != nil {
+		t.Fatalf("创建备份失败: %v", err)
+	}
+
+	// 破坏现场：删账号、改设置，再全量还原
+	created, err := st.GetUserByUsername(ctx, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteUser(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSetting(ctx, "notify_webhook", "https://changed.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.RestoreBackup(ctx, dir, rec.ID, actor); err != nil {
+		t.Fatalf("恢复备份失败: %v", err)
+	}
+
+	// 账号必须完整还原：密码哈希、TOTP、角色
+	u, err := st.GetUserByUsername(ctx, "admin")
+	if err != nil {
+		t.Fatalf("账号未恢复: %v", err)
+	}
+	if u.PasswordHash != hash {
+		t.Fatal("密码哈希未还原")
+	}
+	if u.TOTPSecret != "JBSWY3DPEHPK3PXP" {
+		t.Fatalf("TOTP 密钥未还原，实际: %s", u.TOTPSecret)
+	}
+	if u.Role != model.RoleAdmin {
+		t.Fatalf("角色未还原: %s", u.Role)
+	}
+	// 设置必须还原
+	if got := st.GetSetting(ctx, "notify_webhook", ""); got != "https://example.com/hook" {
+		t.Fatalf("设置未还原，实际: %s", got)
+	}
+}
+
+func TestBackupImportDownload(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+	dir := t.TempDir()
+
+	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.9.0.1/24"}, Enabled: true, Autostart: true,
+	}, actor); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := svc.CreateBackup(ctx, dir, "导出导入", actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 下载：拿到的原始内容应与记录一致
+	raw, name, err := svc.DownloadBackup(ctx, dir, rec.ID)
+	if err != nil {
+		t.Fatalf("下载备份失败: %v", err)
+	}
+	if name != rec.Filename || len(raw) == 0 {
+		t.Fatalf("下载内容异常: %s（%d 字节）", name, len(raw))
+	}
+
+	// 删掉原备份，模拟「从别处拿回备份文件再导入」
+	if err := svc.DeleteBackup(ctx, dir, rec.ID, actor); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := svc.ImportBackup(ctx, dir, raw, rec.Filename, "导回", actor)
+	if err != nil {
+		t.Fatalf("导入备份失败: %v", err)
+	}
+	if imported.Filename != rec.Filename {
+		t.Fatalf("导入文件名不符: %s", imported.Filename)
+	}
+
+	// 导入的备份应可直接还原
+	if _, err := svc.RestoreBackup(ctx, dir, imported.ID, actor); err != nil {
+		t.Fatalf("导入的备份还原失败: %v", err)
+	}
+	list, _ := svc.ListInterfaces(ctx)
+	if len(list) != 1 || list[0].Name != "wg0" {
+		t.Fatalf("还原结果不正确: %+v", list)
+	}
+
+	// 非法内容应被拒绝
+	if _, err := svc.ImportBackup(ctx, dir, []byte("not-json"), "", "", actor); err == nil {
+		t.Fatal("非法备份内容应被拒绝")
 	}
 }
 

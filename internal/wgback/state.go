@@ -58,6 +58,12 @@ type State struct {
 	NATSwitch bool `json:"nat_switch,omitempty"`
 	// NATBlocked 记录开关已打开但规则未能下发的原因（为空表示没有受阻）。
 	NATBlocked string `json:"nat_blocked,omitempty"`
+	// NATIsolateSwitch 记录是否有连接打开了「设备间隔离」开关。
+	NATIsolateSwitch bool `json:"nat_isolate_switch,omitempty"`
+	// NATIsolateNets 记录当前生效的被隔离隧道网段；为空表示隔离规则未生效。
+	NATIsolateNets []string `json:"nat_isolate_nets,omitempty"`
+	// NATIsolateBlocked 记录隔离开关已打开但规则未能下发的原因。
+	NATIsolateBlocked string `json:"nat_isolate_blocked,omitempty"`
 	// IPForwardEnabled 记录内核转发开关是否由本应用开启。
 	// 只记录不还原：还原可能影响机器上其它依赖转发的服务。
 	IPForwardEnabled bool `json:"ip_forward_by_us,omitempty"`
@@ -324,6 +330,46 @@ func (s *State) SetNATState(switchedOn bool, blocked string) {
 		return
 	}
 	s.NATBlocked = ""
+}
+
+// IsolateSwitchOn 返回是否有连接打开了「设备间隔离」开关。
+func (s *State) IsolateSwitchOn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.NATIsolateSwitch
+}
+
+// IsolateNets 返回当前生效的被隔离隧道网段副本。
+func (s *State) IsolateNets() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.NATIsolateNets))
+	copy(out, s.NATIsolateNets)
+	return out
+}
+
+// IsolateBlockedReason 返回最近一次隔离规则未能生效的原因（为空表示没有受阻）。
+func (s *State) IsolateBlockedReason() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.NATIsolateBlocked
+}
+
+// SetIsolateState 记录设备间隔离开关状态、实际生效的网段与未生效原因。
+//
+// 与 SetNATState 同构：开关是用户意图，生效与否取决于环境条件，
+// 两者分开记录界面才能说清「开关是开着的，卡在了哪一层」。
+func (s *State) SetIsolateState(switchedOn bool, applied []string, blocked string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.NATIsolateSwitch = switchedOn
+	if !switchedOn {
+		s.NATIsolateNets = nil
+		s.NATIsolateBlocked = ""
+		return
+	}
+	s.NATIsolateNets = append([]string{}, applied...)
+	s.NATIsolateBlocked = blocked
 }
 
 // IPForwardByUs 返回内核转发开关是否由本应用开启。

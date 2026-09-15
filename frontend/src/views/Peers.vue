@@ -52,6 +52,27 @@
             <el-tag size="small" :type="stateTagType(row)" effect="plain">{{ stateLabel(row) }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="配置" width="110">
+          <template #default="{ row }">
+            <!-- 「通行范围 / 对外地址」这类设置写在设备里，改完必须重新导入。
+                 不主动说的话，用户会以为改完就生效了。 -->
+            <el-tooltip
+              v-if="row.config_stale"
+              content="你在界面上改过的设置（对外地址、通行范围等）还没进入这台设备。点这里重新扫码导入即可生效。"
+              placement="top"
+            >
+              <el-tag
+                size="small"
+                type="warning"
+                effect="plain"
+                style="cursor: pointer"
+                @click="showConfig(row)"
+              >
+                需重新扫码
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column prop="interface_name" label="所属连接" width="100" />
         <el-table-column label="允许访问" min-width="170">
           <template #default="{ row }">
@@ -105,6 +126,7 @@
         <template #extra>
           <el-tag size="small" :type="stateTagType(row)" effect="plain">{{ stateLabel(row) }}</el-tag>
           <el-tag v-if="!row.enabled" size="small" type="info" effect="plain">已停用</el-tag>
+          <el-tag v-if="row.config_stale" size="small" type="warning" effect="plain">需重新扫码</el-tag>
         </template>
 
         <div class="fnwg-kv">
@@ -183,9 +205,18 @@
             default-first-option
             placeholder="例如 192.168.2.0/24，输入后回车"
             style="width: 100%"
-          />
+          >
+            <!-- 探测到的家里网段直接列出来点选：手写 IP 段是最容易填错的一步 -->
+            <el-option v-for="c in homeSubnets" :key="c" :label="c" :value="c" />
+          </el-select>
           <div class="fnwg-hint">
             列出这台设备需要访问的网段；只有这些网段的流量会走本连接，其它上网流量不受影响。
+            <template v-if="homeSubnets.length">
+              已探测到家里网段：{{ homeSubnets.join('、') }}，点一下即可加入。
+            </template>
+          </div>
+          <div v-if="form.id" class="fnwg-hint">
+            提醒：通行范围写在设备配置里，保存后这台设备会显示「需重新扫码」，需要重新导入一次才会生效。
           </div>
         </el-form-item>
 
@@ -345,12 +376,18 @@ import {
   routeModeOptions,
 } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
+import { useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { daysLeft, formatBytes, handshakeLevel, timeAgo } from '@/utils/format'
 
 const route = useRoute()
 const session = useSession()
 const { isMobile, drawerSize, dialogWidth } = useBreakpoint()
+
+// 复用全局已拉取的自检结果：只为了拿到探测到的家里网段，
+// 让「自定义可访问范围」可以直接点选，而不是凭记忆手写 IP。
+const { net } = useSystemHealth()
+const homeSubnets = computed(() => net.value?.home_subnets || [])
 
 const P = peerFields
 const helpGroups = allHelpGroups
@@ -554,6 +591,9 @@ async function showConfig(row: WgPeer) {
     cfg.value = res
     qrDataUrl.value = await QRCode.toDataURL(res.qr_payload || res.conf, { margin: 1, width: 480 })
     cfgVisible.value = true
+    // 生成配置等于把最新设置交付给了设备，服务端已记下这次交付；
+    // 立刻刷新列表，让「需重新扫码」标记当场消失（否则要等下次手动刷新）。
+    if (row.config_stale) await load()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }

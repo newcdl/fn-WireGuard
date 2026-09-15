@@ -75,6 +75,9 @@ func TestAllowLANColumnAddedByMigration(t *testing.T) {
 	if it.AllowLAN {
 		t.Fatal("历史连接的内网访问开关必须默认关闭，避免升级即改用户网络")
 	}
+	if it.IsolatePeers {
+		t.Fatal("历史连接的设备间隔离必须默认关闭：它是新增限制，升级不能改变设备之间现有的可达性")
+	}
 	if it.Name != "wg0" || it.RouteTable != model.RouteTableOff {
 		t.Fatalf("旧数据其余字段应保持原样: %+v", it)
 	}
