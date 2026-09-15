@@ -359,6 +359,19 @@ func (s *Store) GetSetting(ctx context.Context, key, def string) string {
 	return v
 }
 
+// LookupSetting 读取配置项，并区分「没配置过」与「配置成了空值」。
+//
+// 少数设置项需要这个区分才能正确迁移：例如事件通知的开关集合，
+// 「一个都没关」与「这一项在旧版本里还不存在」都表现为空串，
+// 但两者的处理方式不同（前者要保持、后者要补默认值）。
+func (s *Store) LookupSetting(ctx context.Context, key string) (string, bool) {
+	var v string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM app_setting WHERE key=?`, key).Scan(&v); err != nil {
+		return "", false
+	}
+	return v, true
+}
+
 // SetSetting 写入配置项。
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	_, err := s.db.ExecContext(ctx,

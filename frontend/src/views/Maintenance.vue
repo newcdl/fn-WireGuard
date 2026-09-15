@@ -120,6 +120,35 @@
       </div>
     </div>
 
+    <!-- 分组二之二：访问控制配置检查
+         「设备通行范围」「内网访问」「设备之间隔离」单独看都没错，
+         组合起来却可能互相抵消，现象只是一个模糊的「配了却访问不了」。 -->
+    <div class="fnwg-card">
+      <div class="fnwg-card-head">
+        <div>
+          <strong>访问控制配置检查</strong>
+          <span class="fnwg-card-desc">范围、开关、隔离三项设置之间是否互相矛盾</span>
+        </div>
+        <el-tag v-if="accessIssues.length" size="small" type="warning" effect="plain">
+          {{ accessIssues.length }} 项需要确认
+        </el-tag>
+        <el-tag v-else-if="net" size="small" type="success" effect="plain">未发现矛盾</el-tag>
+      </div>
+
+      <div v-if="!net" class="fnwg-hint">暂无数据，点击上方「立即体检」。</div>
+      <div v-else-if="!accessIssues.length" class="fnwg-hint">
+        未发现互相矛盾的配置。这里会检查：设备允许的范围是否被某个开关挡住、范围是否指向了另一条连接等。
+      </div>
+      <div v-for="a in accessIssues" :key="a.key + (a.interface_id || 0)" class="fnwg-nat-check">
+        <el-tag size="small" type="warning" effect="plain">需确认</el-tag>
+        <div class="fnwg-nat-check-body">
+          <strong>{{ a.title }}</strong>
+          <div class="fnwg-nat-check-detail">{{ a.detail }}</div>
+          <div v-if="a.fix" class="fnwg-issue-fix">处理建议：{{ a.fix }}</div>
+        </div>
+      </div>
+    </div>
+
     <!-- 分组三：疑似残留网卡 -->
     <div class="fnwg-card">
       <div class="fnwg-card-head">
@@ -229,6 +258,7 @@ const reconciling = ref(false)
 const removingForeign = ref('')
 
 const natFailed = computed(() => (net.value?.nat?.checks || []).filter((c) => !c.ok))
+const accessIssues = computed(() => net.value?.access_issues || [])
 
 /**
  * 自检结论：疑似残留不算「异常」（它也可能真的在被别的工具使用），

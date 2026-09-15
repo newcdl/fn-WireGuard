@@ -21,6 +21,7 @@ func (s *Service) ListPeers(ctx context.Context, interfaceID int64) ([]model.Pee
 		return nil, err
 	}
 	s.Cache.EnrichPeers(peers)
+	s.markConfigStale(ctx, peers)
 	for i := range peers {
 		peers[i].PresharedKey = ""
 		peers[i].ClientPrivateKey = ""
@@ -36,6 +37,8 @@ func (s *Service) GetPeer(ctx context.Context, id int64) (*model.Peer, error) {
 	}
 	list := []model.Peer{*p}
 	s.Cache.EnrichPeers(list)
+	s.markConfigStale(ctx, list)
+	*p = list[0]
 	p.PresharedKey = ""
 	p.ClientPrivateKey = ""
 	return p, nil
@@ -329,6 +332,17 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		MTU:              it.MTU,
 		Keepalive:        p.Keepalive,
 	})
+	// 记下「这台设备刚拿到的配置」：之后改动对外地址、DNS、通行范围时，
+	// 界面就能据此标出「配置已过期，需要重新扫码」，而不是让用户自己猜。
+	s.rememberPeerConfig(ctx, p, wgconf.ClientFingerprint(wgconf.ClientConfigInputs{
+		Endpoint:    endpoint,
+		ClientAddrs: clientAddrs,
+		AllowedIPs:  clientAllowed,
+		DNS:         it.DNS,
+		MTU:         it.MTU,
+		Keepalive:   p.Keepalive,
+		ServerPub:   serverPub,
+	}))
 	name := p.Name
 	if name == "" {
 		name = fmt.Sprintf("peer-%d", p.ID)
@@ -430,6 +444,9 @@ func (s *Service) validatePeer(ctx context.Context, p *model.Peer, selfID int64)
 			return fmt.Errorf("选择了「自定义可访问范围」但没有填写网段，请补充后再保存")
 		}
 		if err := validateCIDRList("自定义可访问范围", p.ClientAllowedIPs); err != nil {
+			return err
+		}
+		if err := s.checkScopeConflicts(ctx, p); err != nil {
 			return err
 		}
 	default:

@@ -334,6 +334,49 @@ func TestStateNATSwitchAndBlocked(t *testing.T) {
 	}
 }
 
+// TestStateIsolateTracking 设备间隔离开关与「实际生效的网段」必须可跨重启保留：
+// 界面靠它回答「隔离开着没有、隔的是谁、没生效是为什么」。
+func TestStateIsolateTracking(t *testing.T) {
+	path := t.TempDir() + "/netstate.json"
+	st := LoadState(path)
+
+	if st.IsolateSwitchOn() || len(st.IsolateNets()) != 0 || st.IsolateBlockedReason() != "" {
+		t.Fatal("初始状态不应有隔离记录")
+	}
+
+	st.SetIsolateState(true, []string{"10.10.0.0/24"}, "")
+	if !st.IsolateSwitchOn() {
+		t.Fatal("应记录开关已打开")
+	}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := LoadState(path)
+	if !reloaded.IsolateSwitchOn() || len(reloaded.IsolateNets()) != 1 || reloaded.IsolateNets()[0] != "10.10.0.0/24" {
+		t.Fatalf("重新加载后应保留开关与生效网段，实际: %v / %v", reloaded.IsolateSwitchOn(), reloaded.IsolateNets())
+	}
+
+	// 拿到的必须是副本：调用方改动它不能污染状态文件里的数据
+	nets := reloaded.IsolateNets()
+	nets[0] = "被改坏了"
+	if reloaded.IsolateNets()[0] != "10.10.0.0/24" {
+		t.Fatal("返回的网段必须是副本，否则调用方会误改状态")
+	}
+
+	// 开关开着但规则没下发：要同时保留原因，界面才能说清卡在哪一层
+	reloaded.SetIsolateState(true, nil, "本连接的隧道地址是 IPv6，目前暂不支持 IPv6 的设备间隔离")
+	if len(reloaded.IsolateNets()) != 0 || !strings.Contains(reloaded.IsolateBlockedReason(), "IPv6") {
+		t.Fatalf("应记录未生效原因，实际: %v / %s", reloaded.IsolateNets(), reloaded.IsolateBlockedReason())
+	}
+
+	// 关闭开关时三项一并归还初始态
+	reloaded.SetIsolateState(false, nil, "忽略这条：开关没打开时不应记录原因")
+	if reloaded.IsolateSwitchOn() || len(reloaded.IsolateNets()) != 0 || reloaded.IsolateBlockedReason() != "" {
+		t.Fatalf("关闭开关后应清空三项，实际: %v / %v / %s",
+			reloaded.IsolateSwitchOn(), reloaded.IsolateNets(), reloaded.IsolateBlockedReason())
+	}
+}
+
 // TestStatePskFingerprintTracking 确保口令指纹可跨重启保留：
 // 它是「口令变了才下发、没变一次都不碰」的唯一依据。
 func TestStatePskFingerprintTracking(t *testing.T) {

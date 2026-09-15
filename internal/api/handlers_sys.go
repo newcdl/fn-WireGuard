@@ -1,7 +1,9 @@
 package api
 
 import (
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -205,6 +207,22 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"actions": actions})
 }
 
+// ---------------------------------------------------------------- 通知（Webhook）
+
+func (s *Server) handleNotifyStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.svc.NotifyStatus(r.Context()))
+}
+
+// handleNotifyTest 立即发送一条测试通知，让用户能在配置当场确认地址可用。
+func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
+	res, err := s.svc.SendTestNotify(r.Context(), actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // ---------------------------------------------------------------- 审计与日志
 
 func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
@@ -357,14 +375,13 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Note       string `json:"note"`
-		IncludeKey bool   `json:"include_key"`
+		Note string `json:"note"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rec, err := s.svc.CreateBackup(r.Context(), s.shareDir, in.Note, in.IncludeKey, actorOf(r))
+	rec, err := s.svc.CreateBackup(r.Context(), s.shareDir, in.Note, actorOf(r))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -382,6 +399,38 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+// handleDownloadBackup 下载一份备份文件（导出备份）。
+func (s *Server) handleDownloadBackup(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	raw, filename, err := s.svc.DownloadBackup(r.Context(), s.shareDir, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename="+url.QueryEscape(filename))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
+// handleImportBackup 导入一份备份文件（备份 JSON 作为原始请求体）。
+func (s *Server) handleImportBackup(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "读取上传内容失败: "+err.Error())
+		return
+	}
+	rec, err := s.svc.ImportBackup(r.Context(), s.shareDir, raw, r.URL.Query().Get("filename"), r.URL.Query().Get("note"), actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
 }
 
 func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {

@@ -50,6 +50,29 @@ export function download(path: string) {
   document.body.removeChild(a)
 }
 
+/** 以原始字符串作为请求体 POST（用于导入备份等需要原样上传 JSON 文件的场景）。 */
+export async function postRaw<T>(path: string, body: string): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  })
+  const text = await res.text()
+  let payload: any = null
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      payload = null
+    }
+  }
+  if (!res.ok) {
+    throw new ApiError(res.status, payload?.message || `请求失败（HTTP ${res.status}）`)
+  }
+  return (payload?.data ?? payload) as T
+}
+
 export async function downloadText(path: string, filename: string) {
   const res = await fetch(BASE + path, { credentials: 'include' })
   if (!res.ok) {

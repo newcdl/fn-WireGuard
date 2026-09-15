@@ -57,6 +57,10 @@ fnwg_prepare_dirs() {
     mkdir -p "$TRIM_PKGVAR/log" "$TRIM_PKGVAR/share" "$TRIM_PKGVAR/backup"
     chown -R "root:${FNWG_GROUP}" "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGHOME" 2>/dev/null || true
     chmod 770 "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGHOME" 2>/dev/null || true
+    # 子目录同样需要「同组可写」：log 写日志、share 写备份、backup 存历史备份。
+    # 只给顶层目录 chmod 770 的话，这些 mkdir 出来的子目录仍是 755（root 的 umask），
+    # fnwg 属组只有读没有写，Web 进程在 share 里写备份就会报 permission denied。
+    chmod 770 "$TRIM_PKGVAR/log" "$TRIM_PKGVAR/share" "$TRIM_PKGVAR/backup" 2>/dev/null || true
     # setgid 保证新建文件继承 fnwg 属组，两个进程才能共享数据库
     chmod g+s "$TRIM_PKGVAR" "$TRIM_PKGETC" 2>/dev/null || true
 }

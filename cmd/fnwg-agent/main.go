@@ -136,12 +136,17 @@ func main() {
 	logger.Info("特权代理已退出")
 }
 
-// fixSharedPerms 保证数据库与主密钥对运行用户组可读写。
+// fixSharedPerms 保证数据库、主密钥与共享导出目录对运行用户组可读写。
+//
+// share 目录单独在这里修正，是为了「自愈」历史安装：早期版本只在启动脚本里
+// 给顶层数据目录 chmod，share 子目录可能仍是 755，导致 Web 进程（fnwg 用户）
+// 写备份报 permission denied。agent 以 root 运行，每 5 分钟顺手把它改回 770。
 func fixSharedPerms(cfg *config.Config, gid int) {
 	sysutil.FixGroup(cfg.DBPath(), gid, 0o660)
 	sysutil.FixGroup(cfg.DBPath()+"-wal", gid, 0o660)
 	sysutil.FixGroup(cfg.DBPath()+"-shm", gid, 0o660)
 	sysutil.FixGroup(cfg.MasterKeyPath(), gid, 0o640)
+	sysutil.FixGroup(cfg.ShareDir(), gid, 0o770)
 }
 
 func newLogger(cfg *config.Config) *slog.Logger {

@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS wg_interface (
   enabled     INTEGER NOT NULL DEFAULT 1,
   autostart   INTEGER NOT NULL DEFAULT 1,
   allow_lan   INTEGER NOT NULL DEFAULT 0,
+  isolate_peers INTEGER NOT NULL DEFAULT 0,
   revision    INTEGER NOT NULL DEFAULT 1,
   created_at  TEXT    NOT NULL,
   updated_at  TEXT    NOT NULL
@@ -89,6 +90,9 @@ CREATE TABLE IF NOT EXISTS wg_peer (
   quota_tx      INTEGER NOT NULL DEFAULT 0,
   expire_at     TEXT,
   enabled       INTEGER NOT NULL DEFAULT 1,
+  -- config_fp 是设备上次拿到配置时的客户端配置指纹（不含密钥），
+  -- 用来判断「设备里那份配置是不是已经过期」，空表示从未生成过配置。
+  config_fp     TEXT    NOT NULL DEFAULT '',
   created_at    TEXT    NOT NULL,
   updated_at    TEXT    NOT NULL
 );
@@ -181,6 +185,12 @@ func (s *Store) migrate() error {
 		// 内网访问开关：历史数据默认关闭，避免升级即改用户的网络；
 		// 新建连接时由服务层默认开启。
 		{"wg_interface", "allow_lan", `ALTER TABLE wg_interface ADD COLUMN allow_lan INTEGER NOT NULL DEFAULT 0`},
+		// 设备间隔离：默认关闭。历史连接升级后行为必须与升级前完全一致，
+		// 这项是「新增限制」，绝不能默认打开（那会突然切断用户已有的设备互访）。
+		{"wg_interface", "isolate_peers", `ALTER TABLE wg_interface ADD COLUMN isolate_peers INTEGER NOT NULL DEFAULT 0`},
+		// 客户端配置指纹：默认空表示「从未生成过配置」，
+		// 此时不显示「配置已过期」——升级不该让所有设备列表突然飘满提示。
+		{"wg_peer", "config_fp", `ALTER TABLE wg_peer ADD COLUMN config_fp TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := s.ensureColumn(c.table, c.column, c.ddl); err != nil {
 			return err

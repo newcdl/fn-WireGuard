@@ -130,22 +130,30 @@ func parseIPNet(cidr string) (*net.IPNet, error) {
 	return n, nil
 }
 
-// syncNATLocked 让内网访问规则与全部连接的期望态一致。
+// syncNATLocked 让专用表里的规则（内网访问 + 设备间隔离）与全部连接的期望态一致。
 func (b *kernelBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOptions, diff *Diff) {
-	plan, requested := b.planNATLocked(specs)
+	plan, requested, isolateRequested := b.planNATLocked(specs)
 
 	if opts.DryRun {
 		if plan.Enable {
 			diff.Append("（预演）将启用内网访问：%s", DescribeNAT(plan))
 		}
+		if plan.Isolate {
+			diff.Append("（预演）将启用设备间隔离：%s", DescribeIsolation(plan))
+		}
 		return
 	}
 
-	// 记录「开关是否打开」与「未能启用的原因」，供界面逐层诊断：
-	// 用户看到的「连上了但访问不了家里其它设备」只是一个现象，
-	// 卡在哪一层必须能一句话说清，否则用户只会反复检查那个其实已经打开的开关。
+	// 记录两组「开关是否打开」与「未能生效的原因」，供界面逐层诊断：
+	// 用户看到的现象只是「连上了但访问不了家里其它设备」或「设备之间还能互访」，
+	// 卡在哪一层必须能一句话说清，否则用户只会反复检查那些其实已经打开的开关。
 	// 内容不变时 Save 不会产生磁盘写入，稳态下不会带来额外 IO。
 	b.state.SetNATState(requested, plan.SkipReason)
+	if isolateRequested {
+		b.state.SetIsolateState(true, plan.IsolateSources, plan.IsolateReason)
+	} else {
+		b.state.SetIsolateState(false, nil, "")
+	}
 	_ = b.state.Save()
 
 	fingerprint := plan.Fingerprint()
@@ -153,6 +161,9 @@ func (b *kernelBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpt
 	// 转发开关必须**每轮**确认，不能只在重建规则时检查：
 	// 从旧版本升级上来时规则内容没有变化，会走「无需重建」分支，
 	// 若不在这里确认，之前没开过的内核转发就永远不会被打开，修复等于没生效。
+	//
+	// 只在真的要做内网转发时才开：设备间隔离不需要转发开关，
+	// 不应该因为一个隔离开关就去改内核的全局设置。
 	if plan.Enable {
 		turned, err := b.ensureIPForward()
 		if err != nil {
@@ -167,64 +178,96 @@ func (b *kernelBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpt
 
 	// 规则内容与内核现状都一致时才跳过；否则重建。
 	// 顺带也修复了「规则被其它工具清理掉」的情况。
-	if fingerprint != "" && fingerprint == b.state.NATFingerprint() && b.natRulesPresent() {
+	if fingerprint != "" && fingerprint == b.state.NATFingerprint() && b.rulesPresent(plan) {
 		return
 	}
 
 	// 内容有变化（或需要关闭）：先把上一次留下的痕迹全部撤掉，再按当前决策重建
 	removed := b.clearNATLocked()
 
-	if !plan.Enable {
+	if plan.Empty() {
 		b.state.SetNAT("", nil, nil)
 		_ = b.state.Save()
 		if removed {
-			diff.Append("已关闭内网访问，相关转发规则已移除")
+			diff.Append("已关闭内网访问与设备间隔离，相关规则已移除")
 		}
 		if plan.SkipReason != "" {
 			diff.Append("内网访问未启用：%s", plan.SkipReason)
+		}
+		if plan.IsolateReason != "" {
+			diff.Append("设备间隔离未生效：%s", plan.IsolateReason)
 		}
 		return
 	}
 
 	if err := b.ensureNATTableLocked(plan); err != nil {
-		diff.Append("启用内网访问失败：%v", err)
+		diff.Append("下发转发规则失败：%v", err)
 		return
 	}
 	b.state.SetNAT(fingerprint, plan.Sources, plan.WANs)
 	_ = b.state.Save()
-	diff.Append("已启用内网访问：%s", DescribeNAT(plan))
+	if plan.Enable {
+		diff.Append("已启用内网访问：%s", DescribeNAT(plan))
+	}
+	if plan.Isolate {
+		diff.Append("%s", DescribeIsolation(plan))
+	}
 }
 
-// planNATLocked 依据全部连接计算内网访问决策。
+// planNATLocked 依据全部连接计算内网访问与设备隔离决策。
 //
-// 第二个返回值表示「是否有连接打开了内网访问开关」。开关是用户意图，
-// 规则是否真的启用取决于环境条件，两者分开表达，界面才能说清卡在哪一层。
-func (b *kernelBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool) {
+// 后两个返回值分别表示「是否有连接打开了内网访问开关」与「是否有连接打开了
+// 设备间隔离开关」。开关是用户意图，规则是否真的生效取决于环境条件，
+// 两者分开表达，界面才能说清卡在哪一层。
+func (b *kernelBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool, bool) {
 	sources := []string{}
-	anyEnabled := false
+	isoSources := []string{}
+	tunnels := []string{}
+	anyLAN := false
+	anyIsolate := false
 	for _, s := range specs {
-		if !s.AllowLAN || !s.Up {
+		if !s.Up {
+			// 没启用的连接里不可能有设备，它的网段既不需要放行也不需要隔离。
 			continue
 		}
-		anyEnabled = true
-		for _, a := range s.Addresses {
-			if _, n, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil {
-				sources = append(sources, maskedCIDR(n))
-			}
+		subnets := specSubnets(s)
+		tunnels = append(tunnels, subnets...)
+		if s.IsolatePeers {
+			anyIsolate = true
+			isoSources = append(isoSources, subnets...)
+		}
+		if s.AllowLAN {
+			anyLAN = true
+			sources = append(sources, subnets...)
 		}
 	}
-	if !anyEnabled {
-		return NATPlan{}, false
-	}
-	wans, reason := b.wanInterfacesLocked()
-	return PlanNAT(NATPlanInput{
-		Enabled:          true,
+
+	input := NATPlanInput{
+		Enabled:          anyLAN,
 		SourceSubnets:    sources,
-		WANInterfaces:    wans,
-		WANReason:        reason,
 		TunnelInterfaces: b.state.ManagedCopy(),
-		HostNetworks:     b.hostNetworksLocked(),
-	}), true
+		IsolateRequested: anyIsolate,
+		IsolateSubnets:   isoSources,
+		TunnelSubnets:    tunnels,
+	}
+	// 出口网卡与主机网段只在真的要做内网访问时才去探测：
+	// 它们都要读内核路由表，没必要每 10 秒为一个没打开的开关付这份代价。
+	if anyLAN {
+		input.WANInterfaces, input.WANReason = b.wanInterfacesLocked()
+		input.HostNetworks = b.hostNetworksLocked()
+	}
+	return PlanNAT(input), anyLAN, anyIsolate
+}
+
+// specSubnets 返回一条连接的全部隧道网段（已做掩码归一化）。
+func specSubnets(s model.InterfaceSpec) []string {
+	out := []string{}
+	for _, a := range s.Addresses {
+		if _, n, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil {
+			out = append(out, maskedCIDR(n))
+		}
+	}
+	return out
 }
 
 // wanInterfacesLocked 返回可用作转发出口的网卡（排除隧道网卡），
@@ -460,6 +503,11 @@ func (b *kernelBackend) ensureNATTableLocked(plan NATPlan) error {
 		Priority: nftables.ChainPriorityNATSource,
 	})
 
+	// 隔离规则必须排在最前面：nftables 以「第一条匹配的规则」作为终局判定，
+	// 若把它们放在后面的放行规则之后，丢弃永远轮不到生效，
+	// 用户看到的就是「隔离开关打开了但设备还能互访」。
+	isoApplied := addIsolationRules(c, tbl, fwd, plan)
+
 	applied := 0
 	for _, src := range plan.Sources {
 		n, err := parseIPNet(src)
@@ -501,15 +549,56 @@ func (b *kernelBackend) ensureNATTableLocked(plan NATPlan) error {
 			})
 		}
 	}
-	if applied == 0 {
+	if applied == 0 && isoApplied == 0 {
 		c.DelTable(tbl)
 		_ = c.Flush()
 		return fmt.Errorf("没有可用的 IPv4 隧道网段")
 	}
 	if err := c.Flush(); err != nil {
-		return fmt.Errorf("写入内网访问规则失败: %w", err)
+		return fmt.Errorf("下发转发规则失败: %w", err)
+	}
+	if !plan.Enable {
+		// 只下发了隔离规则：系统转发链的兜底放行是为「设备访问内网」准备的，
+		// 这里既不需要，往里插放行规则还会削弱隔离的语义。
+		return nil
 	}
 	return b.ensureSystemForwardLocked(c, plan)
+}
+
+// addIsolationRules 写入设备间隔离规则，返回实际写入的条数。
+//
+// 每条规则形如：
+//
+//	ip saddr <被隔离的隧道网段> ip daddr <隧道网段> drop
+//
+// 用 drop 而不是 reject：drop 在所有内核版本上行为一致，也不需要内核生成 ICMP
+// 差错报文（在转发路径上生成 ICMP 依赖 conntrack 与内核版本，失败时更难排查）。
+// 代价是设备侧表现为「超时」而不是「立即拒绝」，这个取舍是有意为之。
+func addIsolationRules(c *nftables.Conn, tbl *nftables.Table, chain *nftables.Chain, plan NATPlan) int {
+	n := 0
+	for _, pair := range plan.IsolationRules() {
+		from, err := parseIPNet(pair[0])
+		if err != nil {
+			continue
+		}
+		to, err := parseIPNet(pair[1])
+		if err != nil {
+			continue
+		}
+		ex := matchSrcIPv4(from)
+		ex = append(ex, matchDstIPv4(to)...)
+		if len(ex) == 0 {
+			continue
+		}
+		c.AddRule(&nftables.Rule{
+			Table:    tbl,
+			Chain:    chain,
+			Exprs:    append(ex, &expr.Verdict{Kind: expr.VerdictDrop}),
+			UserData: natMarker,
+		})
+		n++
+	}
+	return n
 }
 
 const ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
@@ -718,13 +807,14 @@ func (b *kernelBackend) systemForwardPolicyDropLocked() bool {
 	return false
 }
 
-// natStatusLocked 汇总内网访问的当前状态与逐项自检结果。
+// natStatusLocked 汇总专用表的当前状态与逐项自检结果。
 func (b *kernelBackend) natStatusLocked() model.NATStatus {
 	st := model.NATStatus{
 		Sources:              b.state.NATSources(),
 		WANs:                 b.state.NATWANs(),
 		IPForward:            ipForwardEnabled(),
 		IPForwardEnabledByUs: b.state.IPForwardByUs(),
+		IsolateNets:          b.state.IsolateNets(),
 	}
 	if st.Sources == nil {
 		st.Sources = []string{}
@@ -732,26 +822,90 @@ func (b *kernelBackend) natStatusLocked() model.NATStatus {
 	if st.WANs == nil {
 		st.WANs = []string{}
 	}
-	wanted := b.state.NATFingerprint() != ""
-	if wanted {
+	if st.IsolateNets == nil {
+		st.IsolateNets = []string{}
+	}
+
+	notes := []string{}
+	// 两类规则分别核对。「期望有规则」以状态里记录的实际生效内容为准，
+	// 而不是只看指纹：只开了隔离时指纹也非空，但此时内核里本来就没有
+	// postrouting 规则，用指纹判断会得出「转发规则不存在」的错误结论。
+	if len(st.WANs) > 0 {
 		rules, err := b.natRuleCount()
 		switch {
 		case err != nil:
-			st.Note = "无法读取转发规则状态：" + err.Error()
+			notes = append(notes, "无法读取转发规则状态："+err.Error())
 		case rules == 0:
-			st.Note = "转发规则不存在（可能被其它工具清理过），修改任意连接或重新打开开关即可恢复"
+			notes = append(notes, "转发规则不存在（可能被其它工具清理过），修改任意连接或重新打开开关即可恢复")
 		default:
 			st.Active = true
 		}
 	}
-	st.Checks = b.natChecksLocked(wanted, st.Active)
+	if len(st.IsolateNets) > 0 {
+		rules, err := b.isoRuleCount()
+		switch {
+		case err != nil:
+			notes = append(notes, "无法读取设备间隔离规则状态："+err.Error())
+		case rules == 0:
+			notes = append(notes, "设备间隔离规则不存在（可能被其它工具清理过），修改任意连接或重新打开开关即可恢复")
+		default:
+			st.IsolateActive = true
+			st.IsolateRules = rules
+		}
+	}
+	st.Note = strings.Join(notes, "；")
+	st.Checks = b.natChecksLocked(st)
 	return st
 }
 
-// natRulesPresent 判断专用表里的规则是否还在（可能被其它工具清理过）。
-func (b *kernelBackend) natRulesPresent() bool {
-	n, err := b.natRuleCount()
-	return err == nil && n > 0
+// rulesPresent 判断专用表里的规则是否与决策相符（可能被其它工具清理过）。
+//
+// 两类规则分别核对：内网访问写在 postrouting 链，设备隔离写在 forward 链。
+// 只核对其中一类的话，「隔离开着、内网访问关着」这种组合会被误判成规则丢失，
+// 于是每轮收敛都重建一次规则 —— 规则抖动正是之前花力气消除的问题。
+func (b *kernelBackend) rulesPresent(plan NATPlan) bool {
+	if plan.Enable {
+		if n, err := b.natRuleCount(); err != nil || n == 0 {
+			return false
+		}
+	}
+	if plan.Isolate {
+		if n, err := b.isoRuleCount(); err != nil || n == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// isoRuleCount 返回专用表转发链里「丢弃」类规则的条数，
+// 用来确认隔离规则确实落到内核里了（而不是只看表存不存在）。
+func (b *kernelBackend) isoRuleCount() (int, error) {
+	c, err := nftConn()
+	if err != nil {
+		return 0, err
+	}
+	t, err := findNATTable(c)
+	if err != nil || t == nil {
+		return 0, err
+	}
+	ch, err := c.ListChain(t, natForwardChain)
+	if err != nil || ch == nil {
+		return 0, err
+	}
+	rules, err := c.GetRules(t, ch)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range rules {
+		for _, e := range r.Exprs {
+			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictDrop {
+				n++
+				break
+			}
+		}
+	}
+	return n, nil
 }
 
 // natRuleCount 返回专用表里源地址改写链上的规则条数，用于确认规则确实落到内核里了。
@@ -775,16 +929,20 @@ func (b *kernelBackend) natRuleCount() (int, error) {
 	return len(rules), nil
 }
 
-// natChecksLocked 生成内网访问链路的自检清单。
+// natChecksLocked 生成内网访问链路与设备间隔离的自检清单。
 //
-// 用户看到的现象只有一个（设备连上了但访问不了家里其它设备），
+// 用户看到的现象只有两个（设备连上了但访问不了家里其它设备 / 设备之间还能互访），
 // 但成因分好几层：规则没下发 / 内核转发关了 / 系统转发链拦了 / 出口网卡没认出来。
 // 逐项列出来，用户就不必靠猜，也能直接告诉我们是哪一层出问题。
-func (b *kernelBackend) natChecksLocked(wanted, active bool) []model.NATCheck {
+//
+// 入参是已查好的状态（含内网访问与隔离两侧的事实），避免在这里重复读内核。
+func (b *kernelBackend) natChecksLocked(st model.NATStatus) []model.NATCheck {
 	checks := []model.NATCheck{}
 
 	requested := b.state.NATSwitchOn()
 	blocked := b.state.NATBlockedReason()
+	wanted := len(st.WANs) > 0 // 内网访问规则此前是否已下发过
+	active := st.Active
 
 	// ① 转发规则
 	switch {
@@ -810,7 +968,7 @@ func (b *kernelBackend) natChecksLocked(wanted, active bool) []model.NATCheck {
 		checks = append(checks, model.NATCheck{
 			Key: "rules", Label: "转发规则", OK: true,
 			Detail: fmt.Sprintf("已下发：%s → 出口 %s（已做源地址改写）",
-				strings.Join(b.state.NATSources(), "、"), strings.Join(b.state.NATWANs(), "、")),
+				strings.Join(st.Sources, "、"), strings.Join(st.WANs, "、")),
 		})
 	default:
 		checks = append(checks, model.NATCheck{
@@ -849,10 +1007,10 @@ func (b *kernelBackend) natChecksLocked(wanted, active bool) []model.NATCheck {
 
 	// ④ 出口网卡：只要开关是打开的就要给个明确结论，
 	//    让用户能直接和 `ip route show default` 的输出对上。
-	if wans := b.state.NATWANs(); len(wans) > 0 {
+	if len(st.WANs) > 0 {
 		checks = append(checks, model.NATCheck{
 			Key: "wan", Label: "出口网卡", OK: true,
-			Detail: fmt.Sprintf("经 %s 转发到局域网", strings.Join(wans, "、")),
+			Detail: fmt.Sprintf("经 %s 转发到局域网", strings.Join(st.WANs, "、")),
 		})
 	} else if requested {
 		live, reason := b.wanInterfacesLocked()
@@ -867,6 +1025,36 @@ func (b *kernelBackend) natChecksLocked(wanted, active bool) []model.NATCheck {
 				Detail: reason,
 				Fix: "在 NAS 上执行 ip route show default 查看默认路由；" +
 					"若确实没有默认网关，请到系统网络设置里补上后重试",
+			})
+		}
+	}
+
+	// ⑤ 设备间隔离：只在开关打开时展示，避免没用到这项功能的用户
+	//    被一条「未启用」的条目干扰。
+	if b.state.IsolateSwitchOn() {
+		switch {
+		case len(st.IsolateNets) == 0:
+			reason := b.state.IsolateBlockedReason()
+			if reason == "" {
+				reason = "规则尚未下发"
+			}
+			checks = append(checks, model.NATCheck{
+				Key: "isolate", Label: "设备间隔离", OK: false,
+				Detail: "开关已打开，但隔离规则未生效：" + reason,
+				Fix: "确认连接的「本机专用地址」是 IPv4 网段（目前只支持 IPv4）；" +
+					"本应用每 10 秒会自动重试，也可点「立即应用」马上重试一次",
+			})
+		case !st.IsolateActive:
+			checks = append(checks, model.NATCheck{
+				Key: "isolate", Label: "设备间隔离", OK: false,
+				Detail: "隔离规则内容与期望一致但内核里查不到（可能被其它工具清理过）",
+				Fix:    "把该连接的「设备间隔离」开关关掉再打开，或点「立即应用」重建规则",
+			})
+		default:
+			checks = append(checks, model.NATCheck{
+				Key: "isolate", Label: "设备间隔离", OK: true,
+				Detail: fmt.Sprintf("已隔离 %s：这些连接里的设备之间不能互访，但仍可访问 NAS 与内网（共 %d 条阻断规则）",
+					strings.Join(st.IsolateNets, "、"), st.IsolateRules),
 			})
 		}
 	}

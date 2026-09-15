@@ -228,6 +228,7 @@ const ACTION_LABELS: Record<string, string> = {
   'peer.auto_disable': '系统自动停用了设备',
   'config.import': '导入了已有配置',
   'backup.create': '创建了备份',
+  'backup.import': '导入了备份',
   'backup.delete': '删除了备份',
   'backup.restore': '从备份恢复',
   'settings.update': '修改了系统设置',

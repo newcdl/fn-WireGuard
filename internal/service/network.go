@@ -49,8 +49,23 @@ type NetworkCheckResult struct {
 	NAT model.NATStatus `json:"nat"`
 	// ForwardPolicyDrop 系统转发链策略是否为丢弃（装过 Docker 的机器常见）。
 	ForwardPolicyDrop bool `json:"forward_policy_drop"`
+	// HomeSubnets 是探测到的 NAS 所在局域网网段。
+	//
+	// 暴露给界面是为了让「按设备划分访问范围」能直接给出可选项：
+	// 让用户凭记忆手写家里网段，写错的概率远高于点一下。
+	HomeSubnets []string `json:"home_subnets"`
+	// AccessIssues 是「设备通行范围 / 内网访问 / 设备隔离」之间互相矛盾的结论。
+	AccessIssues []AccessIssue `json:"access_issues"`
 	// Messages 面向用户的结论说明。
 	Messages []string `json:"messages"`
+}
+
+// orEmptyAccessIssues 归一化为空数组，避免前端拿到 null 后遍历报错。
+func orEmptyAccessIssues(list []AccessIssue) []AccessIssue {
+	if list == nil {
+		return []AccessIssue{}
+	}
+	return list
 }
 
 // CheckNetwork 执行只读自检，不修改任何设置。
@@ -68,6 +83,8 @@ func (s *Service) CheckNetwork(ctx context.Context) (*NetworkCheckResult, error)
 		ForeignInterfaces: orEmptyForeign(rep.ForeignInterfaces),
 		NAT:               rep.NAT,
 		ForwardPolicyDrop: rep.ForwardPolicyDrop,
+		HomeSubnets:       orEmptyStrings(s.homeLANSubnets(ctx)),
+		AccessIssues:      orEmptyAccessIssues(s.DiagnoseAccess(ctx)),
 	}
 	if res.NAT.Sources == nil {
 		res.NAT.Sources = []string{}

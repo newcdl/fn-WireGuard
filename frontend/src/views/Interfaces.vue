@@ -5,7 +5,7 @@
         新建连接
       </el-button>
       <el-button :icon="Upload" @click="importVisible = true">导入已有配置</el-button>
-      <el-button :icon="Download" @click="exportAll">导出备份</el-button>
+      <el-button :icon="Download" @click="exportAll">导出连接配置</el-button>
       <el-button v-if="session.can('iface.write')" :icon="Refresh" @click="applyNow">立即应用</el-button>
       <el-button :icon="Reading" @click="helpVisible = true">配置说明</el-button>
       <div style="flex: 1"></div>
@@ -58,6 +58,19 @@
               active-text="开"
               inactive-text="关"
               @change="(v: string | number | boolean) => toggleLan(row, !!v)"
+            />
+          </template>
+        </el-table-column>
+        <el-table-column label="设备隔离" width="112">
+          <template #default="{ row }">
+            <el-switch
+              :model-value="row.isolate_peers"
+              :disabled="!session.can('iface.write')"
+              :loading="isolateSaving === row.id"
+              inline-prompt
+              active-text="开"
+              inactive-text="关"
+              @change="(v: string | number | boolean) => toggleIsolate(row, !!v)"
             />
           </template>
         </el-table-column>
@@ -131,6 +144,20 @@
               active-text="开"
               inactive-text="关"
               @change="(v: string | number | boolean) => toggleLan(row, !!v)"
+            />
+          </span>
+        </div>
+        <div class="fnwg-kv">
+          <span class="fnwg-kv-key">设备之间隔离</span>
+          <span class="fnwg-kv-val">
+            <el-switch
+              :model-value="row.isolate_peers"
+              :disabled="!session.can('iface.write')"
+              :loading="isolateSaving === row.id"
+              inline-prompt
+              active-text="开"
+              inactive-text="关"
+              @change="(v: string | number | boolean) => toggleIsolate(row, !!v)"
             />
           </span>
         </div>
@@ -263,6 +290,12 @@
         </el-form-item>
 
         <el-form-item>
+          <template #label><FieldLabel :meta="F.isolate_peers" /></template>
+          <el-switch v-model="form.isolate_peers" active-text="开启" />
+          <FieldTips :meta="F.isolate_peers" example />
+        </el-form-item>
+
+        <el-form-item>
           <template #label><FieldLabel :meta="F.enabled" /></template>
           <el-switch v-model="form.enabled" active-text="启用" />
           <el-switch v-model="form.autostart" active-text="开机自动启用" style="margin-left: 16px" />
@@ -381,12 +414,21 @@ const helpVisible = ref(false)
 const scenario = ref('home')
 
 // 连接级异常提示：与全局「系统状态」同源，避免连接页与总览给出互相矛盾的结论
-const { issues } = useSystemHealth()
+const { issues, net } = useSystemHealth()
 const natBlocked = computed(() => issues.value.some((i) => i.key === 'nat'))
+const isolateBlocked = computed(() => issues.value.some((i) => i.key === 'isolate'))
+// 访问控制矛盾是按连接聚合的，这里只用来给对应那行加一句提示
+const accessIssueIds = computed(
+  () => new Set((net.value?.access_issues || []).map((a) => a.interface_id ?? 0)),
+)
 
 function rowIssue(row: WgInterface): string {
   if (row.enabled && !row.up) return '已启用但当前未工作：设备无法连接。点「立即应用」重新下发配置。'
   if (row.allow_lan && natBlocked.value) return '内网访问已开启但链路未就绪，到「系统维护」查看卡在哪一层。'
+  if (row.isolate_peers && isolateBlocked.value)
+    return '设备间隔离已开启但未生效，设备之间仍可互访；到「系统维护」查看卡在哪一层。'
+  if (accessIssueIds.value.has(row.id))
+    return '这条连接上的设备范围与开关互相矛盾（例如范围含家里网段但内网访问没开），到「系统维护」查看具体结论。'
   return ''
 }
 
@@ -407,8 +449,11 @@ const emptyForm = () => ({
   autostart: true,
   // 默认开启内网访问：设备连回家就是为了访问 NAS 与家里其它设备
   allow_lan: true,
+  // 设备间隔离默认关闭：它是新增限制，默认打开会静默切断设备之间已有的互访
+  isolate_peers: false,
 })
 const lanSaving = ref(0)
+const isolateSaving = ref(0)
 const form = reactive(emptyForm())
 
 async function load() {
@@ -444,6 +489,7 @@ function openEdit(row: WgInterface) {
     enabled: row.enabled,
     autostart: row.autostart,
     allow_lan: row.allow_lan ?? true,
+    isolate_peers: row.isolate_peers ?? false,
   })
   drawerVisible.value = true
 }
@@ -472,6 +518,32 @@ async function toggleLan(row: WgInterface, enabled: boolean) {
   }
 }
 
+/** 一键切换「设备之间互相隔离」，不必进编辑表单 */
+async function toggleIsolate(row: WgInterface, enabled: boolean) {
+  if (!enabled) {
+    const ok = await ElMessageBox.confirm(
+      `关闭后，连接到「${row.name}」的设备之间可以互相访问（同一连接内的设备彼此可达）。\n\n确认关闭？`,
+      '关闭设备间隔离',
+      { type: 'warning', confirmButtonText: '确认关闭', cancelButtonText: '保持隔离' },
+    )
+      .then(() => true)
+      .catch(() => false)
+    if (!ok) return
+  }
+  isolateSaving.value = row.id
+  try {
+    await api.post(`/interfaces/${row.id}/isolate`, { enabled })
+    ElMessage.success(
+      enabled ? '已开启：设备之间不能互访，但仍可访问 NAS 与家里内网' : '已关闭：设备之间恢复互通',
+    )
+    await load()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    isolateSaving.value = 0
+  }
+}
+
 /** 应用场景预设：只覆盖与该场景相关的字段 */
 function applyScenario(values: Record<string, unknown>) {
   Object.assign(form, values)
@@ -493,6 +565,7 @@ async function submit() {
       enabled: form.enabled,
       autostart: form.autostart,
       allow_lan: form.allow_lan,
+      isolate_peers: form.isolate_peers,
     }
     if (form.id) {
       await api.patch(`/interfaces/${form.id}`, payload)

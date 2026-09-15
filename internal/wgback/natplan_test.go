@@ -179,6 +179,178 @@ func TestPlanNATNeverEmitsDefaultRoute(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- 设备间隔离
+
+// TestPlanIsolationRulePairs 隔离规则必须覆盖互访的两个方向。
+//
+// 单连接时源与目标相同（设备互访都发生在同一网段内），只应下发一条；
+// 两条连接都开隔离时是完整的 2×2（去掉重复后 4 条）。
+func TestPlanIsolationRulePairs(t *testing.T) {
+	one := PlanNAT(NATPlanInput{
+		IsolateRequested: true,
+		IsolateSubnets:   []string{"10.10.0.0/24"},
+		TunnelSubnets:    []string{"10.10.0.0/24"},
+	})
+	if !one.Isolate || one.Enable {
+		t.Fatalf("只开隔离时不应顺带启用内网访问，实际: %+v", one)
+	}
+	if got := one.IsolationRules(); len(got) != 1 || got[0] != [2]string{"10.10.0.0/24", "10.10.0.0/24"} {
+		t.Fatalf("单连接应恰好一条同网段阻断规则，实际: %+v", got)
+	}
+
+	two := PlanNAT(NATPlanInput{
+		IsolateRequested: true,
+		IsolateSubnets:   []string{"10.10.0.0/24", "10.12.0.0/24"},
+		TunnelSubnets:    []string{"10.12.0.0/24", "10.10.0.0/24"},
+	})
+	if got := two.IsolationRules(); len(got) != 4 {
+		t.Fatalf("两条连接都隔离应下发 4 条阻断规则，实际 %d 条: %+v", len(got), got)
+	}
+}
+
+// TestPlanIsolationCoversAllTunnels 只隔离其中一条连接时，另一条连接里的设备
+// 也必须访问不到被隔离的设备，否则「隔离」只堵了一半。
+func TestPlanIsolationCoversAllTunnels(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:          true,
+		SourceSubnets:    []string{"10.10.0.0/24", "10.11.0.0/24"},
+		WANInterfaces:    []string{"end0"},
+		IsolateRequested: true,
+		IsolateSubnets:   []string{"10.10.0.0/24"},
+		TunnelSubnets:    []string{"10.10.0.0/24", "10.11.0.0/24"},
+	})
+	want := map[string]bool{
+		"10.10.0.0/24>10.10.0.0/24": true,
+		"10.10.0.0/24>10.11.0.0/24": true,
+		"10.11.0.0/24>10.10.0.0/24": true,
+	}
+	rules := plan.IsolationRules()
+	if len(rules) != len(want) {
+		t.Fatalf("应恰好 %d 条阻断规则，实际 %d 条: %+v", len(want), len(rules), rules)
+	}
+	for _, r := range rules {
+		if !want[r[0]+">"+r[1]] {
+			t.Fatalf("出现了预期之外的隔离规则: %v", r)
+		}
+	}
+	if !plan.Enable {
+		t.Fatal("内网访问与设备隔离应能同时生效")
+	}
+}
+
+// TestPlanIsolationRuleSpaceIsTunnelOnly 隔离规则只能落在隧道网段之间：
+// 绝不能出现「隧道 ↔ 局域网」这类匹配，那会连带切断设备访问家里内网的能力，
+// 而用户要的只是「设备之间不通」。
+func TestPlanIsolationRuleSpaceIsTunnelOnly(t *testing.T) {
+	const host = "192.168.3.0/24"
+	plan := PlanNAT(NATPlanInput{
+		Enabled:          true,
+		SourceSubnets:    []string{"10.10.0.0/24"},
+		WANInterfaces:    []string{"end0"},
+		HostNetworks:     []string{host},
+		IsolateRequested: true,
+		IsolateSubnets:   []string{"10.10.0.0/24"},
+		TunnelSubnets:    []string{"10.10.0.0/24"},
+	})
+	tunnels := map[string]bool{"10.10.0.0/24": true}
+	rules := plan.IsolationRules()
+	if len(rules) == 0 {
+		t.Fatal("应下发隔离规则")
+	}
+	for _, r := range rules {
+		if !tunnels[r[0]] || !tunnels[r[1]] {
+			t.Fatalf("隔离规则只能匹配隧道网段，实际: %v", r)
+		}
+		if r[0] == host || r[1] == host {
+			t.Fatalf("隔离规则绝不能匹配 NAS 所在局域网网段: %v", r)
+		}
+	}
+}
+
+// TestPlanIsolationIndependentOfForwarding 内网访问因为探测不到出口网卡而无法启用时，
+// 隔离规则仍必须照常下发 —— 它只依赖隧道网段，不依赖出口网卡。
+func TestPlanIsolationIndependentOfForwarding(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:          true,
+		SourceSubnets:    []string{"10.10.0.0/24"},
+		WANReason:        "未能探测到 NAS 的出口网卡：系统里没有默认路由",
+		IsolateRequested: true,
+		IsolateSubnets:   []string{"10.10.0.0/24"},
+		TunnelSubnets:    []string{"10.10.0.0/24"},
+	})
+	if plan.Enable {
+		t.Fatal("没有出口网卡时不应启用内网访问")
+	}
+	if plan.SkipReason == "" {
+		t.Fatal("内网访问未启用必须给出原因")
+	}
+	if !plan.Isolate || len(plan.IsolationRules()) == 0 {
+		t.Fatalf("隔离不应受内网访问未启用的影响，实际: %+v", plan)
+	}
+	if plan.Empty() {
+		t.Fatal("有隔离规则时决策不该被当成「无事可做」")
+	}
+}
+
+// TestPlanIsolationOffChangesNothing 没开开关时一条隔离规则都不该有，
+// 指纹也要与旧版本完全一致：否则升级后的第一轮收敛就会无谓地重建规则。
+func TestPlanIsolationOffChangesNothing(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:          true,
+		SourceSubnets:    []string{"10.10.0.0/24"},
+		WANInterfaces:    []string{"end0"},
+		IsolateRequested: false,
+		TunnelSubnets:    []string{"10.10.0.0/24"},
+	})
+	if plan.Isolate || len(plan.IsolationRules()) != 0 {
+		t.Fatalf("开关关闭时不应产生隔离规则，实际: %+v", plan)
+	}
+	if got := plan.Fingerprint(); got != "nat:10.10.0.0/24->end0" {
+		t.Fatalf("未开启隔离时指纹应与旧版本一致，实际: %s", got)
+	}
+}
+
+// TestPlanIsolationReasons 隔离无法生效时必须给出可读原因，
+// 且要能区分「隧道是 IPv6」与「读不到隧道网段」—— 两者处理方式不同。
+func TestPlanIsolationReasons(t *testing.T) {
+	ipv6 := PlanNAT(NATPlanInput{
+		IsolateRequested: true,
+		IsolateSubnets:   []string{"fd00::1/64"},
+		TunnelSubnets:    []string{"fd00::1/64"},
+	})
+	if ipv6.Isolate || !strings.Contains(ipv6.IsolateReason, "IPv6") {
+		t.Fatalf("IPv6 隧道应给出明确的不支持原因，实际: %+v", ipv6)
+	}
+	none := PlanNAT(NATPlanInput{IsolateRequested: true})
+	if none.Isolate || !strings.Contains(none.IsolateReason, "隧道网段") {
+		t.Fatalf("读不到网段应说明原因，实际: %+v", none)
+	}
+	if none.Fingerprint() != "" {
+		t.Fatalf("隔离未生效且无转发规则时指纹应为空，实际: %s", none.Fingerprint())
+	}
+}
+
+// TestPlanIsolationFingerprintStable 指纹对隔离同样要稳定：
+// 输入顺序变化不改变指纹，开关变化必须改变指纹（否则规则不会重建）。
+func TestPlanIsolationFingerprintStable(t *testing.T) {
+	base := NATPlanInput{
+		IsolateRequested: true,
+		IsolateSubnets:   []string{"10.10.0.0/24"},
+		TunnelSubnets:    []string{"10.10.0.0/24", "10.11.0.0/24"},
+	}
+	a := PlanNAT(base)
+	b := base
+	b.TunnelSubnets = []string{"10.11.0.0/24", "10.10.0.0/24"}
+	if a.Fingerprint() != PlanNAT(b).Fingerprint() {
+		t.Fatalf("顺序不同不应改变指纹：%s vs %s", a.Fingerprint(), PlanNAT(b).Fingerprint())
+	}
+	off := base
+	off.IsolateRequested = false
+	if PlanNAT(off).Fingerprint() == a.Fingerprint() {
+		t.Fatal("开关变化必须改变指纹，否则内核里的规则不会被更新")
+	}
+}
+
 // TestPickWANsBasic 常规情形：多张网卡都有默认路由时全部保留，顺序稳定。
 func TestPickWANsBasic(t *testing.T) {
 	wans, reason := PickWANs([]WANCandidate{

@@ -25,20 +25,121 @@
             </el-form-item>
 
             <el-form-item>
-              <template #label>
-                <FieldLabel :meta="S.notify_webhook" />
-                <el-tag size="small" type="warning" effect="plain" style="margin-left: 6px">暂未生效</el-tag>
-              </template>
-              <el-input v-model="settings.notify_webhook" placeholder="可留空（当前版本暂不生效）" />
-              <!-- 界面不能说假话：这一项后端还没有发送逻辑，必须让用户当场看到 -->
-              <div class="fnwg-row-warn">
-                该功能尚未生效：事件通知已排入 0.7.0，现在填写不会被推送，只会保存下来备用。
-              </div>
+              <el-button v-if="session.isAdmin" type="primary" :loading="savingSettings" @click="saveSettings">
+                保存
+              </el-button>
+              <span v-else class="fnwg-hint">仅管理员可以修改这些设置</span>
+            </el-form-item>
+          </el-form>
+        </div>
+      </el-tab-pane>
+
+      <!-- 事件通知 -->
+      <el-tab-pane label="事件通知" name="notify">
+        <el-alert v-if="!notifyStatus?.configured" type="info" :closable="false" show-icon style="margin-bottom: 12px">
+          <template #title>
+            填一个推送地址就能收到告警：设备上下线、到期、流量用尽、连接中断、配置下发失败都会发到这里。
+            留空则完全不推送，连接与设备的行为不受任何影响。
+          </template>
+        </el-alert>
+
+        <div class="fnwg-card" style="max-width: 900px">
+          <el-form :model="notify" class="fnwg-form" :label-position="isMobile ? 'top' : 'right'" label-width="150px">
+            <el-form-item>
+              <template #label><FieldLabel :meta="S.notify_webhook" /></template>
+              <el-input
+                v-model="notify.webhook"
+                placeholder="留空则不推送，例如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+              />
+              <!-- 地址写错的表现是「配完了但一直没动静」，所以问题必须当场说清 -->
+              <div v-if="notifyStatus?.problem" class="fnwg-row-warn">{{ notifyStatus.problem }}</div>
               <FieldTips :meta="S.notify_webhook" example />
             </el-form-item>
 
             <el-form-item>
-              <el-button v-if="session.isAdmin" type="primary" :loading="savingSettings" @click="saveSettings">
+              <template #label><FieldLabel :meta="S.notify_format" /></template>
+              <el-select v-model="notify.format" style="max-width: 460px">
+                <el-option label="JSON（默认，适合脚本与自动化平台）" value="json" />
+                <el-option label="纯文本（适合自建推送服务）" value="text" />
+                <el-option label="Markdown（钉钉 / 企业微信 / 飞书群机器人）" value="markdown" />
+              </el-select>
+              <FieldTips :meta="S.notify_format" example />
+            </el-form-item>
+
+            <el-form-item>
+              <template #label><FieldLabel :meta="S.notify_off" /></template>
+              <div v-if="!notifyStatus" class="fnwg-hint">正在读取可推送的事件…</div>
+              <div v-else style="width: 100%">
+                <div v-for="g in notifyStatus.groups" :key="g.key" style="margin-bottom: 8px">
+                  <div style="font-size: 13px; opacity: 0.7; margin-bottom: 2px">{{ g.label }}</div>
+                  <el-checkbox-group v-model="notifyEvents">
+                    <el-checkbox
+                      v-for="k in kindsOf(g.key)"
+                      :key="k.kind"
+                      :value="k.kind"
+                      class="fnwg-radio-line"
+                    >
+                      {{ k.label }}
+                      <span class="fnwg-radio-desc">{{ k.detail }}</span>
+                    </el-checkbox>
+                  </el-checkbox-group>
+                </div>
+                <div class="fnwg-hint">
+                  未勾选的事件不会推送；已开启 {{ notifyEvents.length }} / {{ notifyStatus.all_kinds.length }} 类。
+                  勾选状态随「保存」一起生效。
+                </div>
+              </div>
+            </el-form-item>
+
+            <el-form-item label="通知自检">
+              <div>
+                <el-button
+                  v-if="session.isAdmin"
+                  :loading="testingNotify"
+                  :disabled="!notify.webhook"
+                  @click="sendTestNotify"
+                >
+                  发送测试通知
+                </el-button>
+                <span v-else class="fnwg-hint">仅管理员可以发送测试通知</span>
+              </div>
+              <!-- 只说「已保存」不够：用户真正要知道的是「到底有没有发出去、发的是什么」 -->
+              <div class="fnwg-hint" style="margin-top: 6px">
+                发送测试会先保存上面的地址、格式与事件开关，再立刻推送一条，因此可以当场确认配置是否正确。
+              </div>
+              <div v-if="notifyStatus?.last" class="fnwg-hint" style="margin-top: 6px">
+                最近一次：{{ formatTime(notifyStatus.last.at) }}
+                <el-tag
+                  size="small"
+                  :type="notifyStatus.last.ok ? 'success' : 'danger'"
+                  effect="plain"
+                  style="margin: 0 6px"
+                >
+                  {{ notifyStatus.last.ok ? '成功' : '失败' }}
+                </el-tag>
+                {{ notifyStatus.last.message }}
+              </div>
+              <div v-else class="fnwg-hint" style="margin-top: 6px">还没有发送记录。</div>
+
+              <el-collapse v-if="notifyStatus?.last?.payload" style="margin-top: 8px; width: 100%">
+                <el-collapse-item title="查看实际发出的内容（排障用）">
+                  <div
+                    style="
+                      white-space: pre-wrap;
+                      word-break: break-all;
+                      font-family: monospace;
+                      font-size: 12px;
+                      line-height: 1.6;
+                    "
+                  >
+                    {{ notifyStatus.last.payload }}
+                  </div>
+                </el-collapse-item>
+              </el-collapse>
+            </el-form-item>
+
+            <el-form-item>
+              <el-button v-if="session.isAdmin" type="primary" :loading="savingNotify" @click="saveNotify">
                 保存
               </el-button>
               <span v-else class="fnwg-hint">仅管理员可以修改这些设置</span>
@@ -120,7 +221,7 @@
       <el-tab-pane label="备份还原" name="backup">
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
           <template #title>
-            备份会保存你的全部连接与设备设置，换机或误删后可以一键还原。建议在每次大改动前先备份一次。
+            备份会保存全部连接、设备、系统设置与账号（含管理员密码与密钥），换机或误删后可一键完整还原。建议在每次大改动前先备份一次。
           </template>
         </el-alert>
 
@@ -128,7 +229,16 @@
           <el-button v-if="session.can('backup.restore')" type="primary" :icon="Plus" @click="createBackup">
             立即备份
           </el-button>
-          <el-button :icon="Download" @click="exportAll">导出全部配置（可读文本）</el-button>
+          <el-button v-if="session.can('backup.restore')" :icon="Upload" @click="openImportBackup">
+            导入备份
+          </el-button>
+          <input
+            ref="backupFileInput"
+            type="file"
+            accept=".json,application/json"
+            style="display: none"
+            @change="onImportFile"
+          />
           <div style="flex: 1"></div>
           <span class="fnwg-hint">备份文件位置：{{ shareDir || '-' }}</span>
         </div>
@@ -139,20 +249,19 @@
             <el-table-column label="大小" width="100">
               <template #default="{ row }">{{ formatBytes(row.size) }}</template>
             </el-table-column>
-            <el-table-column label="是否含密钥" width="110">
-              <template #default="{ row }">
-                <el-tag size="small" :type="row.include_key ? 'warning' : 'info'" effect="plain">
-                  {{ row.include_key ? '含密钥' : '不含密钥' }}
-                </el-tag>
+            <el-table-column label="备份内容" width="110">
+              <template #default>
+                <el-tag size="small" type="warning" effect="plain">全量备份</el-tag>
               </template>
             </el-table-column>
             <el-table-column label="备份时间" width="180">
               <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
             </el-table-column>
             <el-table-column prop="note" label="备注" min-width="140" />
-            <el-table-column label="操作" width="160">
+            <el-table-column label="操作" width="200">
               <template #default="{ row }">
                 <el-button v-if="session.can('backup.restore')" link type="primary" @click="restore(row)">还原</el-button>
+                <el-button v-if="session.can('backup.restore')" link type="primary" @click="downloadBackup(row)">下载</el-button>
                 <el-button v-if="session.can('backup.restore')" link type="danger" @click="removeBackup(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -162,9 +271,7 @@
         <div v-else>
           <ItemCard v-for="row in backups" :key="row.id" :title="row.filename">
             <template #extra>
-              <el-tag size="small" :type="row.include_key ? 'warning' : 'info'" effect="plain">
-                {{ row.include_key ? '含密钥' : '不含密钥' }}
-              </el-tag>
+              <el-tag size="small" type="warning" effect="plain">全量备份</el-tag>
             </template>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">备份时间</span>
@@ -182,6 +289,7 @@
               <el-button v-if="session.can('backup.restore')" size="small" type="primary" @click="restore(row)">
                 还原
               </el-button>
+              <el-button v-if="session.can('backup.restore')" size="small" @click="downloadBackup(row)">下载</el-button>
               <el-button v-if="session.can('backup.restore')" size="small" @click="removeBackup(row)">删除</el-button>
             </template>
           </ItemCard>
@@ -250,9 +358,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Download, Reading } from '@element-plus/icons-vue'
-import { api, download } from '@/api/client'
-import type { BackupRecord, Health, User } from '@/api/types'
+import { Plus, Upload, Reading } from '@element-plus/icons-vue'
+import { api, download, postRaw } from '@/api/client'
+import type { BackupRecord, Health, NotifyResult, NotifyStatus, User } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
@@ -275,9 +383,18 @@ const tab = ref('general')
 const settings = reactive<Record<string, string>>({
   server_endpoint: '',
   default_dns: '',
-  notify_webhook: '',
 })
 const savingSettings = ref(false)
+
+// 事件通知单独一组状态，与「接入设置」各自保存：
+// 改通知渠道不该连带改动对外访问地址这类会影响所有设备的配置。
+const notify = reactive({ webhook: '', format: 'json' })
+const savingNotify = ref(false)
+// 通知能力的状态与事件开关。
+// 事件清单与分组都由后端下发：前后端各维护一份，迟早出现「界面能勾、后端不认识」的选项。
+const notifyStatus = ref<NotifyStatus | null>(null)
+const notifyEvents = ref<string[]>([])
+const testingNotify = ref(false)
 const health = ref<Health | null>(null)
 const helpVisible = ref(false)
 
@@ -287,6 +404,7 @@ const newUser = reactive({ username: '', password: '', role: 'viewer' })
 
 const backups = ref<BackupRecord[]>([])
 const shareDir = ref('')
+const backupFileInput = ref<HTMLInputElement | null>(null)
 
 const backendLabel = computed(() => {
   const b = health.value?.backend || realtime.status?.backend
@@ -307,14 +425,30 @@ async function loadAll() {
     Object.assign(settings, {
       server_endpoint: kv.server_endpoint || '',
       default_dns: kv.default_dns || '',
-      notify_webhook: kv.notify_webhook || '',
     })
+    notify.webhook = kv.notify_webhook || ''
+    notify.format = (['text', 'markdown'] as string[]).includes(kv.notify_format || '')
+      ? kv.notify_format
+      : 'json'
   } catch {
     /* 忽略 */
   }
+  await loadNotify()
   await loadHealth()
   if (session.isAdmin) await loadUsers()
   await loadBackups()
+}
+
+async function loadNotify() {
+  try {
+    const st = await api.get<NotifyStatus>('/system/notify')
+    notifyStatus.value = st
+    notifyEvents.value = st.events || []
+  } catch {
+    // 读不到时保持 null：此时提交事件开关会被理解成「全部关闭」，
+    // 那等于把用户的推送静默关掉，宁可不提交这一项。
+    notifyStatus.value = null
+  }
 }
 
 async function loadHealth() {
@@ -344,6 +478,30 @@ async function loadBackups() {
   }
 }
 
+/** kindsOf 取某个分组下的事件（用于分组渲染开关）。 */
+function kindsOf(group: string) {
+  return (notifyStatus.value?.all_kinds || []).filter((k) => k.group === group)
+}
+
+/** persistNotify 保存通知设置（地址、格式、事件开关），不触碰接入设置。 */
+async function persistNotify() {
+  const payload: Record<string, string> = {
+    notify_webhook: notify.webhook,
+    notify_format: notify.format,
+  }
+  if (notifyStatus.value) {
+    // 后端存的是「被明确关闭的事件」，这里把未勾选的换算出来。
+    // 关掉全部事件时会写满所有类型 —— 与「没配置过（全部开启）」区分得清清楚楚。
+    const enabled = new Set(notifyEvents.value)
+    payload.notify_off = notifyStatus.value.all_kinds
+      .filter((k) => !enabled.has(k.kind))
+      .map((k) => k.kind)
+      .join(',')
+  }
+  await api.put('/settings', payload)
+  await loadNotify()
+}
+
 async function saveSettings() {
   savingSettings.value = true
   try {
@@ -353,6 +511,35 @@ async function saveSettings() {
     ElMessage.error((e as Error).message)
   } finally {
     savingSettings.value = false
+  }
+}
+
+async function saveNotify() {
+  savingNotify.value = true
+  try {
+    await persistNotify()
+    ElMessage.success('已保存')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    savingNotify.value = false
+  }
+}
+
+async function sendTestNotify() {
+  testingNotify.value = true
+  try {
+    // 先保存再测试：否则测的是上次保存的地址与格式，
+    // 用户会以为新填的配置不通，而实际上只是还没保存
+    await persistNotify()
+    const res = await api.post<NotifyResult>('/system/notify/test')
+    if (res.ok) ElMessage.success(res.message)
+    else ElMessage.error(res.message)
+    await loadNotify()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    testingNotify.value = false
   }
 }
 
@@ -425,20 +612,8 @@ async function createBackup() {
   } catch {
     return
   }
-  let includeKey = false
   try {
-    await ElMessageBox.confirm(
-      '备份里是否同时保存密钥？\n· 含密钥：还原后设备可以直接继续使用\n· 不含密钥：更安全，但还原后设备需要重新扫码',
-      '备份内容',
-      { confirmButtonText: '含密钥', cancelButtonText: '不含密钥', distinguishCancelAndClose: true, type: 'warning' },
-    )
-    includeKey = true
-  } catch (action) {
-    if (action === 'close') return
-    includeKey = false
-  }
-  try {
-    await api.post('/backups', { note, include_key: includeKey })
+    await api.post('/backups', { note })
     ElMessage.success('备份已完成')
     await loadBackups()
   } catch (e) {
@@ -449,7 +624,7 @@ async function createBackup() {
 async function restore(row: BackupRecord) {
   try {
     await ElMessageBox.confirm(
-      `还原将用备份「${row.filename}」覆盖当前的全部连接与设备设置，现有配置会被替换。确认继续？`,
+      `还原将用备份「${row.filename}」覆盖当前的全部连接、设备、系统设置与账号（含管理员密码），现有配置会被替换。确认继续？`,
       '还原备份',
       { type: 'warning' },
     )
@@ -471,8 +646,27 @@ async function removeBackup(row: BackupRecord) {
   }
 }
 
-function exportAll() {
-  download('/config/export')
+function downloadBackup(row: BackupRecord) {
+  download(`/backups/${row.id}/download`)
+}
+
+function openImportBackup() {
+  backupFileInput.value?.click()
+}
+
+async function onImportFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  try {
+    const text = await file.text()
+    await postRaw(`/backups/import?filename=${encodeURIComponent(file.name)}`, text)
+    ElMessage.success('备份已导入，可在列表中选择「还原」')
+    await loadBackups()
+  } catch (err) {
+    ElMessage.error((err as Error).message)
+  }
 }
 
 onMounted(async () => {

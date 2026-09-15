@@ -18,6 +18,8 @@ export interface WgInterface {
   autostart: boolean
   /** 允许设备访问家里内网（NAT 转发） */
   allow_lan: boolean
+  /** 设备间隔离：这条连接里的设备之间不能互相访问 */
+  isolate_peers: boolean
   revision: number
   created_at: string
   updated_at: string
@@ -53,6 +55,11 @@ export interface WgPeer {
   quota_rx: number
   quota_tx: number
   expire_at?: string | null
+  /**
+   * 设备里那份配置已经与当前设置不一致，需要重新扫码导入。
+   * 改通行范围、对外地址、DNS 都只影响「之后新生成」的配置。
+   */
+  config_stale?: boolean
   enabled: boolean
   created_at: string
   updated_at: string
@@ -167,6 +174,51 @@ export interface BackupRecord {
   created_at: string
 }
 
+/** 可配置的事件通知类型（由后端下发，避免前后端各维护一份清单） */
+export interface NotifyKind {
+  kind: string
+  /** 所属分组：peer / iface / system */
+  group: string
+  label: string
+  detail: string
+  level: 'info' | 'warn'
+}
+
+/** 事件分组（设备 / 连接 / 系统），供界面分节展示 */
+export interface NotifyGroup {
+  key: string
+  label: string
+}
+
+/** 一次通知投递的结果 */
+export interface NotifyResult {
+  ok: boolean
+  status_code?: number
+  message: string
+  at: string
+  /** 实际发出的内容（截断后），排障用：接收端不显示消息时唯一可靠的线索 */
+  payload?: string
+}
+
+/** 通知配置与最近一次投递结果 */
+export interface NotifyStatus {
+  configured: boolean
+  /** 脱敏后的地址：路径与查询串已被抹掉，避免令牌泄漏 */
+  url: string
+  /** 地址本身的问题（为空表示可用） */
+  problem?: string
+  format: 'json' | 'text' | 'markdown'
+  /** 已开启的事件类型 */
+  events: string[]
+  all_kinds: NotifyKind[]
+  groups: NotifyGroup[]
+  last?: NotifyResult
+  sent: number
+  failed: number
+  deduped: number
+  dropped: number
+}
+
 export interface DefaultRoute {
   family: number
   gw?: string
@@ -204,8 +256,26 @@ export interface NATStatus {
   /** 该开关是否由本应用开启 */
   ip_forward_enabled_by_us: boolean
   note?: string
+  /** 设备间隔离规则是否已生效 */
+  isolate_active: boolean
+  /** 当前被隔离的隧道网段 */
+  isolate_nets: string[]
+  /** 内核里实际的阻断规则条数 */
+  isolate_rules: number
   /** 逐项自检结果：直接指出卡在哪一层 */
   checks: NATCheck[]
+}
+
+/** 「设备通行范围 / 内网访问 / 设备隔离」之间互相矛盾的一条结论 */
+export interface AccessIssue {
+  key: string
+  title: string
+  detail: string
+  fix?: string
+  /** 涉及哪条连接，便于直接定位 */
+  interface_id?: number
+  /** 需要用户去处理的页面路由名 */
+  to?: string
 }
 
 export interface NetworkCheckResult {
@@ -217,6 +287,10 @@ export interface NetworkCheckResult {
   foreign_interfaces: ForeignInterface[]
   nat: NATStatus
   forward_policy_drop: boolean
+  /** 探测到的 NAS 所在局域网网段（供「自定义可访问范围」点选，避免手写填错） */
+  home_subnets: string[]
+  /** 访问控制相关的配置矛盾（已按连接聚合，数量与连接数同阶） */
+  access_issues: AccessIssue[]
   messages: string[]
 }
 
