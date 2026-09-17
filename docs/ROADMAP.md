@@ -23,7 +23,7 @@
 | 路由安全 | 不改系统网络、可一键复原 | `routesafety.go` 纯函数铁规则、`policyroute.go` 专用策略表 `51888` + `ip rule` |
 | 内网访问 | 设备能访问家里其它机器 | `natplan.go` 决策、`nat.go` 专用 nftables 表 `inet fn-wireguard`、六层自检 |
 | 连接管理 | 创建/编辑/启停/导入导出 | `internal/service/interface.go`（跨连接冲突校验、地址端口自动错开） |
-| 设备管理 | 二维码、上网方式、期限、配额 | `internal/service/peer.go`、`engine.go` 期限与配额强制下线 |
+| 设备管理 | 二维码、上网方式、期限、配额、批量导入、新建向导 | `internal/service/peer.go`（`ImportPeers` 批量）、`engine.go` 期限与配额强制下线 |
 | 密钥托管 | 私钥不落明文、可轮换 | `internal/secretbox/` AES-256-GCM、`wgkey` 密钥生成 |
 | 配置生成 | wg-quick 风格配置、二维码 | `internal/wgconf/`、前端二维码渲染 |
 | 实时监控 | 流量曲线、设备在线状态 | `internal/api` WebSocket + 前端 `stores/realtime.ts` + ECharts |
@@ -31,6 +31,7 @@
 | 系统维护 | 体检、修复、残留清理、重新应用 | `frontend/src/views/Maintenance.vue` + `internal/service/network.go` |
 | 异常可见性 | 顶栏状态栏、全局横幅、行内提示 | `frontend/src/composables/useSystemHealth.ts`（唯一数据源） |
 | 帮助系统 | 每个配置项的「是什么/为什么/影响/例子」 | `frontend/src/constants/fields.ts`（`FieldTips` / 配置说明大全） |
+| 全局搜索 | 顶栏一个入口搜连接与设备并跳转详情 | `frontend/src/components/GlobalSearch.vue` |
 | 备份还原 | 整机配置备份、含/不含密钥 | `internal/service/config.go` + 前端「备份还原」 |
 | 交付链路 | 双架构安装包、自动发版 | `scripts/build.sh`、`scripts/version.sh`、`.github/workflows/release.yml` |
 
@@ -132,16 +133,26 @@
 - **依赖**：P0-3。
 - **风险**：R5。
 
-#### P1-3 设备批量导入与新建向导
+#### P1-3 设备批量导入与新建向导（已完成）
 - **目标**：一次导入多台设备（CSV/文本），新建设备时给分步引导（含「下一步扫码」指引）。
 - **衔接**：复用现有导入解析（`/config/import`）与设备创建接口，仅新增批量循环与逐条错误汇总。
 - **依赖**：无。
 - **验收**：见 V6。
+- **实际实现**：批量导入没有复用 `/config/import`（它要求一份含 `[Interface]` 的完整 wg-quick
+  文本、且只回传成功总数）。改为新增 `POST /peers/import`：前端把多行文本解析成结构化列表并
+  预览，后端逐条创建、**逐条回传成功/失败原因**（重复识别码、格式非法都能定位到具体哪一行）。
+  为满足「导入 100 台 ≤ 10 秒」，把落库逻辑从 `CreatePeer` 里抽出为不触发收敛的 `createPeer`，
+  批量时最后统一收敛一次（否则 100 台会触发 100 次全量收敛）。新建向导在「添加设备」抽屉内做
+  分步（选用途 → 填信息 → 扫码），最后一步**内嵌二维码**，不再跳到另一个弹窗。
 
-#### P1-4 全局搜索与快捷跳转
+#### P1-4 全局搜索与快捷跳转（已完成）
 - **目标**：一个入口搜连接与设备，直接跳到对应页面并打开详情。
 - **衔接**：纯前端，读已有列表数据。
 - **依赖**：无。
+- **实际实现**：新增顶栏搜索组件 `components/GlobalSearch.vue`，连接与设备统一检索
+  （名称/备注/分组/识别码/所属连接），支持 `Ctrl/⌘ + K` 唤起；数据在首次聚焦时拉取并缓存 30 秒。
+  跳转沿用已有的 query 约定并扩展：连接用 `interfaces?edit=<id>`、设备用 `peers?iface=<id>&edit=<id>`，
+  目标页监听 query 变化后自动打开对应的详情抽屉（页面已挂载时也能生效）。
 
 ### P2 —— 0.9.0「兼容性与账号安全」
 

@@ -73,6 +73,20 @@ type PeerInput struct {
 
 // CreatePeer 新增节点。
 func (s *Service) CreatePeer(ctx context.Context, in PeerInput, a Actor) (*model.Peer, error) {
+	p, err := s.createPeer(ctx, in, a)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.reconcile(ctx)
+	return p, nil
+}
+
+// createPeer 落库一台设备，但**不触发收敛**。
+//
+// 单台创建走 CreatePeer（落库后立即收敛）。批量导入则逐条调用本函数、
+// 最后统一收敛一次：否则 100 台设备会触发 100 次全量收敛，既慢又会把
+// 收敛循环搅乱（这正是 V6「导入 100 台 ≤ 10 秒」能否达成的关键）。
+func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model.Peer, error) {
 	it, err := s.Store.GetInterface(ctx, in.InterfaceID)
 	if err != nil {
 		return nil, fmt.Errorf("所选连接不存在，请刷新页面后重试")
@@ -141,8 +155,89 @@ func (s *Service) CreatePeer(ctx context.Context, in PeerInput, a Actor) (*model
 	}
 	p.InterfaceName = it.Name
 	s.audit(ctx, a, "peer.create", "peer", fmt.Sprint(p.ID), "", p.Name, "ok", "")
-	_ = s.reconcile(ctx)
 	return p, nil
+}
+
+// PeerImportRow 是批量导入里的一台设备。
+type PeerImportRow struct {
+	Name      string `json:"name"`
+	PublicKey string `json:"public_key"`
+	Remark    string `json:"remark"`
+	GroupTag  string `json:"group_tag"`
+}
+
+// PeerImportItem 是单台设备的导入结果（逐条回传成功或失败原因）。
+type PeerImportItem struct {
+	Index  int    `json:"index"`
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
+	PeerID int64  `json:"peer_id,omitempty"`
+}
+
+// PeerImportResult 是批量导入汇总。
+type PeerImportResult struct {
+	Created int              `json:"created"`
+	Failed  int              `json:"failed"`
+	Items   []PeerImportItem `json:"items"`
+}
+
+// ImportPeers 批量创建设备：逐条创建并汇总结果，最后统一收敛一次。
+//
+// 与「一次导入整份 wg-quick 配置」不同：这里导入的是**已有的连接下的多台设备**，
+// 且必须逐条给出成功/失败明细 —— 重复识别码、格式非法等问题要能定位到具体哪一行，
+// 否则用户面对一堆设备根本不知道该改哪一台。
+func (s *Service) ImportPeers(ctx context.Context, ifaceID int64, rows []PeerImportRow, a Actor) (*PeerImportResult, error) {
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("没有可导入的设备")
+	}
+	if len(rows) > 500 {
+		return nil, fmt.Errorf("单次最多导入 500 台设备，当前 %d 台，请分批导入", len(rows))
+	}
+	if _, err := s.Store.GetInterface(ctx, ifaceID); err != nil {
+		return nil, fmt.Errorf("所选连接不存在，请刷新页面后重试")
+	}
+	res := &PeerImportResult{Items: make([]PeerImportItem, 0, len(rows))}
+	for i, r := range rows {
+		name := strings.TrimSpace(r.Name)
+		item := PeerImportItem{Index: i, Name: name}
+		if name == "" {
+			item.Error = "缺少设备名称"
+			res.Failed++
+			res.Items = append(res.Items, item)
+			continue
+		}
+		pub := strings.TrimSpace(r.PublicKey)
+		p, err := s.createPeer(ctx, PeerInput{
+			InterfaceID: ifaceID,
+			Name:        name,
+			PublicKey:   pub,
+			Remark:      strings.TrimSpace(r.Remark),
+			GroupTag:    strings.TrimSpace(r.GroupTag),
+			Keepalive:   25,
+			Enabled:     true,
+			AutoAddress: true,
+			// 没给识别码的就自动生成密钥对（等同于在界面点「自动生成」）
+			GenerateKeys: pub == "",
+			GeneratePSK:  true,
+		}, a)
+		if err != nil {
+			item.Error = err.Error()
+			res.Failed++
+		} else {
+			item.OK = true
+			item.PeerID = p.ID
+			item.Name = p.Name
+			res.Created++
+		}
+		res.Items = append(res.Items, item)
+	}
+	if res.Created > 0 {
+		_ = s.reconcile(ctx)
+	}
+	s.audit(ctx, a, "peer.import", "peer", fmt.Sprint(ifaceID), "",
+		fmt.Sprintf("成功 %d / 失败 %d", res.Created, res.Failed), "ok", "")
+	return res, nil
 }
 
 // UpdatePeer 更新节点。

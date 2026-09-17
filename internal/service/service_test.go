@@ -528,6 +528,90 @@ func TestBackupImportDownload(t *testing.T) {
 	}
 }
 
+func TestImportPeersBatch(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+
+	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.20.0.1/24"}, Enabled: true, Autostart: true,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := svc.ImportPeers(ctx, it.ID, []service.PeerImportRow{
+		{Name: "手机A"},
+		{Name: "手机B", Remark: "备用"},
+		{Name: "  "}, // 只有空白名称 → 应被逐条拒绝
+	}, actor)
+	if err != nil {
+		t.Fatalf("批量导入失败: %v", err)
+	}
+	if res.Created != 2 || res.Failed != 1 {
+		t.Fatalf("汇总不正确: created=%d failed=%d", res.Created, res.Failed)
+	}
+	if len(res.Items) != 3 || !res.Items[0].OK || !res.Items[1].OK || res.Items[2].OK {
+		t.Fatalf("逐条结果不正确: %+v", res.Items)
+	}
+	if res.Items[2].Error == "" {
+		t.Fatal("失败项必须带原因")
+	}
+
+	// 自动分配的内部地址必须互不相同，否则两台设备会互相抢地址
+	list, _ := svc.ListPeers(ctx, it.ID)
+	if len(list) != 2 {
+		t.Fatalf("设备数量不正确: %d", len(list))
+	}
+	seen := map[string]bool{}
+	for _, p := range list {
+		for _, ip := range p.AllowedIPs {
+			if seen[ip] {
+				t.Fatalf("内部地址被重复分配: %s", ip)
+			}
+			seen[ip] = true
+		}
+	}
+}
+
+func TestImportPeersRejectsDuplicateKey(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+
+	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.21.0.1/24"}, Enabled: true, Autostart: true,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := svc.CreatePeer(ctx, service.PeerInput{
+		InterfaceID: it.ID, Name: "已有设备", AutoAddress: true, Enabled: true,
+		GenerateKeys: true, GeneratePSK: true,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 导入一个与已有设备相同识别码的行 → 应被逐条拒绝并给出原因
+	res, err := svc.ImportPeers(ctx, it.ID, []service.PeerImportRow{
+		{Name: "重复设备", PublicKey: first.PublicKey},
+		{Name: "正常设备"},
+	}, actor)
+	if err != nil {
+		t.Fatalf("批量导入失败: %v", err)
+	}
+	if res.Created != 1 || res.Failed != 1 {
+		t.Fatalf("重复识别码应被拒绝: created=%d failed=%d", res.Created, res.Failed)
+	}
+	if res.Items[0].OK || res.Items[0].Error == "" {
+		t.Fatalf("重复项应失败且带原因: %+v", res.Items[0])
+	}
+	if !res.Items[1].OK {
+		t.Fatalf("正常项应成功: %+v", res.Items[1])
+	}
+}
+
 func TestAuthAndAudit(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()

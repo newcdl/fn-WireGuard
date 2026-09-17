@@ -72,6 +72,7 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.Get("/peers", s.handleListPeers)
 			r.With(requirePerm(model.PermPeerWrite)).Post("/peers", s.handleCreatePeer)
 			r.With(requirePerm(model.PermPeerWrite)).Post("/peers/batch", s.handleBatchPeers)
+			r.With(requirePerm(model.PermPeerWrite)).Post("/peers/import", s.handleImportPeers)
 			r.Get("/peers/{id}", s.handleGetPeer)
 			r.With(requirePerm(model.PermPeerWrite)).Patch("/peers/{id}", s.handleUpdatePeer)
 			r.With(requirePerm(model.PermPeerWrite)).Delete("/peers/{id}", s.handleDeletePeer)

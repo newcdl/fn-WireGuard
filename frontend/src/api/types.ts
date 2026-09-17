@@ -304,3 +304,27 @@ export interface PeerConfigResult {
   qr_payload: string
   warning?: string
 }
+
+/** 批量导入设备：一行一台设备 */
+export interface PeerImportRow {
+  name: string
+  public_key: string
+  remark: string
+  group_tag: string
+}
+
+/** 单台设备的导入结果 */
+export interface PeerImportItem {
+  index: number
+  name: string
+  ok: boolean
+  error?: string
+  peer_id?: number
+}
+
+/** 批量导入汇总 */
+export interface PeerImportResult {
+  created: number
+  failed: number
+  items: PeerImportItem[]
+}
