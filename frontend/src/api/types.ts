@@ -134,6 +134,17 @@ export interface TOTPSetup {
   uri: string
 }
 
+/** 受信任设备：登录时勾选「信任本设备」后登记，30 天内可跳过动态口令。 */
+export interface TrustedDevice {
+  id: number
+  user_id: number
+  name: string
+  src_ip: string
+  created_at: string
+  last_used_at: string
+  expires_at: string
+}
+
 /** 登录第一步的返回：口令正确但还需二次验证时不带用户信息。 */
 export interface LoginChallenge {
   totp_required?: boolean

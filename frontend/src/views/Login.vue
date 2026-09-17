@@ -42,6 +42,12 @@
             @keyup.enter="submitTOTP"
           />
         </el-form-item>
+        <el-checkbox v-model="trustDevice" style="margin-bottom: 10px">
+          信任本设备，30 天内不再验证
+        </el-checkbox>
+        <div class="login-hint">
+          仅在个人设备上勾选。公共电脑请勿勾选，事后可在「用户菜单 → 二次验证」里撤销。
+        </div>
         <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="submitTOTP">
           验证并登录
         </el-button>
@@ -70,6 +76,7 @@ const form = reactive({ username: '', password: '' })
 const totpRequired = ref(false)
 const challenge = ref('')
 const code = ref('')
+const trustDevice = ref(false)
 
 async function submit() {
   if (!form.username || !form.password) {
@@ -101,7 +108,7 @@ async function submitTOTP() {
   }
   loading.value = true
   try {
-    await session.loginTOTP(challenge.value, code.value.trim())
+    await session.loginTOTP(challenge.value, code.value.trim(), trustDevice.value)
     enter()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -114,6 +121,7 @@ function backToPassword() {
   totpRequired.value = false
   challenge.value = ''
   code.value = ''
+  trustDevice.value = false
   form.password = ''
 }
 
@@ -137,5 +145,11 @@ function enter() {
 .login-card {
   width: min(380px, 100%);
   border-radius: 14px;
+}
+.login-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: 0.6;
+  margin-bottom: 14px;
 }
 </style>

@@ -243,6 +243,9 @@ const ACTION_LABELS: Record<string, string> = {
   'totp.setup': '发起了二次验证绑定',
   'totp.enable': '开启了二次验证',
   'totp.disable': '关闭了二次验证',
+  'totp.trust_device': '信任了一台设备',
+  'totp.revoke_device': '撤销了受信任设备',
+  'totp.admin_reset': '重置了账号的二次验证',
 }
 
 const TARGET_LABELS: Record<string, string> = {

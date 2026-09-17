@@ -43,6 +43,10 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.Post("/auth/totp/setup", s.handleTOTPSetup)
 			r.Post("/auth/totp/enable", s.handleTOTPEnable)
 			r.Post("/auth/totp/disable", s.handleTOTPDisable)
+			// 受信任设备（勾选「信任本设备」后登记，可在此查看与撤销）
+			r.Get("/auth/trusted-devices", s.handleListTrustedDevices)
+			r.Delete("/auth/trusted-devices", s.handleRevokeAllTrustedDevices)
+			r.Delete("/auth/trusted-devices/{id}", s.handleRevokeTrustedDevice)
 
 			r.Get("/overview", s.handleOverview)
 			r.Get("/health", s.handleHealth)
@@ -123,6 +127,8 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.With(requirePerm(model.PermUserManage)).Post("/users", s.handleCreateUser)
 			r.With(requirePerm(model.PermUserManage)).Patch("/users/{id}", s.handleUpdateUser)
 			r.With(requirePerm(model.PermUserManage)).Delete("/users/{id}", s.handleDeleteUser)
+			// 管理员重置某账号的二次验证（用户把自己锁在门外时的正规救法）
+			r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/reset", s.handleResetUserTOTP)
 
 			// 实时推送
 			r.Get("/ws", s.handleWS)

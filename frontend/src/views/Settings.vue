@@ -186,12 +186,20 @@
             <el-table-column label="最近登录" width="180">
               <template #default="{ row }">{{ formatTime(row.last_login_at) }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="220">
+            <el-table-column label="操作" width="290">
               <template #default="{ row }">
                 <el-button link type="primary" @click="toggleUser(row)">
                   {{ row.status === 1 ? '停用' : '启用' }}
                 </el-button>
                 <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
+                <el-button
+                  v-if="row.totp_enabled"
+                  link
+                  type="warning"
+                  @click="resetUserTOTP(row)"
+                >
+                  重置二次验证
+                </el-button>
                 <el-button link type="danger" @click="removeUser(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -223,6 +231,9 @@
             <template #actions>
               <el-button size="small" @click="toggleUser(row)">{{ row.status === 1 ? '停用' : '启用' }}</el-button>
               <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
+              <el-button v-if="row.totp_enabled" size="small" @click="resetUserTOTP(row)">
+                重置二次验证
+              </el-button>
               <el-button size="small" @click="removeUser(row)">删除</el-button>
             </template>
           </ItemCard>
@@ -799,6 +810,32 @@ async function resetPassword(row: User) {
     ElMessage.success('密码已重置')
   } catch (e) {
     if (e !== 'cancel') ElMessage.error((e as Error).message)
+  }
+}
+
+/**
+ * 管理员重置某账号的二次验证。
+ *
+ * 这是「用户手机丢了、恢复码也没了」时唯一的救法，因此把后果写清楚：
+ * 重置后该账号只剩密码一道防线，且会被强制登出，需要用新密码重新登录并重新绑定。
+ */
+async function resetUserTOTP(row: User) {
+  try {
+    await ElMessageBox.confirm(
+      `将关闭「${row.username}」的二次验证，并清空其恢复码与受信任设备，该账号的在线会话也会被登出。\n\n` +
+        '重置后该账号仅凭密码即可登录（安全性下降），请提醒对方尽快重新绑定。确认重置？',
+      '重置二次验证',
+      { type: 'warning', confirmButtonText: '确认重置' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.post(`/users/${row.id}/totp/reset`)
+    ElMessage.success('已重置该账号的二次验证')
+    await loadUsers()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
   }
 }
 

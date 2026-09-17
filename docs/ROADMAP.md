@@ -30,7 +30,7 @@
 | 权限与审计 | 管理员/运维/只读、操作留痕 | `internal/api` 角色校验 + `internal/store` 审计表 |
 | 系统维护 | 体检、修复、残留清理、重新应用 | `frontend/src/views/Maintenance.vue` + `internal/service/network.go` |
 | 异常可见性 | 顶栏状态栏、全局横幅、行内提示 | `frontend/src/composables/useSystemHealth.ts`（唯一数据源） |
-| 账号安全 | 动态口令二次验证、一次性恢复码 | `internal/totp/`（自实现 RFC 6238）、`sys_totp_challenge` / `sys_recovery_code` |
+| 账号安全 | 动态口令二次验证、一次性恢复码、信任本设备 | `internal/totp/`（自实现 RFC 6238）、`sys_totp_challenge` / `sys_recovery_code` / `sys_trusted_device` |
 | 帮助系统 | 每个配置项的「是什么/为什么/影响/例子」 | `frontend/src/constants/fields.ts`（`FieldTips` / 配置说明大全） |
 | 全局搜索 | 顶栏一个入口搜连接与设备并跳转详情 | `frontend/src/components/GlobalSearch.vue` |
 | 备份还原 | 整机配置备份、含/不含密钥 | `internal/service/config.go` + 前端「备份还原」 |
@@ -193,6 +193,58 @@
   另：开启与关闭**都要**重新验证当前口令（关闭还额外要求一次动态口令/恢复码），
   因为两者都会改变账号的安全边界：被盗会话若能直接绑定新验证器或关掉二次验证，
   真正的所有者就被锁在外面了。
+
+#### P2-2b 二次验证对齐官方（已完成）
+- **目标**：把 0.9.0 已落地的 TOTP 补齐到飞牛官方 2FA 的体验水位 —— 官方有的「信任本设备」与账号管理能力。
+- **依据**：飞牛 fnOS v0.9.18（2025-07-31）上线的官方 2FA，官方帮助中心明确支持「勾选信任本设备后免除第二步 OTP，并可在个人设置中查看和管理」。
+- **决策记录**（经确认）：
+  1. 受信任设备有效期 **30 天**；
+  2. **保留一次性恢复码**，不做「安全邮箱紧急验证码」——后者需自建 SMTP，且官方开放 API 里**没有发信能力**（只有 `trim.system.getPlatformConfig` 与 `file.*`），借不到系统的邮件通道；
+  3. 管理员重置用户二次验证、改密码登出其它设备 **都补齐**。
+- **实际实现**：
+  1. 新表 `sys_trusted_device`（只存令牌 SHA-256）；登录第二步可勾选「信任本设备，30 天内不再验证」，
+     命中的设备登录时**跳过第二步直接签发会话**；设备名由 User-Agent 启发式解析（`Chrome · macOS`，
+     不引入 UA 库），便于用户在列表里识别异常设备。
+  2. 「用户菜单 → 二次验证」内可查看受信任设备（设备名 / 来源 IP / 最近使用）并撤销单个或全部。
+  3. **作废时机**（关键安全约束，全部有回归用例）：改密码、关闭二次验证、管理员重置、
+     管理员改他人密码 —— 一律清空该账号的受信任设备与相关会话。
+     其中「关闭后重新开启，旧令牌不得复活」单独断言，因为漏掉它等于留一条后门。
+  4. 管理员可在「账号管理」里重置某账号的二次验证（清 TOTP + 恢复码 + 受信任设备 + 在线会话）,
+     这是用户把自己锁在门外时的正规救法。
+  5. 受信任设备令牌与会话令牌**分属两个 Cookie**：退出登录不清设备信任（否则「记住本设备」等于白做），
+     但改密码、关闭二次验证、撤销设备时会同步清除。
+- **验收**：`TestTrustedDeviceSkipsTOTP`（含「设备令牌不能替代口令」这条越权断言）、
+  `TestTrustedDeviceIsPerUser`、`TestTrustedDeviceRevokedOnSensitiveChanges`、
+  `TestRevokeTrustedDevice`、`TestAdminResetUserTOTP`、`TestAdminResetPasswordKicksSessions`、
+  `TestChangePasswordKicksOtherSessions`。
+
+#### P2-4 接入飞牛统一网关（NAS 账号免密登录、计划中）
+- **目标**：登录页同时提供「飞牛 NAS 账号」与「自建账号密码」两种方式，前者免密。
+- **官方机制**（`developer.fnnas.com` 核心概念 → 统一网关）：在 `app/ui/config` 用
+  `gatewayPrefix` + `gatewaySocket` 注册入口，**请求先由 fnOS 校验用户会话**，再转发到应用
+  `target` 目录下的 Unix Socket，并注入可信身份头 `X-Trim-Userid` / `X-Trim-Username` / `X-Trim-Isadmin`。
+  二次验证与「信任本设备」**由飞牛侧全权负责**，本应用零代码。
+- **不采用的路线**：飞牛的 OAuth 服务（`/oauthapi/authorize` + `/v/api/v1/auth`）**不对外开放**，
+  `trim.oauth_app` 只预置「影视」「相册」两个第一方应用，第三方无法接入。
+- **已确认的边界**：网关模式启用后**关闭独立端口的密码登录**，端口降级为「安全码应急入口」。
+- **⚠️ 最高风险点**：**只能在 Unix Socket 监听器上信任 `X-Trim-*`**。应用同时监听 TCP 端口，
+  若在 TCP 上也信任这些头，任何人只要访问该端口就能伪造 `X-Trim-Isadmin: true` 冒充管理员。
+  这对应官方安全红线第 1 条（绝不信任客户端传入的用户 ID）。
+- **其它待办**：`fnwg-web` 增监听 `${TRIM_APPDEST}/app.sock`；前端支持子路径部署
+  （现为绝对路径 `/api/v1`）；WebSocket 走 `/app/{appname}/ws`；`X-Trim-Username` → 本地角色映射
+  （已定：飞牛管理员 → admin，普通用户 → viewer）。
+- **依赖**：P2-5（安全码后手）需先具备，否则关闭端口登录后一旦网关异常就彻底无入口。
+
+#### P2-5 防自锁后手（安全码 + CLI、计划中）
+- **背景**：P2-4 选定「关闭独立端口登录」后，必须有退路，否则飞牛网关侧一旦异常就再也进不去。
+- **三层后手**（经确认）：
+  1. **安全码**：首次初始化时生成并强提示保存（32 字节 → Base32 共 52 字符，约 256 位熵），
+     只存 argon2id 哈希；直接访问应用端口时显示**应急登录页**，仅安全码可进，
+     进去后引导「重置管理员密码 / 关闭二次验证 / 重新生成安全码」。
+     **一次性**（用后立即作废并要求生成新的）——它能绕过所有认证，长期有效风险过高。
+  2. **`fnwg-cli` 用户管理命令**：现有 CLI 只有 `status/reconcile/export/cleanup/netcheck/version`，
+     需补 `user list` / `user reset-password` / `user reset-2fa` / `security-code`。
+  3. **飞牛应用设置里的登录方式开关**：能进飞牛桌面即可切回自建账号模式。
 
 #### P2-3 配置快照与一键回滚
 - **目标**：关键操作自动留快照，可查看差异并回滚。

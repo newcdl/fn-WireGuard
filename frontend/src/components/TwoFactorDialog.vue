@@ -97,6 +97,34 @@
 
         <el-divider />
 
+        <!-- 受信任设备：登录取自「信任本设备」的勾选，是绕过二次验证的唯一凭据，必须可见可撤销 -->
+        <div style="font-weight: 600; margin-bottom: 10px">
+          受信任设备<span v-if="devices.length">（{{ devices.length }}）</span>
+        </div>
+        <div v-if="!devices.length" class="fnwg-hint" style="margin-bottom: 10px">
+          暂无。登录时勾选「信任本设备」，该设备 30 天内登录就无需再输入验证码。
+        </div>
+        <template v-else>
+          <el-table :data="devices" size="small">
+            <el-table-column prop="name" label="设备" min-width="130" />
+            <el-table-column prop="src_ip" label="来源 IP" width="130" />
+            <el-table-column label="最近使用" width="160">
+              <template #default="{ row }">{{ formatTime(row.last_used_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="70">
+              <template #default="{ row }">
+                <el-button link type="danger" @click="revokeDevice(row)">撤销</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div class="fnwg-hint" style="margin: 8px 0 10px">
+            看到不认识的设备请立即撤销，并顺手改一次密码（改密码会自动作废全部受信任设备）。
+          </div>
+          <el-button size="small" @click="revokeAllDevices">全部撤销</el-button>
+        </template>
+
+        <el-divider />
+
         <div style="font-weight: 600; margin-bottom: 10px">关闭二次验证</div>
         <el-form class="fnwg-form" label-position="top">
           <el-form-item label="当前密码">
@@ -142,10 +170,11 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import QRCode from 'qrcode'
 import { api } from '@/api/client'
-import type { TOTPSetup, TOTPStatus } from '@/api/types'
+import type { TOTPSetup, TOTPStatus, TrustedDevice } from '@/api/types'
+import { formatTime } from '@/utils/format'
 import { useSession } from '@/stores/session'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 
@@ -165,6 +194,7 @@ const code = ref('')
 const secret = ref('')
 const qr = ref('')
 const recoveryCodes = ref<string[]>([])
+const devices = ref<TrustedDevice[]>([])
 
 watch(
   () => props.modelValue,
@@ -185,14 +215,64 @@ async function openDialog() {
   secret.value = ''
   qr.value = ''
   recoveryCodes.value = []
+  devices.value = []
   loadError.value = ''
   busy.value = true
   try {
     status.value = await api.get<TOTPStatus>('/auth/totp')
+    if (status.value.enabled) await loadDevices()
   } catch (e) {
     loadError.value = (e as Error).message
   } finally {
     busy.value = false
+  }
+}
+
+/** 读取受信任设备列表。它只是展示与撤销用途，取不到就不显示，不阻断主流程。 */
+async function loadDevices() {
+  try {
+    const res = await api.get<{ items: TrustedDevice[] }>('/auth/trusted-devices')
+    devices.value = res.items || []
+  } catch {
+    devices.value = []
+  }
+}
+
+async function revokeDevice(row: TrustedDevice) {
+  try {
+    await ElMessageBox.confirm(
+      `撤销后，「${row.name || '该设备'}」下次登录需要重新输入验证码。确认撤销？`,
+      '撤销受信任设备',
+      { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.del(`/auth/trusted-devices/${row.id}`)
+    ElMessage.success('已撤销')
+    await loadDevices()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+async function revokeAllDevices() {
+  try {
+    await ElMessageBox.confirm(
+      '撤销后，所有设备下次登录都需要重新输入验证码。确认全部撤销？',
+      '撤销全部受信任设备',
+      { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.del('/auth/trusted-devices')
+    ElMessage.success('已全部撤销')
+    await loadDevices()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
   }
 }
 

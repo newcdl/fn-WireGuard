@@ -152,6 +152,22 @@ CREATE TABLE IF NOT EXISTS sys_recovery_code (
 );
 CREATE INDEX IF NOT EXISTS idx_recovery_user ON sys_recovery_code(user_id);
 
+-- 受信任设备：勾选「信任本设备」后下发的设备令牌（只存 SHA-256，明文仅签发时返回一次）。
+-- 命中且未过期即可跳过二次验证，这正是飞牛官方 2FA 的「信任本设备」语义。
+-- 注意：它的本质是「用设备上的凭据替代第二个因子」，所以改密码、关闭/重开二次验证、
+-- 管理员重置时都必须立即清空——否则它就成了一条绕过 2FA 的永久后门。
+CREATE TABLE IF NOT EXISTS sys_trusted_device (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id      INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
+  token_hash   TEXT    NOT NULL UNIQUE,
+  name         TEXT    NOT NULL DEFAULT '',
+  src_ip       TEXT    NOT NULL DEFAULT '',
+  created_at   TEXT    NOT NULL,
+  last_used_at TEXT    NOT NULL,
+  expires_at   TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trusted_user ON sys_trusted_device(user_id);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts          TEXT    NOT NULL,

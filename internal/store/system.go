@@ -236,8 +236,11 @@ func (s *Store) SetUserTOTPSecret(ctx context.Context, userID int64, secret stri
 	return err
 }
 
-// ClearUserTOTP 关闭二次验证：清空密钥、删除恢复码，并顺手清掉该账号未完成的挑战，
-// 避免「关闭之后，之前那次半途而废的登录还能继续用」。
+// ClearUserTOTP 关闭 / 重置二次验证：清空密钥、删除恢复码与受信任设备，
+// 并顺手清掉该账号未完成的挑战。
+//
+// 受信任设备必须一起删：它本身就是「跳过二次验证」的凭据，留着它就等于
+// 二次验证虽然关了但后门还在，而且重新开启后这个后门会自动复活。
 func (s *Store) ClearUserTOTP(ctx context.Context, userID int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -248,6 +251,7 @@ func (s *Store) ClearUserTOTP(ctx context.Context, userID int64) error {
 		`UPDATE sys_user SET totp_secret='' WHERE id=?`,
 		`DELETE FROM sys_recovery_code WHERE user_id=?`,
 		`DELETE FROM sys_totp_challenge WHERE user_id=?`,
+		`DELETE FROM sys_trusted_device WHERE user_id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, userID); err != nil {
 			return err
@@ -311,6 +315,132 @@ func (s *Store) CountUnusedRecoveryCodes(ctx context.Context, userID int64) (int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(1) FROM sys_recovery_code WHERE user_id=? AND used_at IS NULL`, userID).Scan(&n)
 	return n, err
+}
+
+// ---------------------------------------------------------------- 受信任设备
+
+// CreateTrustedDevice 记录一台受信任设备（tokenHash 是设备令牌的 SHA-256）。
+func (s *Store) CreateTrustedDevice(ctx context.Context, d *model.TrustedDevice) error {
+	now := time.Now()
+	if d.CreatedAt.IsZero() {
+		d.CreatedAt = now
+	}
+	if d.LastUsedAt.IsZero() {
+		d.LastUsedAt = now
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO sys_trusted_device(user_id,token_hash,name,src_ip,created_at,last_used_at,expires_at) VALUES(?,?,?,?,?,?,?)`,
+		d.UserID, d.TokenHash, d.Name, d.SrcIP, ts(d.CreatedAt), ts(d.LastUsedAt), ts(d.ExpiresAt))
+	if err != nil {
+		return err
+	}
+	d.ID, _ = res.LastInsertId()
+	return nil
+}
+
+// GetTrustedDevice 按令牌哈希查询；已过期即删除并按「不存在」返回。
+func (s *Store) GetTrustedDevice(ctx context.Context, tokenHash string) (*model.TrustedDevice, error) {
+	var (
+		d          model.TrustedDevice
+		createdAt  string
+		lastUsedAt string
+		expiresAt  string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id,user_id,token_hash,name,src_ip,created_at,last_used_at,expires_at FROM sys_trusted_device WHERE token_hash=?`, tokenHash).
+		Scan(&d.ID, &d.UserID, &d.TokenHash, &d.Name, &d.SrcIP, &createdAt, &lastUsedAt, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.CreatedAt = parseTS(createdAt)
+	d.LastUsedAt = parseTS(lastUsedAt)
+	d.ExpiresAt = parseTS(expiresAt)
+	if time.Now().After(d.ExpiresAt) {
+		_ = s.DeleteTrustedDeviceByID(ctx, d.ID)
+		return nil, ErrNotFound
+	}
+	return &d, nil
+}
+
+// TouchTrustedDevice 更新最近使用时间，便于用户在列表里识别哪台在用。
+func (s *Store) TouchTrustedDevice(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sys_trusted_device SET last_used_at=? WHERE id=?`, ts(time.Now()), id)
+	return err
+}
+
+// ListTrustedDevices 返回某账号的全部受信任设备（不含令牌哈希）。
+func (s *Store) ListTrustedDevices(ctx context.Context, userID int64) ([]model.TrustedDevice, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id,user_id,name,src_ip,created_at,last_used_at,expires_at FROM sys_trusted_device WHERE user_id=? ORDER BY id DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.TrustedDevice{}
+	for rows.Next() {
+		var (
+			d          model.TrustedDevice
+			createdAt  string
+			lastUsedAt string
+			expiresAt  string
+		)
+		if err := rows.Scan(&d.ID, &d.UserID, &d.Name, &d.SrcIP, &createdAt, &lastUsedAt, &expiresAt); err != nil {
+			return nil, err
+		}
+		d.CreatedAt = parseTS(createdAt)
+		d.LastUsedAt = parseTS(lastUsedAt)
+		d.ExpiresAt = parseTS(expiresAt)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeleteTrustedDevice 撤销一台受信任设备。带 userID 条件是为了防越权：
+// 即使 id 猜对了，也只能删自己的设备。
+func (s *Store) DeleteTrustedDevice(ctx context.Context, userID, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE id=? AND user_id=?`, id, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteTrustedDeviceByID 按主键删除（内部清理过期记录用，不做属主校验）。
+func (s *Store) DeleteTrustedDeviceByID(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE id=?`, id)
+	return err
+}
+
+// DeleteAllTrustedDevices 清空某账号的全部受信任设备。
+//
+// 改密码、切换二次验证开关、管理员重置后都必须调用它。
+func (s *Store) DeleteAllTrustedDevices(ctx context.Context, userID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE user_id=?`, userID)
+	return err
+}
+
+// CleanExpiredTrustedDevices 清理已过期的受信任设备。
+func (s *Store) CleanExpiredTrustedDevices(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE expires_at < ?`, ts(time.Now()))
+	return err
+}
+
+// DeleteOtherSessions 删除该账号除指定会话外的全部会话（改密码后把其它设备踢下线）。
+func (s *Store) DeleteOtherSessions(ctx context.Context, userID int64, keepTokenHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_session WHERE user_id=? AND token_hash<>?`, userID, keepTokenHash)
+	return err
+}
+
+// DeleteUserSessions 删除该账号的全部会话（管理员重置密码 / 二次验证时使用）。
+func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_session WHERE user_id=?`, userID)
+	return err
 }
 
 // ---------------------------------------------------------------- 审计

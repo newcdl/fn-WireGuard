@@ -67,9 +67,18 @@ export const useSession = defineStore('session', {
       await this.loadMe()
       return { totpRequired: false, challenge: '' }
     },
-    /** 登录第二步：提交动态口令或恢复码，换取真正的会话。 */
-    async loginTOTP(challenge: string, code: string) {
-      const u = await api.post<User>('/auth/login/totp', { challenge, code })
+    /**
+     * 登录第二步：提交动态口令或恢复码，换取真正的会话。
+     *
+     * trustDevice 为真时服务端会下发一枚设备令牌（HttpOnly Cookie），
+     * 该设备 30 天内登录可跳过这一步。
+     */
+    async loginTOTP(challenge: string, code: string, trustDevice = false) {
+      const u = await api.post<User>('/auth/login/totp', {
+        challenge,
+        code,
+        trust_device: trustDevice,
+      })
       this.user = u
       this.authenticated = true
       await this.loadMe()

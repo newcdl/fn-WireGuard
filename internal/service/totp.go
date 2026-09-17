@@ -22,6 +22,11 @@ const (
 	totpSkew = 1
 	// totpIssuer 是显示在验证器 App 里的服务名。
 	totpIssuer = "WireGuard 管理工具"
+	// trustedDeviceTTL 是「信任本设备」的有效期。
+	//
+	// 30 天是常见的折中点：太短则「信任」形同虚设、每次都要掏手机；
+	// 太长则一台被入侵或转手的设备会长期持有一张免二次验证的通行证。
+	trustedDeviceTTL = 30 * 24 * time.Hour
 )
 
 // TOTPSetup 是开启二次验证前的绑定信息（密钥 + 扫码链接）。
@@ -37,7 +42,10 @@ type TOTPStatus struct {
 }
 
 // CompleteTOTPLogin 提交动态口令（或一枚恢复码）完成二次验证登录。
-func (s *Service) CompleteTOTPLogin(ctx context.Context, challenge, code, ua, ip string) (*LoginStep, error) {
+//
+// trustDevice 为真时（用户在界面上勾选了「信任本设备」）额外签发一枚设备令牌，
+// 该设备在 30 天内登录可跳过这一步。
+func (s *Service) CompleteTOTPLogin(ctx context.Context, challenge, code string, trustDevice bool, ua, ip string) (*LoginStep, error) {
 	ch := strings.TrimSpace(challenge)
 	if ch == "" {
 		return nil, errors.New("登录状态已失效，请重新登录")
@@ -67,7 +75,138 @@ func (s *Service) CompleteTOTPLogin(ctx context.Context, challenge, code, ua, ip
 	}
 	// 挑战一次性：成功了立刻删掉，防止同一个挑战换出两个会话。
 	_ = s.Store.DeleteTOTPChallenge(ctx, th)
-	return s.issueSession(ctx, u, ua, ip)
+	step, err := s.issueSession(ctx, u, ua, ip)
+	if err != nil {
+		return nil, err
+	}
+	if trustDevice {
+		token, expiresAt, err := s.trustDevice(ctx, u, ua, ip)
+		if err != nil {
+			// 登记受信任设备失败不应让整次登录失败——会话已经签发，
+			// 用户下次多输一次验证码即可，比把他挡在门外合理。
+			_ = s.Store.AddLog(ctx, "warn", "auth", "记录受信任设备失败，本次登录不受影响", err.Error())
+		} else {
+			step.DeviceToken = token
+			step.DeviceExpiresAt = expiresAt
+		}
+	}
+	return step, nil
+}
+
+// trustDevice 为账号登记一台受信任设备，返回明文令牌（仅此一次）与过期时间。
+func (s *Service) trustDevice(ctx context.Context, u *model.User, ua, ip string) (string, time.Time, error) {
+	token := newToken(32)
+	d := &model.TrustedDevice{
+		UserID:    u.ID,
+		TokenHash: hashToken(token),
+		Name:      deviceName(ua),
+		SrcIP:     ip,
+		ExpiresAt: time.Now().Add(trustedDeviceTTL),
+	}
+	if err := s.Store.CreateTrustedDevice(ctx, d); err != nil {
+		return "", time.Time{}, err
+	}
+	s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: ip}, "totp.trust_device", "user",
+		fmt.Sprint(u.ID), "", d.Name, "ok", "")
+	return token, d.ExpiresAt, nil
+}
+
+// deviceName 从 User-Agent 里提取一个便于人识别的设备名，例如「Chrome · macOS」。
+//
+// 不引入 UA 解析库：这里的目的只是让用户能在受信任设备列表里认出哪台是自己，
+// 一个粗糙但稳定的启发式足够，解析不出来时退回原文截断，绝不返回空串。
+// 注意判定顺序——Edge 的 UA 里含 "Chrome/"、Chrome 的含 "Safari/"，先判前者才准。
+func deviceName(ua string) string {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return "未知设备"
+	}
+	osName := ""
+	switch {
+	case strings.Contains(ua, "Windows"):
+		osName = "Windows"
+	case strings.Contains(ua, "iPhone"):
+		osName = "iPhone"
+	case strings.Contains(ua, "iPad"):
+		osName = "iPad"
+	case strings.Contains(ua, "Android"):
+		osName = "Android"
+	case strings.Contains(ua, "Mac OS X"), strings.Contains(ua, "Macintosh"):
+		osName = "macOS"
+	case strings.Contains(ua, "Linux"):
+		osName = "Linux"
+	}
+	browser := ""
+	switch {
+	case strings.Contains(ua, "Edg/"):
+		browser = "Edge"
+	case strings.Contains(ua, "OPR/"), strings.Contains(ua, "Opera"):
+		browser = "Opera"
+	case strings.Contains(ua, "Chrome/"):
+		browser = "Chrome"
+	case strings.Contains(ua, "Firefox/"):
+		browser = "Firefox"
+	case strings.Contains(ua, "Safari/"):
+		browser = "Safari"
+	}
+	switch {
+	case browser != "" && osName != "":
+		return browser + " · " + osName
+	case browser != "":
+		return browser
+	case osName != "":
+		return osName
+	}
+	r := []rune(ua)
+	if len(r) > 40 {
+		return string(r[:40]) + "…"
+	}
+	return ua
+}
+
+// ListTrustedDevices 返回某账号的受信任设备列表。
+func (s *Service) ListTrustedDevices(ctx context.Context, userID int64) ([]model.TrustedDevice, error) {
+	return s.Store.ListTrustedDevices(ctx, userID)
+}
+
+// RevokeTrustedDevice 撤销一台受信任设备（只能撤销自己的）。
+func (s *Service) RevokeTrustedDevice(ctx context.Context, userID, id int64, a Actor) error {
+	if err := s.Store.DeleteTrustedDevice(ctx, userID, id); err != nil {
+		return errors.New("设备不存在或不属于当前账号")
+	}
+	s.audit(ctx, a, "totp.revoke_device", "user", fmt.Sprint(userID), "", fmt.Sprint(id), "ok", "")
+	return nil
+}
+
+// RevokeAllTrustedDevices 撤销某账号的全部受信任设备。
+func (s *Service) RevokeAllTrustedDevices(ctx context.Context, userID int64, a Actor) error {
+	if err := s.Store.DeleteAllTrustedDevices(ctx, userID); err != nil {
+		return err
+	}
+	s.audit(ctx, a, "totp.revoke_device", "user", fmt.Sprint(userID), "", "全部设备", "ok", "")
+	return nil
+}
+
+// ResetUserTOTP 由管理员重置某个账号的二次验证（清空密钥、恢复码与受信任设备）。
+//
+// 这是「用户把自己锁在门外」时的正规救法，官方 2FA 同样提供该能力。
+// 没有它，用户只能靠恢复码；恢复码也丢了就只能去改数据库。
+func (s *Service) ResetUserTOTP(ctx context.Context, userID int64, a Actor) error {
+	u, err := s.Store.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u.TOTPSecret == "" {
+		return errors.New("该账号未开启二次验证")
+	}
+	if err := s.Store.ClearUserTOTP(ctx, userID); err != nil {
+		return err
+	}
+	// 重置后该账号只剩口令一道防线，把在线会话一并收掉，
+	// 避免「重置前就已经登录着的会话」继续被使用。
+	_ = s.Store.DeleteUserSessions(ctx, userID)
+	s.audit(ctx, a, "totp.admin_reset", "user", fmt.Sprint(userID), u.Username, "", "ok", "管理员重置了二次验证")
+	return nil
 }
 
 // TOTPChallengeUser 反查登录挑战对应的账号名。

@@ -111,7 +111,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]model.User, error) {
 	return s.Store.ListUsers(ctx)
 }
 
-// UpdateUser 修改账号角色或状态。
+// UpdateUser 修改账号角色或状态（管理员操作）。
 func (s *Service) UpdateUser(ctx context.Context, id int64, role string, status int, password string, a Actor) error {
 	u, err := s.Store.GetUser(ctx, id)
 	if err != nil {
@@ -132,6 +132,13 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role string, status 
 	}
 	if err := s.Store.UpdateUser(ctx, u); err != nil {
 		return err
+	}
+	// 管理员改掉了别人的口令后，该账号的在线会话与「免二次验证」资格都必须收回：
+	// 否则知道旧口令的人可能仍留在系统里，而受信任设备更是直接绕过二次验证。
+	// 这与官方 2FA「重置密码后自动登出该用户所有设备」的语义一致。
+	if password != "" {
+		_ = s.Store.DeleteUserSessions(ctx, id)
+		_ = s.Store.DeleteAllTrustedDevices(ctx, id)
 	}
 	s.audit(ctx, a, "user.update", "user", fmt.Sprint(id), "", u.Username+"/"+u.Role, "ok", "")
 	return nil
@@ -163,7 +170,12 @@ func (s *Service) DeleteUser(ctx context.Context, id int64, a Actor) error {
 }
 
 // ChangePassword 修改自己的口令。
-func (s *Service) ChangePassword(ctx context.Context, id int64, oldPw, newPw string, a Actor) error {
+//
+// 改完口令必须做两件事，缺一不可（官方 2FA 的语义也是如此）：
+//  1. 作废本账号全部受信任设备——否则改密码收不回别人设备上「免二次验证」的资格；
+//  2. 登出除当前会话外的所有会话——把可能已经泄露的旧会话清掉，
+//     同时不把正在操作的这个浏览器踢出去（currentToken 为空时才全清）。
+func (s *Service) ChangePassword(ctx context.Context, id int64, oldPw, newPw, currentToken string, a Actor) error {
 	u, err := s.Store.GetUser(ctx, id)
 	if err != nil {
 		return err
@@ -180,7 +192,15 @@ func (s *Service) ChangePassword(ctx context.Context, id int64, oldPw, newPw str
 	if err := s.Store.UpdateUser(ctx, u); err != nil {
 		return err
 	}
-	s.audit(ctx, a, "user.change_password", "user", fmt.Sprint(id), "", "", "ok", "")
+	if err := s.Store.DeleteAllTrustedDevices(ctx, id); err != nil {
+		return err
+	}
+	if currentToken != "" {
+		_ = s.Store.DeleteOtherSessions(ctx, id, hashToken(currentToken))
+	} else {
+		_ = s.Store.DeleteUserSessions(ctx, id)
+	}
+	s.audit(ctx, a, "user.change_password", "user", fmt.Sprint(id), "", "", "ok", "已作废受信任设备并登出其它会话")
 	return nil
 }
 
@@ -192,12 +212,28 @@ type LoginStep struct {
 	Token     string
 	User      *model.User
 	Challenge string
+	// DeviceToken / DeviceExpiresAt 仅在勾选「信任本设备」并校验通过后才有值，
+	// 明文令牌只在这里返回一次，落库存的是哈希。
+	DeviceToken     string
+	DeviceExpiresAt time.Time
 }
 
 // TOTPRequired 表示是否还需要二次验证。
 func (r *LoginStep) TOTPRequired() bool { return r.Challenge != "" }
 
-// hashToken 是会话令牌与挑战令牌统一的落库形式：只存 SHA-256，不存明文。
+// LoginInput 是一次登录尝试的全部输入。
+//
+// 刻意收成结构体而不是参数列表：这里同时有 username / password / deviceToken /
+// userAgent / ip 五个字符串，位置写错编译器不会拦，而那等于「拿别人的设备令牌登录」。
+type LoginInput struct {
+	Username    string
+	Password    string
+	DeviceToken string // 受信任设备令牌；命中且有效则跳过二次验证
+	UserAgent   string
+	SrcIP       string
+}
+
+// hashToken 是会话令牌、挑战令牌与设备令牌统一的落库形式：只存 SHA-256，不存明文。
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
@@ -207,28 +243,52 @@ func hashToken(token string) string {
 //
 // 账号开启二次验证时**不签发会话**，只返回一次性挑战；调用方需再调用
 // CompleteTOTPLogin 提交动态口令，通过后才真正登录。
-func (s *Service) Login(ctx context.Context, username, password, ua, ip string) (*LoginStep, error) {
-	u, err := s.Store.GetUserByUsername(ctx, strings.TrimSpace(username))
+// 例外：来自「已信任设备」的登录可以直接拿到会话（等价于官方 2FA 的信任本设备）。
+func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginStep, error) {
+	u, err := s.Store.GetUserByUsername(ctx, strings.TrimSpace(in.Username))
 	if err != nil {
-		s.audit(ctx, Actor{Username: username, SrcIP: ip}, "auth.login", "user", username, "", "", "deny", "账号不存在")
+		s.audit(ctx, Actor{Username: in.Username, SrcIP: in.SrcIP}, "auth.login", "user", in.Username, "", "", "deny", "账号不存在")
 		return nil, errors.New("用户名或密码错误")
 	}
 	if u.Status != 1 {
 		return nil, errors.New("该账号已被停用，请联系管理员")
 	}
-	if !VerifyPassword(password, u.PasswordHash) {
-		s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: ip}, "auth.login", "user", fmt.Sprint(u.ID), "", "", "deny", "密码错误")
+	if !VerifyPassword(in.Password, u.PasswordHash) {
+		s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: in.SrcIP}, "auth.login", "user", fmt.Sprint(u.ID), "", "", "deny", "密码错误")
 		return nil, errors.New("用户名或密码错误")
 	}
 	if u.TOTPSecret != "" {
+		if s.trustedDeviceOK(ctx, u, in.DeviceToken, in.SrcIP) {
+			return s.issueSession(ctx, u, in.UserAgent, in.SrcIP)
+		}
 		ch := newToken(32)
 		if err := s.Store.CreateTOTPChallenge(ctx, hashToken(ch), u.ID, time.Now().Add(totpChallengeTTL)); err != nil {
 			return nil, err
 		}
-		s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: ip}, "auth.login", "user", fmt.Sprint(u.ID), "", "", "ok", "口令已通过，等待二次验证")
+		s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: in.SrcIP}, "auth.login", "user", fmt.Sprint(u.ID), "", "", "ok", "口令已通过，等待二次验证")
 		return &LoginStep{Challenge: ch}, nil
 	}
-	return s.issueSession(ctx, u, ua, ip)
+	return s.issueSession(ctx, u, in.UserAgent, in.SrcIP)
+}
+
+// trustedDeviceOK 判断设备令牌能否用于跳过二次验证。
+//
+// 三重校验缺一不可：令牌存在且未过期、令牌属于当前账号、
+// **该账号当前确实开着二次验证**。最后一条最容易被忽略——少了它，
+// 关闭二次验证后残留的令牌会在重新开启时自动复活成后门。
+func (s *Service) trustedDeviceOK(ctx context.Context, u *model.User, deviceToken, ip string) bool {
+	token := strings.TrimSpace(deviceToken)
+	if token == "" || u.TOTPSecret == "" {
+		return false
+	}
+	d, err := s.Store.GetTrustedDevice(ctx, hashToken(token))
+	if err != nil || d.UserID != u.ID {
+		return false
+	}
+	_ = s.Store.TouchTrustedDevice(ctx, d.ID)
+	s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: ip}, "auth.login.totp", "user",
+		fmt.Sprint(u.ID), "", "", "ok", "受信任设备，免动态口令")
+	return true
 }
 
 // issueSession 为已通过全部校验的账号签发会话。

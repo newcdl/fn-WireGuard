@@ -351,6 +351,24 @@ type RecoveryCode struct {
 	CreatedAt time.Time
 }
 
+// TrustedDevice 是一条「受信任设备」记录：用户在二次验证界面勾选「信任本设备」后
+// 下发给该设备的凭据，之后从这台设备登录可跳过动态口令。
+//
+// 只保存令牌的 SHA-256，明文仅在签发时返回一次。Name / SrcIP 是给用户看的——
+// 用户要靠它们判断列表里有没有自己不认识的设备，从而发现异常登录。
+type TrustedDevice struct {
+	ID     int64  `json:"id"`
+	UserID int64  `json:"user_id"`
+	Name   string `json:"name"`
+	SrcIP  string `json:"src_ip"`
+	// TokenHash 只用于落库与比对，绝不出现在接口响应里
+	// （与 User.PasswordHash 同样的处理方式）。
+	TokenHash  string    `json:"-"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastUsedAt time.Time `json:"last_used_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
 // Session 是登录会话。
 type Session struct {
 	TokenHash string

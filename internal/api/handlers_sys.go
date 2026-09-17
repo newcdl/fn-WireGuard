@@ -46,7 +46,12 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	step, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
+	step, err := s.svc.Login(r.Context(), service.LoginInput{
+		Username:  in.Username,
+		Password:  in.Password,
+		UserAgent: r.UserAgent(),
+		SrcIP:     clientIP(r),
+	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -74,7 +79,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "登录失败次数过多，请 5 分钟后再试")
 		return
 	}
-	step, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
+	step, err := s.svc.Login(r.Context(), service.LoginInput{
+		Username:    in.Username,
+		Password:    in.Password,
+		DeviceToken: extractDeviceToken(r),
+		UserAgent:   r.UserAgent(),
+		SrcIP:       clientIP(r),
+	})
 	if err != nil {
 		s.recordLoginFail(key)
 		writeErr(w, http.StatusUnauthorized, err.Error())
@@ -98,8 +109,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 // handleLoginTOTP 是登录的第二步：用登录挑战 + 动态口令（或恢复码）换取会话。
 func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Challenge string `json:"challenge"`
-		Code      string `json:"code"`
+		Challenge   string `json:"challenge"`
+		Code        string `json:"code"`
+		TrustDevice bool   `json:"trust_device"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -115,7 +127,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	step, err := s.svc.CompleteTOTPLogin(r.Context(), in.Challenge, in.Code, r.UserAgent(), clientIP(r))
+	step, err := s.svc.CompleteTOTPLogin(r.Context(), in.Challenge, in.Code, in.TrustDevice, r.UserAgent(), clientIP(r))
 	if err != nil {
 		if key != "" {
 			s.recordLoginFail(key)
@@ -125,6 +137,11 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if key != "" {
 		s.clearLoginFail(key)
+	}
+	// 勾选了「信任本设备」时下发设备令牌；没勾选时不碰这个 Cookie，
+	// 免得把上一次的信任状态莫名清掉（用户可能只是这次不想勾）。
+	if step.DeviceToken != "" {
+		s.setDeviceCookie(w, step.DeviceToken, step.DeviceExpiresAt)
 	}
 	s.setSessionCookie(w, step.Token)
 	writeJSON(w, http.StatusOK, step.User)
@@ -191,6 +208,56 @@ func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 关闭二次验证会作废全部受信任设备，本地 Cookie 一起清掉。
+	s.clearDeviceCookie(w)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleListTrustedDevices 列出当前账号的受信任设备。
+func (s *Server) handleListTrustedDevices(w http.ResponseWriter, r *http.Request) {
+	u := userOf(r)
+	list, err := s.svc.ListTrustedDevices(r.Context(), u.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": list})
+}
+
+// handleRevokeTrustedDevice 撤销一台受信任设备。
+func (s *Server) handleRevokeTrustedDevice(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	if err := s.svc.RevokeTrustedDevice(r.Context(), userOf(r).ID, id, actorOf(r)); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
+}
+
+// handleRevokeAllTrustedDevices 撤销当前账号的全部受信任设备。
+func (s *Server) handleRevokeAllTrustedDevices(w http.ResponseWriter, r *http.Request) {
+	u := userOf(r)
+	if err := s.svc.RevokeAllTrustedDevices(r.Context(), u.ID, actorOf(r)); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.clearDeviceCookie(w)
+	writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
+}
+
+// handleResetUserTOTP 管理员重置某个账号的二次验证。
+func (s *Server) handleResetUserTOTP(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	if err := s.svc.ResetUserTOTP(r.Context(), id, actorOf(r)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -226,10 +293,13 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userOf(r)
-	if err := s.svc.ChangePassword(r.Context(), u.ID, in.OldPassword, in.NewPassword, actorOf(r)); err != nil {
+	// 传入当前会话令牌：改密码会登出其它设备，但必须保留正在操作的这一台。
+	if err := s.svc.ChangePassword(r.Context(), u.ID, in.OldPassword, in.NewPassword, extractToken(r), actorOf(r)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 改密码已作废全部受信任设备，本地这枚 Cookie 也就失效了，顺手清掉。
+	s.clearDeviceCookie(w)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -247,6 +317,41 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name: "fnwg_token", Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
+	})
+}
+
+// deviceCookieName 是「信任本设备」的设备令牌 Cookie 名。
+//
+// 刻意与会话 Cookie 分开：退出登录**不应该**清掉设备信任，
+// 否则「记住本设备」就退化成「只在当前会话内免验证」，功能等于白做。
+const deviceCookieName = "fnwg_device"
+
+// extractDeviceToken 读取受信任设备令牌。
+func extractDeviceToken(r *http.Request) string {
+	if c, err := r.Cookie(deviceCookieName); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
+func (s *Server) setDeviceCookie(w http.ResponseWriter, token string, expires time.Time) {
+	maxAge := int(time.Until(expires).Seconds())
+	if maxAge <= 0 {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     deviceCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+}
+
+func (s *Server) clearDeviceCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: deviceCookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
 	})
 }
 
