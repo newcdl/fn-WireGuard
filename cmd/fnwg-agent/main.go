@@ -150,7 +150,7 @@ func fixSharedPerms(cfg *config.Config, gid int) {
 }
 
 func newLogger(cfg *config.Config) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
 	f, err := os.OpenFile(cfg.LogDir()+"/agent.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
 	if err != nil {
 		return slog.New(slog.NewTextHandler(os.Stderr, opts))

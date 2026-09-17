@@ -208,10 +208,23 @@ func ensureDevAdmin(ctx context.Context, st *store.Store, logger *slog.Logger) e
 	return nil
 }
 
+// newLogger 同时写 stderr（systemd 下即 journald）与 ${TRIM_PKGVAR}/log/web.log。
+//
+// 日志文件打不开时**必须留下痕迹**：以前这里是静默降级成"只写 stderr"，
+// 于是 web.log 停在某个时间点不再增长，而排障的人只会去读这个文件 ——
+// 「日志里什么都没有」被读成「程序什么都没发生」，方向被彻底带偏。
+// 现在降级依然允许（进程不能因为写不了日志就起不来），但降级本身要在 journal 里说清楚。
+//
+// 创建模式用 0660 而非 0640：安装脚本会对整个数据目录执行 chown -R root:fnwg，
+// 文件属主随之变成 root，只有「属组可写」才能让以 fnwg 运行的 Web 进程继续追加。
 func newLogger(cfg *config.Config) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	f, err := os.OpenFile(cfg.LogDir()+"/web.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
+	path := cfg.LogDir() + "/web.log"
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o660)
 	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"警告：无法写入日志文件 %s（%v）。本次运行的日志只在 journalctl 中可见，"+
+				"该文件将保持旧内容，请勿以它判断服务是否正常（journalctl -u fnwg-web）\n", path, err)
 		return slog.New(slog.NewTextHandler(os.Stderr, opts))
 	}
 	return slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, f), opts))

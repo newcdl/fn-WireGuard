@@ -4,6 +4,7 @@ package config
 
 import (
 	"flag"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,6 +41,9 @@ type Config struct {
 	// Timezone 仅用于日志展示，留空使用系统时区。
 	Timezone string
 
+	// LogLevel 控制日志详细程度：debug / info / warn / error，默认 info。
+	LogLevel string
+
 	// Once 仅用于 fnwg-agent：执行一次收敛后退出（便于排查与脚本化）。
 	Once bool
 	// Cleanup 仅用于 fnwg-agent：删除本应用创建的全部内核对象后退出（停用/卸载使用）。
@@ -61,6 +65,7 @@ func Load(args []string) *Config {
 		SocketPath: "",
 		Dev:        false,
 		Timezone:   envOr("TRIM_SYS_LANGUAGE", ""),
+		LogLevel:   envOr("FNWG_LOG_LEVEL", "info"),
 	}
 
 	fs := flag.NewFlagSet("fnwg", flag.ContinueOnError)
@@ -75,6 +80,7 @@ func Load(args []string) *Config {
 	fs.BoolVar(&c.Dev, "dev", false, "开发模式：使用内存后端，不连接特权代理")
 	fs.BoolVar(&c.Once, "once", false, "只执行一次收敛后退出（fnwg-agent）")
 	fs.BoolVar(&c.Cleanup, "cleanup", false, "删除本应用创建的全部网络对象后退出（fnwg-agent）")
+	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "日志级别：debug / info / warn / error")
 	_ = fs.Parse(args)
 
 	if c.Port == 0 {
@@ -84,6 +90,25 @@ func Load(args []string) *Config {
 		c.SocketPath = filepath.Join(c.VarDir, "agent.sock")
 	}
 	return c
+}
+
+// SlogLevel 把 LogLevel 文本转成 slog 级别，无法识别时回退 info。
+//
+// 之所以要有这个开关：像「请求到底有没有到达服务端」这类问题，只有 Debug 级的
+// 访问日志（见 api.accessLog）能回答，而它平时必须保持关闭 —— 每个请求记一行
+// 会把真正重要的日志淹掉。做成运行期可调，排障时改一行 systemd 环境变量即可，
+// 不必为了看一眼请求轨迹重新打包发版。
+func (c *Config) SlogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // DBPath 返回 SQLite 数据库文件路径。

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"fnwg/internal/model"
 	"fnwg/internal/service"
 	"fnwg/internal/totp"
 )
@@ -249,6 +250,70 @@ func TestTOTPDisableRestoresPlainLogin(t *testing.T) {
 	}
 	if err := svc.DisableTOTP(ctx, uid, "admin12345", code, actor); err == nil {
 		t.Fatal("未开启时关闭应当报错")
+	}
+}
+
+// TestAdminTOTPSetupOnBehalf 覆盖「管理员在账号管理里代为开启二次验证」：
+// 本地账号可以（不需要知道对方密码），飞牛账号必须被拒——
+// 飞牛账号免密进入、不经过本应用的口令校验，给它开二次验证是个永远不起作用的假开关。
+func TestAdminTOTPSetupOnBehalf(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "admin"}
+	if _, err := svc.Setup(ctx, "admin", "admin12345"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 本地自建账号：管理员可代开，且不需要知道对方密码
+	local, err := svc.CreateUser(ctx, "bob", "bobpassword1", model.RoleViewer, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup, err := svc.AdminBeginTOTPSetup(ctx, local.ID, actor)
+	if err != nil {
+		t.Fatalf("管理员应为本地账号生成绑定信息: %v", err)
+	}
+	code, err := totp.Code(setup.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	codes, err := svc.AdminEnableTOTP(ctx, local.ID, setup.Secret, code, actor)
+	if err != nil {
+		t.Fatalf("管理员代开应成功: %v", err)
+	}
+	if len(codes) != totp.RecoveryCodeCount {
+		t.Fatalf("应返回 %d 枚恢复码，实际 %d", totp.RecoveryCodeCount, len(codes))
+	}
+	if st, _ := svc.TOTPStatusOf(ctx, local.ID); !st.Enabled {
+		t.Fatal("代开之后二次验证应已生效")
+	}
+	// 生效后该账号登录必须走动态口令，说明代开是真的绑上了、不是只改了个标记
+	step, err := svc.Login(ctx, service.LoginInput{Username: "bob", Password: "bobpassword1", UserAgent: "ua", SrcIP: "127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !step.TOTPRequired() {
+		t.Fatal("代开之后登录应要求动态口令")
+	}
+
+	// 飞牛账号：绑定、确认、重置三条路都必须被拒，且理由指向飞牛
+	gwStep, err := svc.GatewayLogin(ctx, service.GatewayIdentity{
+		UID: "8000", Username: "frank", IsAdmin: true,
+	}, "ua", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := gwStep.User.ID
+	if _, err := svc.AdminBeginTOTPSetup(ctx, gid, actor); err == nil {
+		t.Fatal("飞牛账号不应允许管理员代开二次验证")
+	} else if !strings.Contains(err.Error(), "飞牛") {
+		t.Fatalf("拒绝理由要说清由飞牛管理，实际: %v", err)
+	}
+	if _, err := svc.AdminEnableTOTP(ctx, gid, "JBSWY3DPEHPK3PXP", "000000", actor); err == nil {
+		t.Fatal("飞牛账号不应允许管理员确认开启二次验证")
+	}
+	if err := svc.ResetUserTOTP(ctx, gid, actor); err == nil {
+		t.Fatal("飞牛账号不应允许重置二次验证")
 	}
 }
 

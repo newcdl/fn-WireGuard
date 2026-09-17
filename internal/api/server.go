@@ -200,6 +200,15 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		token := extractToken(r)
 		u, err := s.svc.Authenticate(r.Context(), token)
 		if err != nil {
+			// 被拒的请求必须留痕。此前这里是静默 401，于是「请求压根没到达服务端」
+			// 与「到达了但没通过鉴权」在日志里一模一样 —— 都是一片安静，
+			// 排障的人只会得出「什么都没发生」这个错误结论。
+			// 前端还有几处会自动重连（App.vue 在未登录时也会先连一次 /ws），
+			// 一次拒绝就会变成每 8 秒一轮的静默重试，正是最难被发现的那种失效。
+			// 只记方法与路径与原因；令牌本身绝不落日志。
+			s.log.Info("请求未通过鉴权",
+				"method", r.Method, "path", r.URL.Path,
+				"reason", err.Error(), "ip", clientIP(r))
 			writeErr(w, http.StatusUnauthorized, err.Error())
 			return
 		}

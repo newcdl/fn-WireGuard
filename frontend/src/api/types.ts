@@ -163,6 +163,17 @@ export interface Health {
 export interface User {
   id: number
   username: string
+  /**
+   * 展示名：飞牛账号是飞牛那边的账号名，本地账号就是用户名本身。
+   *
+   * 界面一律用它渲染，别直接用 username —— 飞牛账号的 username 是 nas:<uid>，
+   * 那是映射用的锚点，用户从没设置过、也认不出来。用 displayNameOf() 取值。
+   */
+  display_name?: string
+  /** 账号来源：gateway=由飞牛账号映射而来（只能免密进入），local=应用内自建 */
+  source?: 'gateway' | 'local'
+  /** 仅飞牛账号有值：飞牛侧的用户 ID，供界面标注与核对 */
+  trim_uid?: string
   role: 'admin' | 'operator' | 'viewer'
   status: number
   last_login_at?: string | null

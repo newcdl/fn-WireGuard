@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -160,6 +162,125 @@ func TestGatewayLoginOverUnixSocket(t *testing.T) {
 	}
 }
 
+// TestCheckWSOriginAllowsFnOSDesktop 是「飞牛桌面实时状态永远连不上」的回归。
+//
+// 用户实际遇到的组合：页面由飞牛统一网关按 gatewayPrefix 打开，
+// 浏览器发来的 Origin 是网关地址，而请求经应用目录下的 Unix Socket 到达本进程时
+// Host 已被代理改写。旧实现只比 r.Host，于是每次握手都被判成跨站，
+// 日志里只剩每 10 秒一条「origin not allowed」—— 既看不出成因，也看不出该改哪里。
+func TestCheckWSOriginAllowsFnOSDesktop(t *testing.T) {
+	srv := newGatewayTestServer(t)
+
+	// newReq 模拟网关转发：Host 已被改写成后端地址，Origin 仍是浏览器地址栏里的那个。
+	newReq := func(origin string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/ws", nil)
+		req.Host = "localhost"
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		return req
+	}
+
+	// 1) 直接访问端口：Origin 与 Host 一致，放行
+	same := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:34567/api/v1/ws", nil)
+	same.Host = "192.168.1.10:34567"
+	same.Header.Set("Origin", "http://192.168.1.10:34567")
+	if !srv.checkWSOrigin(same) {
+		t.Fatal("同源握手必须放行")
+	}
+
+	// 2) 端口通道上来自其它网站：必须拒绝，这是这层检查存在的全部意义
+	if srv.checkWSOrigin(newReq("http://evil.example")) {
+		t.Fatal("端口通道上来自其它网站的握手必须拒绝")
+	}
+	if srv.checkWSOrigin(newReq("null")) {
+		t.Fatal("Origin: null 必须拒绝")
+	}
+	if !srv.checkWSOrigin(newReq("")) {
+		t.Fatal("不带 Origin 的非浏览器客户端应放行")
+	}
+
+	// 3) 代理透传原始主机名时也放行（浏览器无法自定义握手请求头，不可伪造）
+	xdh := newReq("http://nas.local:8000")
+	xdh.Header.Set("X-Forwarded-Host", "nas.local:8000, proxy.internal")
+	if !srv.checkWSOrigin(xdh) {
+		t.Fatal("带 X-Forwarded-Host 的代理场景必须放行")
+	}
+
+	// 4) 飞牛统一网关通道：来源与 Host 都对不上，但连接方身份已核验 → 放行
+	gwReq := newReq("http://192.168.1.10:8000")
+	if srv.checkWSOrigin(gwReq) {
+		t.Fatal("未经核验的通道不该仅因 Host 不同就被放行")
+	}
+	trusted := gwReq.WithContext(context.WithValue(gwReq.Context(), ctxGatewayPeerKey,
+		GatewayPeer{Unix: true, UID: 0, Verified: true}))
+	if !srv.checkWSOrigin(trusted) {
+		t.Fatal("飞牛网关通道上的握手必须放行，否则前端实时状态永远连不上")
+	}
+	// 同一通道但连接方身份未获信任时，「来自 socket」本身不能成为放行理由
+	untrusted := gwReq.WithContext(context.WithValue(gwReq.Context(), ctxGatewayPeerKey,
+		GatewayPeer{Unix: true, UID: 1234, Verified: false, Detail: "不在允许列表内"}))
+	if srv.checkWSOrigin(untrusted) {
+		t.Fatal("连接方身份未核验的 Unix Socket 请求不得放行")
+	}
+}
+
+// TestWSHandshakeOverGatewaySocket 端到端复现用户日志里的那条报错：
+// 经网关 socket 到达、Host 被改写、Origin 是网关地址的握手必须升级成功。
+//
+// 这里手写握手报文而不是用 websocket 客户端：Origin 与 Host 完全由测试决定，
+// 不会被客户端库的默认行为掩盖 —— 而这次的毛病恰恰出在这两个头上。
+func TestWSHandshakeOverGatewaySocket(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Unix Socket 对端身份校验仅在 Linux 上可用")
+	}
+	srv := newGatewayTestServer(t)
+	ctx := context.Background()
+	if _, err := srv.svc.Setup(ctx, "admin", "admin12345"); err != nil {
+		t.Fatal(err)
+	}
+	step, err := srv.svc.Login(ctx, service.LoginInput{
+		Username: "admin", Password: "admin12345", UserAgent: "test", SrcIP: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sock := filepath.Join(t.TempDir(), "app.sock")
+	serveCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gw, err := srv.ListenGateway(sock, srv.Router(nil))
+	if err != nil {
+		t.Fatalf("监听网关 socket 失败: %v", err)
+	}
+	go func() { _ = gw.Serve(serveCtx) }()
+	defer func() { _ = gw.Close() }()
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("连接网关 socket 失败: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	handshake := fmt.Sprintf("GET /api/v1/ws?token=%s HTTP/1.1\r\n"+
+		"Host: localhost\r\n"+ // 网关改写后的 Host
+		"Origin: http://192.168.1.10:8000\r\n"+ // 浏览器地址栏里的来源
+		"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		step.Token)
+	if _, err := conn.Write([]byte(handshake)); err != nil {
+		t.Fatalf("发送握手请求失败: %v", err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("读取握手响应失败: %v", err)
+	}
+	if !strings.Contains(line, "101") {
+		t.Fatalf("网关通道上的握手应升级成功，实际响应: %q", strings.TrimSpace(line))
+	}
+}
+
 // TestGatewayStateExposedForLoginPage 登录页需要在不登录的情况下知道
 // 「当前是不是飞牛桌面打开的」，据此决定是否展示一键免密登录。
 func TestGatewayStateExposedForLoginPage(t *testing.T) {
@@ -284,5 +405,66 @@ func TestSPAServedUnderGatewayPrefix(t *testing.T) {
 	}
 	if loc := res.Header.Get("Location"); loc != GatewayPrefix+"/" {
 		t.Fatalf("重定向目标不正确: %s", loc)
+	}
+}
+
+// TestAuthSetupValidatesLoginModeBeforeCreatingAccount 覆盖初始化时选定登录方式的失败路径。
+//
+// 在端口上打开初始化页时选「仅飞牛账号登录」必须被拒。更关键的是**拒绝要发生在建号之前**：
+// 若账号已经建好才发现设置不合法，用户看到的是初始化失败；他重来一遍，
+// 得到的却是「系统已初始化」—— 账号在，他填的密码算不算数还得自己猜。
+func TestAuthSetupValidatesLoginModeBeforeCreatingAccount(t *testing.T) {
+	srv := newGatewayTestServer(t)
+	hs := httptest.NewServer(srv.TCPRouter(nil))
+	defer hs.Close()
+
+	post := func(body string) (int, string) {
+		t.Helper()
+		res, err := hs.Client().Post(hs.URL+"/api/v1/auth/setup", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		b, _ := io.ReadAll(res.Body)
+		return res.StatusCode, string(b)
+	}
+
+	code, body := post(`{"username":"admin","password":"admin12345","login_mode":"gateway_only"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("端口上初始化不应允许选「仅飞牛账号登录」，实际 HTTP %d: %s", code, body)
+	}
+	if !strings.Contains(body, "飞牛桌面") {
+		t.Fatalf("拒绝时要指出「从哪进来才能选它」，实际: %s", body)
+	}
+
+	// 被拒之后必须还能正常初始化，否则用户就永远卡在这一步了。
+	code, body = post(`{"username":"admin","password":"admin12345","login_mode":"password_only"}`)
+	if code != http.StatusOK {
+		t.Fatalf("被拒后应仍可重新初始化，实际 HTTP %d: %s", code, body)
+	}
+	if !strings.Contains(body, `"login_mode":"password_only"`) {
+		t.Fatalf("响应应回报落库后的登录方式: %s", body)
+	}
+}
+
+// TestAuthSetupDefaultsToBothLoginModes 保证不带 login_mode 的调用（旧前端、命令行）
+// 行为不变：照旧初始化成功，且登录方式保持在默认的「两种都可用」。
+func TestAuthSetupDefaultsToBothLoginModes(t *testing.T) {
+	srv := newGatewayTestServer(t)
+	hs := httptest.NewServer(srv.TCPRouter(nil))
+	defer hs.Close()
+
+	res, err := hs.Client().Post(hs.URL+"/api/v1/auth/setup", "application/json",
+		strings.NewReader(`{"username":"admin","password":"admin12345"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("不带 login_mode 的初始化应照旧成功，实际 HTTP %d: %s", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"login_mode":"both"`) {
+		t.Fatalf("未指定登录方式时应保持「两种都可用」: %s", body)
 	}
 }

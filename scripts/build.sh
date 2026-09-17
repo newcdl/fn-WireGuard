@@ -125,6 +125,88 @@ guard_version_not_built() {
        若确实要原地重打，请显式放行：FNWG_ALLOW_REBUILD=1 ./scripts/build.sh ${TARGET}"
 }
 
+# ---------------------------------------------------------------- 校验
+# run_tests：打包前必跑，绑进流程而不是留在开发者的记忆里。
+#
+# 打包会覆盖载荷目录并产出**能直接装到设备上**的产物；一旦某次「先跳过测试、
+# 待会儿再补」，坏掉的包已经在 dist 里了。更麻烦的是版本号此时已经 bump，
+# 事后修好还得再 bump 一次，设备上才会出现新版本 —— 代价远高于跑一次测试。
+#
+# go vet 一并放在这里：它抓的是「能编译、但明显不对」的调用，几秒钟的成本，
+# 常常比单元测试更早发现笔误。
+# 需要快速迭代时可以 FNWG_SKIP_TESTS=1 显式跳过（发布时不要用）。
+run_tests() {
+    if [ "${FNWG_SKIP_TESTS:-}" = "1" ]; then
+        warn "按 FNWG_SKIP_TESTS=1 跳过测试（仅限本地迭代，发布勿用）"
+        return 0
+    fi
+    log "运行后端静态检查与单元测试"
+    "$GO_BIN" vet ./...
+    "$GO_BIN" test ./...
+    log "运行前端类型检查"
+    if [ ! -d frontend/node_modules ]; then
+        (cd frontend && npm install --no-audit --no-fund)
+    fi
+    (cd frontend && npm run typecheck)
+}
+
+# verify_fpk <文件> <goarch> <platform>：验收刚打出来的包。
+#
+# 打包不是「命令没报错就对了」：载荷里的二进制是复用上一次构建结果的，
+# 平台信息靠 sed 改写 manifest，载荷由 app/ 经 fnpack 二次封装 —— 任何一步出岔子，
+# 产物都「看起来成功」但装到设备上是另一个架构或另一个版本，
+# 这类问题只有真把包解开核对才能发现。
+# 因此这里拆包，逐个核对真正决定设备行为的东西：
+#   1. manifest 的 version / platform：决定应用中心让不让升级、装到哪台设备
+#   2. 载荷里三个二进制的真实架构：决定装上去能不能执行
+#   3. 桌面入口的 gatewaySocket：缺了它从飞牛桌面打开就是 502
+#   4. 安装/升级脚本存在且可执行：缺了它装完不会授权网关 socket
+verify_fpk() {
+    local fpk="$1" arch="$2" platform="$3"
+    [ -s "$fpk" ] || die "产物为空: $fpk"
+    local expect
+    case "$arch" in
+        amd64) expect='x86-64' ;;
+        arm64) expect='aarch64' ;;
+        *) die "未知架构: $arch" ;;
+    esac
+
+    local tmp="${DIST_DIR}/.verify-${arch}"
+    rm -rf "$tmp"
+    mkdir -p "$tmp"
+
+    tar -xf "$fpk" -C "$tmp" || die "无法解开产物（不是预期的 fpk 结构）: $fpk"
+    [ -f "$tmp/manifest" ] || die "$fpk 内缺少 manifest"
+    grep -q "^version[[:space:]]*=[[:space:]]*${VERSION}$" "$tmp/manifest" \
+        || die "$fpk 的 manifest 版本与 ${VERSION} 不一致"
+    grep -q "^platform[[:space:]]*=[[:space:]]*${platform}$" "$tmp/manifest" \
+        || die "$fpk 的 manifest platform 不是 ${platform}"
+
+    local script
+    for script in install_init install_callback upgrade_init upgrade_callback uninstall_init; do
+        [ -f "$tmp/cmd/$script" ] || die "$fpk 内缺少 cmd/$script"
+        [ -x "$tmp/cmd/$script" ] || die "$fpk 内 cmd/$script 没有执行权限"
+    done
+
+    [ -f "$tmp/app.tgz" ] || die "$fpk 内缺少载荷 app.tgz"
+    tar -xzf "$tmp/app.tgz" -C "$tmp" || die "$fpk 的载荷 app.tgz 无法解开"
+
+    local bin
+    for bin in fnwg-agent fnwg-web fnwg-cli; do
+        [ -s "$tmp/$bin" ] || die "载荷内缺少 $bin"
+        file "$tmp/$bin" | grep -q "$expect" \
+            || die "载荷内 $bin 的架构不是 ${arch}：$(file -b "$tmp/$bin")"
+    done
+    grep -q "^arch=${arch}$" "$tmp/BUILDINFO" || die "载荷内 BUILDINFO 的架构不是 ${arch}"
+
+    [ -f "$tmp/ui/config" ] || die "载荷内缺少桌面入口 ui/config"
+    grep -q '"gatewaySocket"[[:space:]]*:[[:space:]]*"app.sock"' "$tmp/ui/config" \
+        || die "桌面入口 ui/config 缺少 gatewaySocket=app.sock（从飞牛桌面打开会显示 502）"
+
+    rm -rf "$tmp"
+    log "已验收 ${fpk}：版本 ${VERSION} / 平台 ${platform} / 载荷架构 ${arch}"
+}
+
 # ---------------------------------------------------------------- 打包
 # package_fpk <goarch> <platform>
 package_fpk() {
@@ -160,6 +242,8 @@ package_fpk() {
     mkdir -p "$DIST_DIR"
     local out="${DIST_DIR}/${APP_NAME}-${VERSION}-${arch}.fpk"
     mv "$produced" "$out"
+    # 在删掉 stage 之前验收：此时载荷已被 fnpack 二次封装过，验的是用户真正装的那个文件。
+    verify_fpk "$out" "$arch" "$platform"
     rm -rf "$stage_root"
     log "已生成 ${out}（$(du -h "$out" | awk '{print $1}')）"
 }
@@ -172,23 +256,29 @@ export PATH="$(dirname "$GO_BIN"):$PATH"
 TARGET="${1:-local}"
 case "$TARGET" in
     local)
+        run_tests
         build_frontend
         build_backend "$(go env GOARCH)"
         ;;
     amd64)
         guard_version_not_built
+        run_tests
         build_frontend
         build_backend amd64
         package_fpk amd64 x86
         ;;
     arm64)
         guard_version_not_built
+        run_tests
         build_frontend
         build_backend arm64
         package_fpk arm64 arm
         ;;
     all)
         guard_version_not_built
+        # 测试只跑一次：两个架构共用同一份源码，跑两遍只是浪费时间，
+        # 但一定要在**两个包都产出之前**跑完，才能挡住带病发布。
+        run_tests
         build_frontend
         build_backend amd64
         package_fpk amd64 x86

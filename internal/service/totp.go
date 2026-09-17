@@ -196,6 +196,13 @@ func (s *Service) ResetUserTOTP(ctx context.Context, userID int64, a Actor) erro
 	if err != nil {
 		return err
 	}
+	// 飞牛账号在本应用里不该有绑定：开启入口本身就拒绝（见 gatewayTOTPRefusal）。
+	// 这里一并挡掉，是为了让「界面不显示」与「接口不接受」两处语义一致，
+	// 而不是留一个只在 UI 上隐藏、直连接口仍能生效的后门。
+	if s.IsGatewayUser(ctx, userID) {
+		s.audit(ctx, a, "totp.admin_reset", "user", fmt.Sprint(userID), u.Username, "", "deny", "飞牛账号的二次验证由飞牛管理")
+		return errors.New(gatewayTOTPRefusal)
+	}
 	if u.TOTPSecret == "" {
 		return errors.New("该账号未开启二次验证")
 	}
@@ -273,6 +280,14 @@ func (s *Service) BeginTOTPSetup(ctx context.Context, userID int64, password str
 		s.audit(ctx, a, "totp.setup", "user", fmt.Sprint(userID), "", "", "deny", "口令错误")
 		return nil, errors.New("当前密码不正确")
 	}
+	return s.newTOTPSetup(u)
+}
+
+// newTOTPSetup 生成一份绑定信息（不落库、尚未生效）。
+//
+// 与「谁在操作」无关，因此自助路径与管理员代开路径共用：
+// 两者的差别只在进来之前要不要校验本人密码，绑定信息本身完全一样。
+func (s *Service) newTOTPSetup(u *model.User) (*TOTPSetup, error) {
 	secret, err := totp.GenerateSecret()
 	if err != nil {
 		return nil, err
@@ -281,6 +296,40 @@ func (s *Service) BeginTOTPSetup(ctx context.Context, userID int64, password str
 		Secret: secret,
 		URI:    totp.ProvisioningURI(totpIssuer, u.Username, secret),
 	}, nil
+}
+
+// AdminBeginTOTPSetup 由管理员为指定账号生成绑定信息（尚未生效）。
+//
+// 与自助路径只差一处：不校验「本人密码」—— 操作者本来就不是账号主人，
+// 权限由调用方要求的 user.manage 保证。正因为它少了那道校验，才必须在入口
+// 挡住飞牛账号（见 gatewayTOTPRefusal）：那条路上二次验证不可能生效，
+// 允许绑定等于让管理员以为自己加固了这个账号，实际上什么也没发生。
+func (s *Service) AdminBeginTOTPSetup(ctx context.Context, userID int64, a Actor) (*TOTPSetup, error) {
+	u, err := s.Store.GetUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if s.IsGatewayUser(ctx, userID) {
+		s.audit(ctx, a, "totp.admin_setup", "user", fmt.Sprint(userID), u.Username, "", "deny", "飞牛账号的二次验证由飞牛管理")
+		return nil, errors.New(gatewayTOTPRefusal)
+	}
+	s.audit(ctx, a, "totp.admin_setup", "user", fmt.Sprint(userID), u.Username, "", "ok", "管理员发起了二次验证绑定")
+	return s.newTOTPSetup(u)
+}
+
+// AdminEnableTOTP 由管理员用一次动态口令确认绑定并开启，返回一次性恢复码。
+//
+// 恢复码明文同样只返回一次，由管理员交回账号主人保存。
+func (s *Service) AdminEnableTOTP(ctx context.Context, userID int64, secret, code string, a Actor) ([]string, error) {
+	u, err := s.Store.GetUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if s.IsGatewayUser(ctx, userID) {
+		s.audit(ctx, a, "totp.admin_enable", "user", fmt.Sprint(userID), u.Username, "", "deny", "飞牛账号的二次验证由飞牛管理")
+		return nil, errors.New(gatewayTOTPRefusal)
+	}
+	return s.enableTOTPWith(ctx, u, secret, code, a)
 }
 
 // EnableTOTP 用一次有效的动态口令确认绑定，正式开启二次验证，并返回一次性恢复码。
@@ -296,6 +345,12 @@ func (s *Service) EnableTOTP(ctx context.Context, userID int64, password, secret
 		s.audit(ctx, a, "totp.enable", "user", fmt.Sprint(userID), "", "", "deny", "口令错误")
 		return nil, errors.New("当前密码不正确")
 	}
+	return s.enableTOTPWith(ctx, u, secret, code, a)
+}
+
+// enableTOTPWith 是启用二次验证的公共实现（自助与管理员代开共用）。
+func (s *Service) enableTOTPWith(ctx context.Context, u *model.User, secret, code string, a Actor) ([]string, error) {
+	userID := u.ID
 	secret = totp.NormalizeSecret(secret)
 	if secret == "" {
 		return nil, errors.New("缺少绑定密钥，请重新扫码")

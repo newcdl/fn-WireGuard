@@ -68,7 +68,14 @@ export const useSession = defineStore('session', {
       this.loginMode = data.login_mode || 'both'
       if (data.authenticated) {
         await this.loadMe()
-      } else if (data.initialized && this.gateway.available && !gatewayAutoTried) {
+      } else if (
+        data.initialized &&
+        this.gateway.available &&
+        // 管理员关掉免密后，这个请求必然被拒：发出去只会在审计里多留一条
+        // 「deny」记录，什么也改变不了。
+        this.loginMode !== 'password_only' &&
+        !gatewayAutoTried
+      ) {
         gatewayAutoTried = true
         try {
           await this.gatewayLogin()
@@ -148,24 +155,38 @@ export const useSession = defineStore('session', {
     /**
      * 初始化管理员。
      *
+     * loginMode 在初始化时一并选定：这一步其实就已经决定了「谁能进来」，
+     * 先随便进、事后再去设置里改，等于把第一道门槛藏起来。
+     *
      * 返回一次性下发的应急安全码（明文只在这一刻存在）；生成失败时 securityCodeError 非空。
+     * loginModeError 非空表示账号已建好但登录方式没落库（此时仍保持「两种都可用」）。
      */
-    async setup(username: string, password: string): Promise<{
+    async setup(
+      username: string,
+      password: string,
+      loginMode: LoginMode = 'both',
+    ): Promise<{
       securityCode: string
       securityCodeError: string
+      loginModeError: string
     }> {
       const res = await api.post<{
         user: User
         security_code?: string
         security_code_error?: string
-      }>('/auth/setup', { username, password })
+        login_mode?: LoginMode
+        login_mode_error?: string
+      }>('/auth/setup', { username, password, login_mode: loginMode })
       this.user = res.user
       this.authenticated = true
       this.initialized = true
+      // 以服务端落库后的实际值为准，不假设自己的选择一定生效。
+      this.loginMode = res.login_mode || loginMode
       await this.loadMe()
       return {
         securityCode: res.security_code || '',
         securityCodeError: res.security_code_error || '',
+        loginModeError: res.login_mode_error || '',
       }
     },
 

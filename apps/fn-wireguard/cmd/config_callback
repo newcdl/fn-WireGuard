@@ -20,7 +20,7 @@ fnwg_stop >/dev/null 2>&1 || true
 if ! fnwg_start; then
     fnwg_fail "应用配置后重启服务失败"
 fi
-fnwg_fix_db_perms
+fnwg_fix_runtime_perms
 
 if ! fnwg_wait_health 15; then
     fnwg_fail "应用配置后 Web 控制台未能在 15 秒内就绪"

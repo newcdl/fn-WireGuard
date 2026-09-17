@@ -22,17 +22,31 @@ bootstrap="${TRIM_PKGETC}/bootstrap.json"
 } > "$bootstrap"
 chmod 640 "$bootstrap"
 
-chmod +x "$TRIM_APPDEST"/fnwg-* 2>/dev/null || true
+appdest="$(fnwg_appdest)" || fnwg_fail "无法确定应用运行目录（TRIM_APPDEST 缺失），安装中止"
+chmod +x "$appdest"/fnwg-* 2>/dev/null || true
 
 if ! fnwg_start; then
     fnwg_fail "启动服务失败（方式: $(fnwg_mode)）"
 fi
 
-# 首次启动会创建数据库与主密钥，需要允许 fnwg 组读写
-fnwg_fix_db_perms
+# 首次启动会创建数据库与主密钥，需要允许 fnwg 组读写；日志文件同理 ——
+# 上面的 fnwg_prepare_dirs 刚把整个数据目录 chown 成 root:fnwg，
+# 不补回组可写的话，Web 进程从此写不进 web.log（只写 stderr），
+# 用户手里那份 web.log 会停在旧内容上，比没有日志更误导。
+fnwg_fix_runtime_perms
 
-if ! fnwg_wait_health 20; then
-    fnwg_fail "Web 控制台未能在 20 秒内就绪，请检查日志后重试"
+# 必须连网关入口一起确认：只看端口的话，「socket 没建起来」会被算成安装成功，
+# 用户从飞牛桌面点进来才发现是 502。
+if ! fnwg_ensure_gateway_ready 20; then
+    fnwg_fail "Web 控制台或飞牛统一网关入口未能在 20 秒内就绪（从飞牛桌面打开会显示 502）。
+       请检查 ${TRIM_PKGVAR}/log/web.log，或执行 journalctl -u ${FNWG_UNIT_WEB} 查看 Web 进程是否报告「网关 socket 无法创建」"
+fi
+
+# 最后确认「装上去的」与「正在跑的」是同一个版本。装的是新版本、跑的却是旧版本时，
+# 用户会遇到「明明升级了、问题一点没变」而毫无线索，这是最该被拦住的一种结果。
+if ! fnwg_verify_running_version "$appdest" "${TRIM_APPVER:-}"; then
+    fnwg_fail "安装版本与设备上实际运行的版本不一致（详见上方日志）。
+       这通常意味着应用文件没有完整替换，请停用后重新安装；若反复出现请反馈本安装日志"
 fi
 
 fnwg_log "安装完成，管理界面：http://<NAS地址>:$(fnwg_service_port)/"

@@ -11,15 +11,30 @@ fnwg_log "完成 fn-WireGuard 升级到 ${TRIM_APPVER:-unknown}"
 
 fnwg_ensure_group
 fnwg_prepare_dirs
-chmod +x "$TRIM_APPDEST"/fnwg-* 2>/dev/null || true
+appdest="$(fnwg_appdest)" || fnwg_fail "无法确定应用运行目录（TRIM_APPDEST 缺失），升级中止"
+chmod +x "$appdest"/fnwg-* 2>/dev/null || true
 
 if ! fnwg_start; then
     fnwg_fail "升级后启动服务失败（方式: $(fnwg_mode)）"
 fi
-fnwg_fix_db_perms
+fnwg_fix_runtime_perms
 
-if ! fnwg_wait_health 20; then
-    fnwg_fail "升级后 Web 控制台未能在 20 秒内就绪，可执行 journalctl -u ${FNWG_UNIT_WEB} 或查看 ${TRIM_PKGVAR}/log/web.log 定位原因"
+# 升级路径是「socket 建不起来」最容易发生的地方：飞牛重建应用目录会把属组与
+# ACL 打回 root:root，而升级前跑过 fnwg_stop、升级后又由 fnwg_start 拉起，
+# 授权时机与 Web 启动时机很容易错开。fnwg_ensure_gateway_ready 会先自动修一次；
+# 仍然失败就如实报错，而不是像以前那样升级「成功」、用户打开只看到 502。
+if ! fnwg_ensure_gateway_ready 20; then
+    fnwg_fail "升级后 Web 控制台或飞牛统一网关入口未能在 20 秒内就绪（从飞牛桌面打开会显示 502）。
+       可执行 journalctl -u ${FNWG_UNIT_WEB} 或查看 ${TRIM_PKGVAR}/log/web.log 定位原因；
+       若反复出现，请把该日志一并反馈"
+fi
+
+# 再确认「装上去的」与「正在跑的」是同一个版本。这一条专门针对最容易把人气走的
+# 那种结果：升级流程走完、界面上版本也写着新的，设备上跑的却还是旧二进制 ——
+# 于是「升级了但问题一点没变」，而日志里对此毫无线索。
+if ! fnwg_verify_running_version "$appdest" "${TRIM_APPVER:-}"; then
+    fnwg_fail "升级版本与设备上实际运行的版本不一致（详见上方日志）。
+       这通常意味着应用文件没有被完整替换，请停用后重新安装；若反复出现请反馈本升级日志"
 fi
 
 fnwg_log "升级完成，配置已自动恢复"

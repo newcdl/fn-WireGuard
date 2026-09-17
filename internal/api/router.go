@@ -184,6 +184,11 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.With(requirePerm(model.PermUserManage)).Delete("/users/{id}", s.handleDeleteUser)
 		// 管理员重置某账号的二次验证（用户把自己锁在门外时的正规救法）
 		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/reset", s.handleResetUserTOTP)
+		// 管理员为某账号开启二次验证：账号主人自己操作不熟时的正规做法。
+		// 只对应用内自建账号有效；飞牛账号会被服务层拒绝并说明原因 ——
+		// 它从飞牛桌面免密进入、不经过本应用的动态口令校验，开关在它身上不可能生效。
+		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/setup", s.handleAdminUserTOTPSetup)
+		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/enable", s.handleAdminUserTOTPEnable)
 
 		// 实时推送
 		r.Get("/ws", s.handleWS)

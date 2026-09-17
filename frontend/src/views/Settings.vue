@@ -153,7 +153,8 @@
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
           <template #title>
             管理谁能登录这个界面。可以给家人或同事开通「只读」查看权限，避免误改配置。
-            二次验证由各账号自行在右上角「用户菜单 → 二次验证」里开启，这里只显示状态。
+            本地账号的二次验证可由本人在右上角开启，也可由管理员在这里代为开启；
+            飞牛账号标记为「飞牛账号」，其密码与二次验证由飞牛 NAS 统一管理，本应用不重复设置。
           </template>
         </el-alert>
 
@@ -183,7 +184,19 @@
 
         <div v-if="!isMobile" class="fnwg-card">
           <el-table :data="users" size="small" empty-text="暂无账号">
-            <el-table-column prop="username" label="登录账号" min-width="140" />
+            <el-table-column label="登录账号" min-width="200">
+              <template #default="{ row }">
+                <!-- 飞牛账号的 username 是 nas:<uid> 这种内部锚点，用户认不出来，
+                     所以这里显示飞牛那边的名字，并明确标出来源与 UID。 -->
+                <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap">
+                  <span>{{ displayNameOf(row) }}</span>
+                  <el-tag v-if="isGatewayAccount(row)" size="small" type="info" effect="plain">飞牛账号</el-tag>
+                </div>
+                <div v-if="isGatewayAccount(row)" class="fnwg-hint" style="font-size: 12px">
+                  飞牛 UID {{ row.trim_uid || '-' }}
+                </div>
+              </template>
+            </el-table-column>
             <el-table-column label="权限" width="120">
               <template #default="{ row }">
                 <el-tag size="small" effect="plain">{{ roleLabel(row.role) }}</el-tag>
@@ -196,9 +209,10 @@
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="二次验证" width="110">
+            <el-table-column label="二次验证" width="130">
               <template #default="{ row }">
-                <el-tag size="small" :type="row.totp_enabled ? 'success' : 'info'" effect="plain">
+                <span v-if="isGatewayAccount(row)" class="fnwg-hint" style="font-size: 12px">由飞牛 NAS 管理</span>
+                <el-tag v-else size="small" :type="row.totp_enabled ? 'success' : 'info'" effect="plain">
                   {{ row.totp_enabled ? '已开启' : '未开启' }}
                 </el-tag>
               </template>
@@ -206,20 +220,22 @@
             <el-table-column label="最近登录" width="180">
               <template #default="{ row }">{{ formatTime(row.last_login_at) }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="290">
+            <el-table-column label="操作" width="340">
               <template #default="{ row }">
                 <el-button link type="primary" @click="toggleUser(row)">
                   {{ row.status === 1 ? '停用' : '启用' }}
                 </el-button>
-                <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
-                <el-button
-                  v-if="row.totp_enabled"
-                  link
-                  type="warning"
-                  @click="resetUserTOTP(row)"
-                >
-                  重置二次验证
-                </el-button>
+                <!-- 飞牛账号免密进入、不经过本应用的口令校验，改密码/开关二次验证都不会生效，
+                     因此不给入口，避免让人以为设置成功却始终用不上。 -->
+                <template v-if="!isGatewayAccount(row)">
+                  <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
+                  <el-button v-if="!row.totp_enabled" link type="primary" @click="openAdminTOTP(row)">
+                    开启二次验证
+                  </el-button>
+                  <el-button v-else link type="warning" @click="resetUserTOTP(row)">
+                    重置二次验证
+                  </el-button>
+                </template>
                 <el-button link type="danger" @click="removeUser(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -231,18 +247,25 @@
             v-for="row in users"
             :key="row.id"
             :status="row.status === 1 ? 'ok' : 'off'"
-            :title="row.username"
+            :title="displayNameOf(row)"
           >
             <template #extra>
               <el-tag size="small" effect="plain">{{ roleLabel(row.role) }}</el-tag>
+              <el-tag v-if="isGatewayAccount(row)" size="small" type="info" effect="plain">飞牛账号</el-tag>
             </template>
+            <div v-if="isGatewayAccount(row)" class="fnwg-kv">
+              <span class="fnwg-kv-key">飞牛 UID</span>
+              <span class="fnwg-kv-val">{{ row.trim_uid || '-' }}</span>
+            </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">状态</span>
               <span class="fnwg-kv-val">{{ row.status === 1 ? '可登录' : '已停用' }}</span>
             </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">二次验证</span>
-              <span class="fnwg-kv-val">{{ row.totp_enabled ? '已开启' : '未开启' }}</span>
+              <span class="fnwg-kv-val">
+                {{ isGatewayAccount(row) ? '由飞牛 NAS 管理' : row.totp_enabled ? '已开启' : '未开启' }}
+              </span>
             </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">最近登录</span>
@@ -250,10 +273,13 @@
             </div>
             <template #actions>
               <el-button size="small" @click="toggleUser(row)">{{ row.status === 1 ? '停用' : '启用' }}</el-button>
-              <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
-              <el-button v-if="row.totp_enabled" size="small" @click="resetUserTOTP(row)">
-                重置二次验证
-              </el-button>
+              <template v-if="!isGatewayAccount(row)">
+                <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
+                <el-button v-if="!row.totp_enabled" size="small" @click="openAdminTOTP(row)">
+                  开启二次验证
+                </el-button>
+                <el-button v-else size="small" @click="resetUserTOTP(row)">重置二次验证</el-button>
+              </template>
               <el-button size="small" @click="removeUser(row)">删除</el-button>
             </template>
           </ItemCard>
@@ -660,6 +686,15 @@
       </template>
     </el-dialog>
 
+    <!-- 管理员代开二次验证：不改对方密码，只把二维码与恢复码交到账号主人手里 -->
+    <AdminTOTPDialog
+      v-if="adminTOTPUser"
+      v-model="adminTOTPDialog"
+      :user-id="adminTOTPUser.id"
+      :user-name="displayNameOf(adminTOTPUser)"
+      @done="onAdminTOTPDone"
+    />
+
     <!-- 快照差异对比：把「回滚会撤销什么」摊开，确认后再回滚 -->
     <el-dialog v-model="diffVisible" title="快照差异对比" :width="dialogWidth || '720px'">
       <div v-if="diffLoading" class="fnwg-hint">正在比对差异…</div>
@@ -759,6 +794,7 @@ import type {
 } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import SecurityCodeBlock from '@/components/SecurityCodeBlock.vue'
+import AdminTOTPDialog from '@/components/AdminTOTPDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
@@ -767,7 +803,7 @@ import { useBreakpoint } from '@/composables/useBreakpoint'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
-import { formatBytes, formatTime } from '@/utils/format'
+import { displayNameOf, formatBytes, formatTime, isGatewayAccount } from '@/utils/format'
 
 const session = useSession()
 const realtime = useRealtime()
@@ -864,6 +900,9 @@ const helpVisible = ref(false)
 const users = ref<User[]>([])
 const userDialog = ref(false)
 const newUser = reactive({ username: '', password: '', role: 'viewer' })
+// 管理员代开二次验证：与「本人开启」共用同一套绑定流程，只是不校验本人密码
+const adminTOTPDialog = ref(false)
+const adminTOTPUser = ref<User | null>(null)
 
 const backups = ref<BackupRecord[]>([])
 const shareDir = ref('')
@@ -1292,7 +1331,7 @@ async function toggleUser(row: User) {
 
 async function resetPassword(row: User) {
   try {
-    const { value } = await ElMessageBox.prompt(`为「${row.username}」设置新密码（至少 8 位）`, '重置密码', {
+    const { value } = await ElMessageBox.prompt(`为「${displayNameOf(row)}」设置新密码（至少 8 位）`, '重置密码', {
       inputType: 'password',
     })
     await api.patch(`/users/${row.id}`, { role: row.role, password: value })
@@ -1300,6 +1339,17 @@ async function resetPassword(row: User) {
   } catch (e) {
     if (e !== 'cancel') ElMessage.error((e as Error).message)
   }
+}
+
+/** 打开管理员代开二次验证的对话框；真正的绑定/确认由对话框内部完成。 */
+function openAdminTOTP(row: User) {
+  adminTOTPUser.value = row
+  adminTOTPDialog.value = true
+}
+
+/** 绑定成功后刷新列表：状态列要从「未开启」变成「已开启」。 */
+async function onAdminTOTPDone() {
+  await loadUsers()
 }
 
 /**
@@ -1311,7 +1361,7 @@ async function resetPassword(row: User) {
 async function resetUserTOTP(row: User) {
   try {
     await ElMessageBox.confirm(
-      `将关闭「${row.username}」的二次验证，并清空其恢复码与受信任设备，该账号的在线会话也会被登出。\n\n` +
+      `将关闭「${displayNameOf(row)}」的二次验证，并清空其恢复码与受信任设备，该账号的在线会话也会被登出。\n\n` +
         '重置后该账号仅凭密码即可登录（安全性下降），请提醒对方尽快重新绑定。确认重置？',
       '重置二次验证',
       { type: 'warning', confirmButtonText: '确认重置' },
@@ -1330,7 +1380,7 @@ async function resetUserTOTP(row: User) {
 
 async function removeUser(row: User) {
   try {
-    await ElMessageBox.confirm(`确认删除账号「${row.username}」？删除后该账号立即无法登录。`, '删除账号', {
+    await ElMessageBox.confirm(`确认删除账号「${displayNameOf(row)}」？删除后该账号立即无法登录。`, '删除账号', {
       type: 'warning',
     })
     await api.del(`/users/${row.id}`)

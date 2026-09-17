@@ -27,6 +27,20 @@
           </el-button>
         </template>
 
+        <!-- 管理员关掉了免密登录：入口还在，但不能给一个必然失败的按钮 -->
+        <el-alert
+          v-else-if="gatewayLoginDisabled"
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+        >
+          <template #title>管理员已关闭「飞牛账号免密登录」，请使用账号密码进入。</template>
+          <template #default>
+            想改回来：先用账号密码登录，再到「系统设置 → 登录方式」切换。
+          </template>
+        </el-alert>
+
         <!-- 网关通道存在但身份不可信：把原因说清楚，而不是只说一句「失败」 -->
         <el-alert
           v-else-if="session.gateway.blocked_reason"
@@ -178,8 +192,15 @@ const realtime = useRealtime()
 const loading = ref(false)
 const form = reactive({ username: '', password: '' })
 
-/** 当前是不是飞牛桌面打开的应用（可用 NAS 账号免密登录）。 */
-const gatewayAvailable = computed(() => !!session.gateway.available)
+/**
+ * 管理员是否关闭了「飞牛账号免密登录」。
+ *
+ * 与「入口可不可用」是两回事：入口照样在、身份头照样会到，只是服务端会拒绝。
+ * 所以这里必须自己也挡一层——展示一个必定失败的按钮，等于把用户送去撞一次墙再回来。
+ */
+const gatewayLoginDisabled = computed(() => session.loginMode === 'password_only')
+/** 当前是不是飞牛桌面打开的应用，且管理员没有关掉免密登录。 */
+const gatewayAvailable = computed(() => !!session.gateway.available && !gatewayLoginDisabled.value)
 /** 管理员是否关闭了端口上的账号密码登录（安全码应急入口不受影响）。 */
 const passwordLoginDisabled = computed(() => session.loginMode === 'gateway_only')
 

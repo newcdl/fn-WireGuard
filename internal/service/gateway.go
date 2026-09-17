@@ -75,22 +75,68 @@ func (s *Service) GatewayEverLoggedIn(ctx context.Context) bool {
 	return err == nil && len(list) > 0
 }
 
-// SetLoginMode 修改登录方式。
+// SetLoginMode 修改登录方式（运行期）。
 //
 // 防自锁：启用「仅网关登录」前必须先证明网关真的能进来，否则一旦网关侧异常，
 // 用户既进不了界面也改不回来（安全码还能救，但不该把人逼到那一步）。
 func (s *Service) SetLoginMode(ctx context.Context, mode string, a Actor) error {
+	if err := checkLoginMode(mode, s.GatewayEverLoggedIn(ctx), false); err != nil {
+		return err
+	}
+	return s.writeLoginMode(ctx, mode, a)
+}
+
+// SetLoginModeAtSetup 是初始化流程里的登录方式设定。
+//
+// 与运行期唯一的差别在判据：运行期问的是「历史上成功用过免密登录吗」，
+// 初始化时问的是「这一次请求本身是不是经飞牛网关通道带着身份进来的」（见 api 层
+// gatewayTrusted）。后者是更强的证明 —— 免密要用到的身份头此刻就在这个请求里，
+// 不存在「猜它能不能用」；而初始化之前本应用从没用过免密登录，历史记录必然为空，
+// 若沿用运行期的判据，「仅飞牛账号登录」将永远无法在初始化时被选中。
+func (s *Service) SetLoginModeAtSetup(ctx context.Context, mode string, gatewayProven bool, a Actor) error {
+	if err := checkLoginMode(mode, gatewayProven, true); err != nil {
+		return err
+	}
+	return s.writeLoginMode(ctx, mode, a)
+}
+
+// CheckLoginModeAtSetup 只校验取值、不落库，供初始化在**建号之前**先拦一道。
+//
+// 之所以必须能「先校验再建号」：取值不合法时若已经建好了管理员，用户看到的是
+// 初始化失败，重填一遍却只会得到「系统已初始化」—— 账号在、但他不知道密码算不算数，
+// 这是最坏的一种失败形态（从业界惯例看，宁可让他重提一次）。
+func (s *Service) CheckLoginModeAtSetup(mode string, gatewayProven bool) error {
+	return checkLoginMode(mode, gatewayProven, true)
+}
+
+// checkLoginMode 是登录方式取值与防自锁的**唯一**判据。
+//
+// atSetup 只影响措辞：同一个拒绝理由，在初始化与在运行期能做的补救动作并不相同，
+// 说错一步就等于给用户一句他做不到的指引（在初始化页让他「先回桌面点一次」，
+// 他点的就是眼前这个页面，永远绕不出去）。
+func checkLoginMode(mode string, gatewayProven, atSetup bool) error {
 	switch mode {
 	case LoginModeBoth, LoginModeGatewayOnly, LoginModePasswordOnly:
 	default:
 		return errors.New("登录方式取值不合法")
 	}
-	if mode == LoginModeGatewayOnly && !s.GatewayEverLoggedIn(ctx) {
+	if mode == LoginModeGatewayOnly && !gatewayProven {
+		if atSetup {
+			return errors.New("本次不是从飞牛桌面打开的应用，无法确认「飞牛账号免密登录」真的能进来，" +
+				"因此不能一上来就关闭账号密码登录。请改选「两种都可用」，" +
+				"或先从飞牛桌面打开本应用再初始化")
+		}
 		return errors.New("还没有成功用过飞牛账号免密登录，不能关闭账号密码登录。" +
 			"请先回到飞牛桌面用本应用图标打开一次（确认免密登录可用），再回来开启")
 	}
+	return nil
+}
+
+// writeLoginMode 落库并留档。调用前必须已过 checkLoginMode。
+func (s *Service) writeLoginMode(ctx context.Context, mode string, a Actor) error {
 	// 改动前留快照：登录方式是「改错了可能进不来」的设置，
-	// 恰恰是最需要后悔药的一类改动。
+	// 恰恰是最需要后悔药的一类改动。初始化时也留一份 —— 它同时是这份
+	// 「出厂设置」的基线，日后改坏了至少能看出最初是什么样。
 	s.snapshotBefore(ctx, "auth.login_mode", settingsNote([]string{"登录方式"}))
 	if err := s.Store.SetSetting(ctx, SettingLoginMode, mode); err != nil {
 		return err
@@ -212,4 +258,61 @@ func (s *Service) GatewayAccounts(ctx context.Context) (map[int64]GatewayAccount
 		out[g.UserID] = GatewayAccountInfo{TrimUID: g.TrimUID, TrimUsername: g.TrimUsername, IsAdmin: g.IsAdmin}
 	}
 	return out, nil
+}
+
+// 账号来源取值，与 model.User.Source 一致。
+const (
+	// SourceGateway：由飞牛账号映射而来，只能在网关通道上免密进入。
+	SourceGateway = "gateway"
+	// SourceLocal：应用内自建账号，用账号密码登录。
+	SourceLocal = "local"
+)
+
+// IsGatewayUser 判断某本地账号是否由飞牛网关映射而来。
+//
+// 判定依据是映射表里有没有它的记录，而不是「用户名里有没有冒号」：
+// 冒号只是生成规则，规则一旦调整，靠字符串猜的地方会集体失效，
+// 而映射表是唯一事实来源。映射不存在时返回 false（当作本地账号处理），
+// 因此这个函数永远不会把本地账号误判成飞牛账号、进而挡掉它的正常操作。
+func (s *Service) IsGatewayUser(ctx context.Context, userID int64) bool {
+	g, err := s.Store.GetGatewayIdentityByUser(ctx, userID)
+	return err == nil && g != nil
+}
+
+// gatewayTOTPRefusal 是「给飞牛账号做本应用二次验证」时的统一拒绝理由。
+//
+// 这不是「暂时没做」，而是这条路上它**不可能生效**：飞牛账号只能从统一网关
+// 免密进入，而网关入口（GatewayLogin）在确认身份后直接签发会话，根本不经过
+// 本应用的动态口令校验 —— 飞牛的二次验证由飞牛在网关那一侧自己做。
+// 在这里给一个开关，等于给用户一个永远不起作用的假开关，比没有更糟。
+const gatewayTOTPRefusal = "飞牛账号的二次验证由飞牛 NAS 统一管理，本应用里无法为它开启：" +
+	"它从飞牛桌面免密进入，不经过本应用的动态口令校验。请到飞牛的账号安全设置里开启"
+
+// gatewayPasswordRefusal 是「给飞牛账号设密码」时的统一拒绝理由。
+//
+// 飞牛账号在本地是一个映射出来的影子账号：口令是映射时写入的占位值，
+// 本人登录走网关免密、从不比对它。所以在这里「重置密码」不会有任何效果 ——
+// 与其给出一个看起来成功、实际永远用不上的结果，不如直接说清该去哪里改。
+const gatewayPasswordRefusal = "这个账号对应飞牛里的账号，密码由飞牛 NAS 统一管理，" +
+	"本应用改不了 —— 请到飞牛「用户管理」里修改；想让它在这里也能用密码登录，请改用应用内自建账号"
+
+// decorateUserSource 给账号填上来源与展示名（只作用于返回给界面的那份数据）。
+func (s *Service) decorateUserSource(ctx context.Context, u *model.User) {
+	if u == nil {
+		return
+	}
+	g, err := s.Store.GetGatewayIdentityByUser(ctx, u.ID)
+	if err != nil || g == nil {
+		u.Source, u.DisplayName = SourceLocal, u.Username
+		return
+	}
+	u.Source = SourceGateway
+	u.TrimUID = g.TrimUID
+	u.DisplayName = g.TrimUsername
+	if u.DisplayName == "" {
+		// 飞牛没给用户名时（早期记录或网关异常）也不能退回 nas:<uid>：
+		// 那正是用户看不懂的东西。退回「飞牛账号 <uid>」至少还能让人对上号，
+		// 而且 uid 是他在飞牛用户列表里能核对到的。
+		u.DisplayName = "飞牛账号 " + g.TrimUID
+	}
 }

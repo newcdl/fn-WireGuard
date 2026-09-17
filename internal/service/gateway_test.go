@@ -175,6 +175,82 @@ func TestGatewayOnlyRequiresProvenGateway(t *testing.T) {
 	}
 }
 
+// TestSetupLoginModeValidation 覆盖初始化页对三种登录方式的取值校验。
+//
+// 关键在判据的选择：初始化时问「这一次请求是不是经飞牛网关进来的」，而不是
+// 「历史上有没有成功用过免密登录」—— 后者在初始化之前必然为假，照它判就等于
+// 把「仅飞牛账号登录」做成了一个永远点不动的选项。
+func TestSetupLoginModeValidation(t *testing.T) {
+	svc, _ := newTestEnv(t)
+
+	// 在端口上打开初始化页：「两种都可用」「仅账号密码」都能选，
+	// 「仅飞牛账号」不行 —— 此刻没有任何证据表明免密真的能进来，
+	// 选了它就是把唯一还走得通的入口关掉。
+	for _, mode := range []string{service.LoginModeBoth, service.LoginModePasswordOnly} {
+		if err := svc.CheckLoginModeAtSetup(mode, false); err != nil {
+			t.Fatalf("端口上初始化应允许选 %s: %v", mode, err)
+		}
+	}
+	err := svc.CheckLoginModeAtSetup(service.LoginModeGatewayOnly, false)
+	if err == nil {
+		t.Fatal("端口上初始化不应允许选「仅飞牛账号登录」")
+	}
+	if !strings.Contains(err.Error(), "飞牛桌面") {
+		t.Fatalf("拒绝时要给出这一步真做得到的补救动作，实际: %v", err)
+	}
+
+	// 从飞牛桌面打开初始化页：免密要用的身份头此刻就在这个请求里，
+	// 「能不能用」已经不是猜测，三种都该可选。
+	for _, mode := range []string{
+		service.LoginModeBoth, service.LoginModePasswordOnly, service.LoginModeGatewayOnly,
+	} {
+		if err := svc.CheckLoginModeAtSetup(mode, true); err != nil {
+			t.Fatalf("网关通道上初始化应允许选 %s: %v", mode, err)
+		}
+	}
+
+	// 非法取值一律拒绝，且这个只校验的入口不能产生任何副作用。
+	for _, bad := range []string{"", "whatever", "gateway-only", "BOTH", " both"} {
+		if err := svc.CheckLoginModeAtSetup(bad, true); err == nil {
+			t.Fatalf("非法登录方式应被拒绝: %q", bad)
+		}
+	}
+	if got := svc.LoginMode(context.Background()); got != service.LoginModeBoth {
+		t.Fatalf("只校验的入口不应改动设置: %s", got)
+	}
+}
+
+// TestSetupAppliesLoginModeFromDesktop 覆盖初始化时真的选定「仅飞牛账号登录」。
+//
+// 顺序按真实调用链来：先校验（在建号之前）、再建号、最后落库。
+// 任何一步都不该被登录方式卡住 —— 卡住的后果是用户拿到一个
+// 「账号建好了、却没有任何入口进得去」的实例。
+func TestSetupAppliesLoginModeFromDesktop(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	admin := service.Actor{Username: "admin"}
+
+	if err := svc.CheckLoginModeAtSetup(service.LoginModeGatewayOnly, true); err != nil {
+		t.Fatalf("网关通道上应允许选「仅飞牛账号登录」: %v", err)
+	}
+	if _, err := svc.Setup(ctx, "admin", "admin12345"); err != nil {
+		t.Fatalf("初始化建号不应受登录方式影响: %v", err)
+	}
+	if err := svc.SetLoginModeAtSetup(ctx, service.LoginModeGatewayOnly, true, admin); err != nil {
+		t.Fatalf("落库失败: %v", err)
+	}
+	if got := svc.LoginMode(ctx); got != service.LoginModeGatewayOnly {
+		t.Fatalf("初始化选定的登录方式未生效: %s", got)
+	}
+	// 落库路径自己也要把关：绕过校验直接调它，同样拒绝且不改动现状。
+	if err := svc.SetLoginModeAtSetup(ctx, "whatever", true, admin); err == nil {
+		t.Fatal("非法登录方式不应落库")
+	}
+	if got := svc.LoginMode(ctx); got != service.LoginModeGatewayOnly {
+		t.Fatalf("非法输入不应改动设置: %s", got)
+	}
+}
+
 // TestPasswordOnlyModeBlocksGatewayLogin 覆盖「关闭免密登录」这一侧。
 func TestPasswordOnlyModeBlocksGatewayLogin(t *testing.T) {
 	svc, _ := newTestEnv(t)
@@ -223,6 +299,144 @@ func TestGenericSettingsCannotBypassLoginModeGuard(t *testing.T) {
 	// 宁可让用户重提一次，也不能让「关闭端口登录」在不该生效时生效。
 	if got := st.GetSetting(ctx, "server_endpoint", ""); got != "" {
 		t.Fatalf("校验失败时不应写入其它设置项: %s", got)
+	}
+}
+
+// TestGatewayAccountMarkedBySource 覆盖「飞牛账号要标记出来」与「账号名要认得出来」：
+// 账号列表必须区分来源，飞牛账号用飞牛侧用户名做展示名，
+// 而不是 nas:<uid> 这个用户从未设置、也认不出来的内部锚点。
+func TestGatewayAccountMarkedBySource(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	if _, err := svc.Setup(ctx, "admin", "admin12345"); err != nil {
+		t.Fatal(err)
+	}
+	step, err := svc.GatewayLogin(ctx, service.GatewayIdentity{
+		UID: "6000", Username: "dave", IsAdmin: false,
+	}, "ua", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 登录返回的账号应当立刻带展示名，界面不必再自己判断来源
+	if step.User.Source != service.SourceGateway || step.User.DisplayName != "dave" || step.User.TrimUID != "6000" {
+		t.Fatalf("网关登录返回的账号缺少来源/展示名: %+v", step.User)
+	}
+
+	list, err := svc.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawGateway, sawLocal bool
+	for _, u := range list {
+		if u.ID == step.User.ID {
+			sawGateway = true
+			if u.Source != service.SourceGateway || u.DisplayName != "dave" || u.TrimUID != "6000" {
+				t.Fatalf("飞牛账号未正确标注: %+v", u)
+			}
+			if u.Username != "nas:6000" {
+				t.Fatalf("飞牛账号的本地锚点应为 nas:6000，实际 %s", u.Username)
+			}
+			continue
+		}
+		sawLocal = true
+		if u.Source != service.SourceLocal || u.DisplayName != u.Username {
+			t.Fatalf("本地账号应标为 local 且展示名回落为用户名: %+v", u)
+		}
+	}
+	if !sawGateway || !sawLocal {
+		t.Fatalf("列表应同时含飞牛账号与本地账号: gateway=%v local=%v", sawGateway, sawLocal)
+	}
+
+	// 飞牛侧没给用户名时也不能退回 nas:<uid>——那正是用户看不懂的东西，
+	// 回落到「飞牛账号 <uid>」至少还能让他在飞牛用户列表里对上号。
+	anon, err := svc.GatewayLogin(ctx, service.GatewayIdentity{UID: "6001"}, "ua", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anon.User.DisplayName != "飞牛账号 6001" {
+		t.Fatalf("缺用户名时应回落到可核对的展示名，实际 %q", anon.User.DisplayName)
+	}
+}
+
+// TestGatewayAccountPasswordNotManageable 回归「飞牛账号不能在本应用改密码」：
+// 它从网关免密进入，本地口令只是占位值；在这里改密码只会「看起来成功、实际用不上」，
+// 因此必须直接拒绝并指向飞牛，同时不影响本应用自己的角色/状态管理。
+func TestGatewayAccountPasswordNotManageable(t *testing.T) {
+	svc, st := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "admin"}
+	if _, err := svc.Setup(ctx, "admin", "admin12345"); err != nil {
+		t.Fatal(err)
+	}
+	step, err := svc.GatewayLogin(ctx, service.GatewayIdentity{
+		UID: "7000", Username: "erin", IsAdmin: true,
+	}, "ua", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := step.User.ID
+
+	if err := svc.ChangePassword(ctx, gid, "", "newpassword123", "", actor); err == nil {
+		t.Fatal("飞牛账号不应允许在本应用修改密码")
+	} else if !strings.Contains(err.Error(), "飞牛") {
+		t.Fatalf("拒绝理由要指向飞牛，实际: %v", err)
+	}
+	if err := svc.UpdateUser(ctx, gid, model.RoleAdmin, 1, "newpassword123", actor); err == nil {
+		t.Fatal("管理员为飞牛账号重置密码也应被拒")
+	}
+
+	// 角色与状态是本应用自己的权限，仍必须可管理——否则就无法停用一个飞牛账号
+	if err := svc.UpdateUser(ctx, gid, model.RoleViewer, 1, "", actor); err != nil {
+		t.Fatalf("飞牛账号的角色应仍可管理: %v", err)
+	}
+	if u, err := st.GetUser(ctx, gid); err != nil {
+		t.Fatal(err)
+	} else if u.Role != model.RoleViewer {
+		t.Fatalf("角色未更新: %s", u.Role)
+	}
+	if err := svc.UpdateUser(ctx, gid, model.RoleViewer, 0, "", actor); err != nil {
+		t.Fatalf("飞牛账号的停用应仍可管理: %v", err)
+	}
+}
+
+// TestAuthenticateDecoratesGatewayUser 回归「登录后右上角仍显示 nas:1000」：
+// 登录响应里的账号是带展示名的，但前端拿到后紧接着会调 /auth/me 刷新，
+// 而 /auth/me 与 /auth/state 都走 Authenticate —— 它不补来源与展示名的话，
+// 界面就会在刷新后从飞牛账号名退回内部的 nas:<uid>，正是用户看到的现象。
+func TestAuthenticateDecoratesGatewayUser(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	if _, err := svc.Setup(ctx, "admin", "admin12345"); err != nil {
+		t.Fatal(err)
+	}
+	step, err := svc.GatewayLogin(ctx, service.GatewayIdentity{
+		UID: "9000", Username: "grace", IsAdmin: false,
+	}, "ua", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := svc.Authenticate(ctx, step.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Source != service.SourceGateway || u.DisplayName != "grace" || u.TrimUID != "9000" {
+		t.Fatalf("会话账号必须带来源与展示名（否则界面会显示 nas:<uid>）: %+v", u)
+	}
+	// 本地账号同样要有展示名，且来源不能被误判成飞牛
+	local, err := svc.CreateUser(ctx, "carol", "carolpassword1", model.RoleViewer, service.Actor{Username: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lstep, err := svc.Login(ctx, service.LoginInput{Username: "carol", Password: "carolpassword1", UserAgent: "ua", SrcIP: "127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lu, err := svc.Authenticate(ctx, lstep.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lu.Source != service.SourceLocal || lu.DisplayName != "carol" || lu.ID != local.ID {
+		t.Fatalf("本地账号的展示名应回落为用户名且来源为 local: %+v", lu)
 	}
 }
 
