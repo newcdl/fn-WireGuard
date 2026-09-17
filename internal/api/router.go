@@ -28,6 +28,8 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 		r.Get("/auth/state", s.handleAuthState)
 		r.Post("/auth/setup", s.handleAuthSetup)
 		r.Post("/auth/login", s.handleLogin)
+		// 二次验证登录的第二步：凭登录挑战提交动态口令（同样无需登录，因为此时还没有会话）
+		r.Post("/auth/login/totp", s.handleLoginTOTP)
 
 		// 需要登录
 		r.Group(func(r chi.Router) {
@@ -36,6 +38,11 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.Get("/auth/me", s.handleMe)
 			r.Post("/auth/logout", s.handleLogout)
 			r.Post("/auth/password", s.handleChangePassword)
+			// 二次验证：管理「自己的」账号，因此只要求登录、不额外要求 user.manage
+			r.Get("/auth/totp", s.handleTOTPStatus)
+			r.Post("/auth/totp/setup", s.handleTOTPSetup)
+			r.Post("/auth/totp/enable", s.handleTOTPEnable)
+			r.Post("/auth/totp/disable", s.handleTOTPDisable)
 
 			r.Get("/overview", s.handleOverview)
 			r.Get("/health", s.handleHealth)

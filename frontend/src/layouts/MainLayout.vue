@@ -74,6 +74,18 @@
                 <el-dropdown-item disabled>{{ session.user?.username }}（{{ roleLabel }}）</el-dropdown-item>
                 <el-dropdown-item command="help" divided>配置说明大全</el-dropdown-item>
                 <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                <el-dropdown-item command="totp">
+                  二次验证
+                  <el-tag
+                    v-if="session.user?.totp_enabled"
+                    size="small"
+                    type="success"
+                    effect="plain"
+                    style="margin-left: 6px"
+                  >
+                    已开启
+                  </el-tag>
+                </el-dropdown-item>
                 <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -158,6 +170,8 @@
         <el-button type="primary" @click="submitPassword">确定</el-button>
       </template>
     </el-dialog>
+
+    <TwoFactorDialog v-model="totpVisible" />
   </div>
 </template>
 
@@ -182,6 +196,7 @@ import {
 } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import TwoFactorDialog from '@/components/TwoFactorDialog.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
@@ -275,6 +290,7 @@ const mobileSearchVisible = ref(false)
 const helpVisible = ref(false)
 const pwVisible = ref(false)
 const pw = ref({ old: '', next: '' })
+const totpVisible = ref(false)
 
 /** 菜单只处理真实路由，未知 index 一律忽略（防止误导航导致白屏） */
 function onMenuSelect(index: string) {
@@ -317,6 +333,10 @@ async function onCommand(cmd: string) {
   if (cmd === 'password') {
     pw.value = { old: '', next: '' }
     pwVisible.value = true
+    return
+  }
+  if (cmd === 'totp') {
+    totpVisible.value = true
     return
   }
   if (cmd === 'logout') {

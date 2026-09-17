@@ -153,6 +153,7 @@
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
           <template #title>
             管理谁能登录这个界面。可以给家人或同事开通「只读」查看权限，避免误改配置。
+            二次验证由各账号自行在右上角「用户菜单 → 二次验证」里开启，这里只显示状态。
           </template>
         </el-alert>
 
@@ -172,6 +173,13 @@
               <template #default="{ row }">
                 <el-tag size="small" :type="row.status === 1 ? 'success' : 'info'" effect="plain">
                   {{ row.status === 1 ? '可登录' : '已停用' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="二次验证" width="110">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.totp_enabled ? 'success' : 'info'" effect="plain">
+                  {{ row.totp_enabled ? '已开启' : '未开启' }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -203,6 +211,10 @@
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">状态</span>
               <span class="fnwg-kv-val">{{ row.status === 1 ? '可登录' : '已停用' }}</span>
+            </div>
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">二次验证</span>
+              <span class="fnwg-kv-val">{{ row.totp_enabled ? '已开启' : '未开启' }}</span>
             </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">最近登录</span>

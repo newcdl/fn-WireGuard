@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia'
 import { api } from '@/api/client'
-import type { User } from '@/api/types'
+import type { LoginChallenge, User } from '@/api/types'
+
+/** 登录第一步的结果：要么已经登录，要么拿到一个待二次验证的挑战。 */
+export interface LoginOutcome {
+  totpRequired: boolean
+  challenge: string
+}
 
 interface State {
   initialized: boolean
@@ -45,8 +51,25 @@ export const useSession = defineStore('session', {
       this.permissions = data.permissions || {}
       this.version = data.version
     },
-    async login(username: string, password: string) {
-      const u = await api.post<User>('/auth/login', { username, password })
+    /**
+     * 登录第一步：提交账号口令。
+     *
+     * 账号开启二次验证时服务端**不会**下发会话，只回一个一次性挑战；
+     * 因此这里不能把响应当作用户信息，必须交给调用方决定是否进入第二步。
+     */
+    async login(username: string, password: string): Promise<LoginOutcome> {
+      const res = await api.post<User & LoginChallenge>('/auth/login', { username, password })
+      if (res.totp_required) {
+        return { totpRequired: true, challenge: res.challenge || '' }
+      }
+      this.user = res as User
+      this.authenticated = true
+      await this.loadMe()
+      return { totpRequired: false, challenge: '' }
+    },
+    /** 登录第二步：提交动态口令或恢复码，换取真正的会话。 */
+    async loginTOTP(challenge: string, code: string) {
+      const u = await api.post<User>('/auth/login/totp', { challenge, code })
       this.user = u
       this.authenticated = true
       await this.loadMe()

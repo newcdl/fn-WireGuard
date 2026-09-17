@@ -680,13 +680,17 @@ func TestAuthAndAudit(t *testing.T) {
 	if _, err := svc.Setup(ctx, "other", "admin12345"); err == nil {
 		t.Fatal("已初始化后不应允许重复初始化")
 	}
-	if _, _, err := svc.Login(ctx, "admin", "wrong-password", "test", "127.0.0.1"); err == nil {
+	if _, err := svc.Login(ctx, "admin", "wrong-password", "test", "127.0.0.1"); err == nil {
 		t.Fatal("错误口令应登录失败")
 	}
-	token, user, err := svc.Login(ctx, "admin", "admin12345", "test", "127.0.0.1")
+	step, err := svc.Login(ctx, "admin", "admin12345", "test", "127.0.0.1")
 	if err != nil {
 		t.Fatalf("登录失败: %v", err)
 	}
+	if step.TOTPRequired() {
+		t.Fatal("未开启二次验证的账号不应要求动态口令")
+	}
+	token, user := step.Token, step.User
 	if user.Username != "admin" || token == "" {
 		t.Fatal("登录返回值异常")
 	}

@@ -118,6 +118,27 @@ export interface User {
   status: number
   last_login_at?: string | null
   created_at: string
+  /** 是否已开启二次验证（密钥本身不会下发，只给这个派生标志） */
+  totp_enabled?: boolean
+}
+
+/** 二次验证状态。 */
+export interface TOTPStatus {
+  enabled: boolean
+  recovery_remaining: number
+}
+
+/** 绑定二次验证所需的密钥与扫码链接（此时尚未生效）。 */
+export interface TOTPSetup {
+  secret: string
+  uri: string
+}
+
+/** 登录第一步的返回：口令正确但还需二次验证时不带用户信息。 */
+export interface LoginChallenge {
+  totp_required?: boolean
+  challenge?: string
+  username?: string
 }
 
 export interface Overview {

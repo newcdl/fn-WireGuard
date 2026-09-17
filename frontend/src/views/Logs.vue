@@ -239,6 +239,10 @@ const ACTION_LABELS: Record<string, string> = {
   'user.delete': '删除了账号',
   'user.change_password': '修改了密码',
   'auth.login': '登录',
+  'auth.login.totp': '二次验证登录',
+  'totp.setup': '发起了二次验证绑定',
+  'totp.enable': '开启了二次验证',
+  'totp.disable': '关闭了二次验证',
 }
 
 const TARGET_LABELS: Record<string, string> = {

@@ -184,41 +184,74 @@ func (s *Service) ChangePassword(ctx context.Context, id int64, oldPw, newPw str
 	return nil
 }
 
-// Login 校验口令并创建会话，返回明文令牌。
-func (s *Service) Login(ctx context.Context, username, password, ua, ip string) (string, *model.User, error) {
+// LoginStep 是一次登录尝试的结果。
+//
+// 两项恰有其一：Challenge 非空表示「口令已通过，但还需二次验证」，
+// 此时**不签发任何会话**；否则 Token/User 就是已完成登录的会话。
+type LoginStep struct {
+	Token     string
+	User      *model.User
+	Challenge string
+}
+
+// TOTPRequired 表示是否还需要二次验证。
+func (r *LoginStep) TOTPRequired() bool { return r.Challenge != "" }
+
+// hashToken 是会话令牌与挑战令牌统一的落库形式：只存 SHA-256，不存明文。
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// Login 校验口令。
+//
+// 账号开启二次验证时**不签发会话**，只返回一次性挑战；调用方需再调用
+// CompleteTOTPLogin 提交动态口令，通过后才真正登录。
+func (s *Service) Login(ctx context.Context, username, password, ua, ip string) (*LoginStep, error) {
 	u, err := s.Store.GetUserByUsername(ctx, strings.TrimSpace(username))
 	if err != nil {
 		s.audit(ctx, Actor{Username: username, SrcIP: ip}, "auth.login", "user", username, "", "", "deny", "账号不存在")
-		return "", nil, errors.New("用户名或密码错误")
+		return nil, errors.New("用户名或密码错误")
 	}
 	if u.Status != 1 {
-		return "", nil, errors.New("该账号已被停用，请联系管理员")
+		return nil, errors.New("该账号已被停用，请联系管理员")
 	}
 	if !VerifyPassword(password, u.PasswordHash) {
 		s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: ip}, "auth.login", "user", fmt.Sprint(u.ID), "", "", "deny", "密码错误")
-		return "", nil, errors.New("用户名或密码错误")
+		return nil, errors.New("用户名或密码错误")
 	}
+	if u.TOTPSecret != "" {
+		ch := newToken(32)
+		if err := s.Store.CreateTOTPChallenge(ctx, hashToken(ch), u.ID, time.Now().Add(totpChallengeTTL)); err != nil {
+			return nil, err
+		}
+		s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: ip}, "auth.login", "user", fmt.Sprint(u.ID), "", "", "ok", "口令已通过，等待二次验证")
+		return &LoginStep{Challenge: ch}, nil
+	}
+	return s.issueSession(ctx, u, ua, ip)
+}
+
+// issueSession 为已通过全部校验的账号签发会话。
+func (s *Service) issueSession(ctx context.Context, u *model.User, ua, ip string) (*LoginStep, error) {
 	token := newToken(32)
-	sum := sha256.Sum256([]byte(token))
 	sess := &model.Session{
-		TokenHash: hex.EncodeToString(sum[:]),
+		TokenHash: hashToken(token),
 		UserID:    u.ID,
 		ExpiresAt: time.Now().Add(sessionTTL),
 		UserAgent: ua,
 		SrcIP:     ip,
 	}
 	if err := s.Store.CreateSession(ctx, sess); err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	_ = s.Store.TouchLastLogin(ctx, u.ID)
 	s.audit(ctx, Actor{UserID: u.ID, Username: u.Username, SrcIP: ip}, "auth.login", "user", fmt.Sprint(u.ID), "", "", "ok", "")
-	return token, u, nil
+	return &LoginStep{Token: token, User: u}, nil
 }
 
 // Logout 注销会话。
 func (s *Service) Logout(ctx context.Context, token string) error {
-	sum := sha256.Sum256([]byte(token))
-	return s.Store.DeleteSession(ctx, hex.EncodeToString(sum[:]))
+	return s.Store.DeleteSession(ctx, hashToken(token))
 }
 
 // Authenticate 校验令牌并返回账号。
@@ -226,8 +259,7 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*model.User, 
 	if token == "" {
 		return nil, errors.New("未登录")
 	}
-	sum := sha256.Sum256([]byte(token))
-	sess, u, err := s.Store.GetSession(ctx, hex.EncodeToString(sum[:]))
+	sess, u, err := s.Store.GetSession(ctx, hashToken(token))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, errors.New("登录状态已失效，请重新登录")

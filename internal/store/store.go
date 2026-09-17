@@ -129,6 +129,29 @@ CREATE TABLE IF NOT EXISTS sys_session (
 );
 CREATE INDEX IF NOT EXISTS idx_session_user ON sys_session(user_id);
 
+-- 二次验证（TOTP）的登录挑战：口令校验通过后、动态口令校验通过前，会话尚未建立。
+-- 单独一张表而不是复用 sys_session 加个 pending 标记，是为了从结构上杜绝
+-- 「未通过二次验证的令牌被当成已登录会话」——那种写法一旦漏判一处就是越权。
+CREATE TABLE IF NOT EXISTS sys_totp_challenge (
+  token_hash TEXT    PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
+  expires_at TEXT    NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_totp_challenge_user ON sys_totp_challenge(user_id);
+
+-- 二次验证的恢复码：只存 argon2id 哈希（与登录口令同一套算法，参数也一致），
+-- 明文仅在开启时展示一次、之后无法再取回。used_at 非空表示已用过（一次性）。
+CREATE TABLE IF NOT EXISTS sys_recovery_code (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
+  code_hash  TEXT    NOT NULL,
+  used_at    TEXT,
+  created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_user ON sys_recovery_code(user_id);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts          TEXT    NOT NULL,

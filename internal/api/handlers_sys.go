@@ -46,12 +46,17 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	token, _, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
+	step, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.setSessionCookie(w, token)
+	if step.TOTPRequired() {
+		// 账号是刚刚创建的，不可能已开启二次验证；走到这里说明数据被外部改动过
+		writeErr(w, http.StatusInternalServerError, "账号状态异常，请手动登录")
+		return
+	}
+	s.setSessionCookie(w, step.Token)
 	writeJSON(w, http.StatusOK, u)
 }
 
@@ -69,15 +74,124 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "登录失败次数过多，请 5 分钟后再试")
 		return
 	}
-	token, u, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
+	step, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
 	if err != nil {
 		s.recordLoginFail(key)
 		writeErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+	if step.TOTPRequired() {
+		// 口令正确但还需二次验证：这里**绝不能设 Cookie**，
+		// 否则「只过了一半」的登录就变成了已登录。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"totp_required": true,
+			"challenge":     step.Challenge,
+			"username":      in.Username,
+		})
+		return
+	}
 	s.clearLoginFail(key)
-	s.setSessionCookie(w, token)
-	writeJSON(w, http.StatusOK, u)
+	s.setSessionCookie(w, step.Token)
+	writeJSON(w, http.StatusOK, step.User)
+}
+
+// handleLoginTOTP 是登录的第二步：用登录挑战 + 动态口令（或恢复码）换取会话。
+func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Challenge string `json:"challenge"`
+		Code      string `json:"code"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 失败计数归到「IP+账号」这个键上，与密码那一步共用一套限流：
+	// 动态口令只有 6 位，若不限流，拿到口令的人可以靠反复重试撞开。
+	key := ""
+	if name, ok := s.svc.TOTPChallengeUser(r.Context(), in.Challenge); ok {
+		key = clientIP(r) + "|" + name
+		if s.loginBlocked(key) {
+			writeErr(w, http.StatusTooManyRequests, "登录失败次数过多，请 5 分钟后再试")
+			return
+		}
+	}
+	step, err := s.svc.CompleteTOTPLogin(r.Context(), in.Challenge, in.Code, r.UserAgent(), clientIP(r))
+	if err != nil {
+		if key != "" {
+			s.recordLoginFail(key)
+		}
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if key != "" {
+		s.clearLoginFail(key)
+	}
+	s.setSessionCookie(w, step.Token)
+	writeJSON(w, http.StatusOK, step.User)
+}
+
+// handleTOTPStatus 返回当前账号的二次验证状态。
+func (s *Server) handleTOTPStatus(w http.ResponseWriter, r *http.Request) {
+	u := userOf(r)
+	st, err := s.svc.TOTPStatusOf(r.Context(), u.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// handleTOTPSetup 生成绑定密钥与 otpauth 扫码链接（此时尚未生效）。
+func (s *Server) handleTOTPSetup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.svc.BeginTOTPSetup(r.Context(), userOf(r).ID, in.Password, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleTOTPEnable 用一次有效动态口令确认绑定并正式开启，返回一次性恢复码。
+func (s *Server) handleTOTPEnable(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+		Secret   string `json:"secret"`
+		Code     string `json:"code"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	codes, err := s.svc.EnableTOTP(r.Context(), userOf(r).ID, in.Password, in.Secret, in.Code, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"recovery_codes": codes})
+}
+
+// handleTOTPDisable 关闭二次验证（需当前口令 + 一次动态口令或恢复码）。
+func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.svc.DisableTOTP(r.Context(), userOf(r).ID, in.Password, in.Code, actorOf(r)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {

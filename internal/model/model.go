@@ -323,6 +323,32 @@ type User struct {
 	Status       int        `json:"status"` // 1 启用 0 禁用
 	LastLoginAt  *time.Time `json:"last_login_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
+	// TOTPEnabled 是派生给人看的字段：TOTPSecret 本身必须用 `json:"-"` 隐藏
+	// （它落在 /users 响应里就等于把二次验证密钥泄给了任何能读账号列表的人），
+	// 但「这个账号有没有开二次验证」需要让管理员看得到。
+	// 由 store 在扫描时按 TOTPSecret 是否为空填充，不是数据库列。
+	TOTPEnabled bool `json:"totp_enabled"`
+}
+
+// TOTPChallenge 是一次二次验证登录挑战。
+//
+// 口令校验通过、动态口令尚未校验的这段时间里没有会话，只有这条挑战记录；
+// 因此它必须短命（见 service 里的 TTL）且只能用一次。
+type TOTPChallenge struct {
+	TokenHash string
+	UserID    int64
+	ExpiresAt time.Time
+	Attempts  int
+	CreatedAt time.Time
+}
+
+// RecoveryCode 是一条恢复码记录（只含哈希，明文不落库）。
+type RecoveryCode struct {
+	ID        int64
+	UserID    int64
+	CodeHash  string
+	UsedAt    *time.Time
+	CreatedAt time.Time
 }
 
 // Session 是登录会话。

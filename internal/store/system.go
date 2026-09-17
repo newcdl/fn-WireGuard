@@ -50,6 +50,7 @@ func (s *Store) scanUser(sc interface{ Scan(...any) error }) (*model.User, error
 	}
 	u.LastLoginAt = parseTSNull(lastLoginAt)
 	u.CreatedAt = parseTS(createdAt)
+	u.TOTPEnabled = u.TOTPSecret != ""
 	return &u, nil
 }
 
@@ -169,6 +170,147 @@ func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
 func (s *Store) CleanExpiredSessions(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_session WHERE expires_at < ?`, ts(time.Now()))
 	return err
+}
+
+// ---------------------------------------------------------------- 二次验证
+
+// CreateTOTPChallenge 写入一次二次验证挑战。
+func (s *Store) CreateTOTPChallenge(ctx context.Context, tokenHash string, userID int64, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO sys_totp_challenge(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)`,
+		tokenHash, userID, ts(expiresAt), ts(time.Now()))
+	return err
+}
+
+// GetTOTPChallenge 查询未过期的挑战；过期即删除并按「不存在」返回。
+func (s *Store) GetTOTPChallenge(ctx context.Context, tokenHash string) (*model.TOTPChallenge, error) {
+	var (
+		c         model.TOTPChallenge
+		expiresAt string
+		createdAt string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT token_hash,user_id,expires_at,attempts,created_at FROM sys_totp_challenge WHERE token_hash=?`, tokenHash).
+		Scan(&c.TokenHash, &c.UserID, &expiresAt, &c.Attempts, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.ExpiresAt = parseTS(expiresAt)
+	c.CreatedAt = parseTS(createdAt)
+	if time.Now().After(c.ExpiresAt) {
+		_ = s.DeleteTOTPChallenge(ctx, tokenHash)
+		return nil, ErrNotFound
+	}
+	return &c, nil
+}
+
+// BumpTOTPChallengeAttempts 累加失败次数并返回最新值，用于限制单次挑战的尝试次数。
+func (s *Store) BumpTOTPChallengeAttempts(ctx context.Context, tokenHash string) (int, error) {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE sys_totp_challenge SET attempts=attempts+1 WHERE token_hash=?`, tokenHash); err != nil {
+		return 0, err
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT attempts FROM sys_totp_challenge WHERE token_hash=?`, tokenHash).Scan(&n)
+	return n, err
+}
+
+// DeleteTOTPChallenge 删除挑战。验证成功后必须调用，保证挑战只能用一次。
+func (s *Store) DeleteTOTPChallenge(ctx context.Context, tokenHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_totp_challenge WHERE token_hash=?`, tokenHash)
+	return err
+}
+
+// CleanExpiredTOTPChallenges 清理过期挑战。
+func (s *Store) CleanExpiredTOTPChallenges(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_totp_challenge WHERE expires_at < ?`, ts(time.Now()))
+	return err
+}
+
+// SetUserTOTPSecret 写入二次验证密钥（开启二次验证时调用）。
+func (s *Store) SetUserTOTPSecret(ctx context.Context, userID int64, secret string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sys_user SET totp_secret=? WHERE id=?`, secret, userID)
+	return err
+}
+
+// ClearUserTOTP 关闭二次验证：清空密钥、删除恢复码，并顺手清掉该账号未完成的挑战，
+// 避免「关闭之后，之前那次半途而废的登录还能继续用」。
+func (s *Store) ClearUserTOTP(ctx context.Context, userID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`UPDATE sys_user SET totp_secret='' WHERE id=?`,
+		`DELETE FROM sys_recovery_code WHERE user_id=?`,
+		`DELETE FROM sys_totp_challenge WHERE user_id=?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ReplaceRecoveryCodes 用新一批恢复码哈希整体替换旧记录。
+func (s *Store) ReplaceRecoveryCodes(ctx context.Context, userID int64, hashes []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sys_recovery_code WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	now := ts(time.Now())
+	for _, h := range hashes {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO sys_recovery_code(user_id,code_hash,created_at) VALUES(?,?,?)`, userID, h, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListUnusedRecoveryCodes 返回某账号尚未使用过的恢复码（只含哈希）。
+func (s *Store) ListUnusedRecoveryCodes(ctx context.Context, userID int64) ([]model.RecoveryCode, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id,user_id,code_hash,created_at FROM sys_recovery_code WHERE user_id=? AND used_at IS NULL ORDER BY id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.RecoveryCode{}
+	for rows.Next() {
+		var (
+			c         model.RecoveryCode
+			createdAt string
+		)
+		if err := rows.Scan(&c.ID, &c.UserID, &c.CodeHash, &createdAt); err != nil {
+			return nil, err
+		}
+		c.CreatedAt = parseTS(createdAt)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// MarkRecoveryCodeUsed 标记恢复码已使用（恢复码是一次性的）。
+func (s *Store) MarkRecoveryCodeUsed(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sys_recovery_code SET used_at=? WHERE id=?`, ts(time.Now()), id)
+	return err
+}
+
+// CountUnusedRecoveryCodes 统计剩余可用恢复码数量。
+func (s *Store) CountUnusedRecoveryCodes(ctx context.Context, userID int64) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM sys_recovery_code WHERE user_id=? AND used_at IS NULL`, userID).Scan(&n)
+	return n, err
 }
 
 // ---------------------------------------------------------------- 审计
