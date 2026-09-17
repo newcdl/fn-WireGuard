@@ -5,7 +5,10 @@
 #   ./scripts/build.sh                # 构建前端 + 当前机器架构的 linux 二进制（不做 fpk 打包）
 #   ./scripts/build.sh amd64          # 构建并打包 linux/amd64 的 fpk
 #   ./scripts/build.sh arm64          # 构建并打包 linux/arm64 的 fpk
-#   ./scripts/build.sh all            # 同时构建两个架构的 fpk
+#   ./scripts/build.sh all            # 同时构建两个架构的 fpk（两个文件，即发布用产物）
+#
+# 发布形态固定为「每个架构一个包」：飞牛应用中心按 manifest 的 platform 字段挑包，
+# 一份包只能声明一个平台，因此发布就是 x86 与 arm 各一个 fpk，不提供通用包。
 #
 # 依赖: Go 1.24+、Node 20+、fnpack（https://developer.fnnas.com/docs/cli/fnpack/）
 #
@@ -53,11 +56,27 @@ build_frontend() {
 }
 
 # ---------------------------------------------------------------- 后端
-# build_backend <goarch>
-build_backend() {
+# clean_payload 清掉上一次构建留下的二进制。
+#
+# 每目标开建前都清一次是有意的：切换架构构建时，若上一次的二进制残留在目录里，
+# 会被打进别的架构的包内，包体积翻倍且出现两份同名能力，
+# 属于「只在切换构建目标时才出现」的隐蔽故障。
+#
+# 只删构建产物、绝不用 rm -rf 整个目录：载荷目录里同时住着**源码**
+# （app/ui 下的图标与桌面入口配置，仓库跟踪它们），整目录删掉会把源码一起带走，
+# 而且打包会在很远的地方以「app/ui: no such file or directory」的形式失败，
+# 与真正的过错（这条命令）隔了一层。删除范围严格等于 .gitignore 里列的那两条。
+clean_payload() {
+    mkdir -p "${APP_PAYLOAD}"
+    rm -f "${APP_PAYLOAD}"/fnwg-* "${APP_PAYLOAD}/BUILDINFO"
+}
+
+# compile_binaries <goarch>
+# 产出 target 下的正式名字（无架构后缀）：包与架构一一对应，平台由 manifest 的 platform 声明。
+compile_binaries() {
     local arch="$1"
     log "编译 linux/${arch} 二进制"
-    mkdir -p "${APP_PAYLOAD}"
+    local bin
     for bin in fnwg-agent fnwg-web fnwg-cli; do
         # -tags embedui：把前端产物真正内嵌进 fnwg-web（干净克隆默认走占位实现）
         GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
@@ -65,14 +84,45 @@ build_backend() {
             -o "${APP_PAYLOAD}/${bin}" "./cmd/${bin}"
     done
     chmod +x "${APP_PAYLOAD}"/fnwg-*
-    # 记录构建信息，便于在设备上核对（target/BUILDINFO）
+}
+
+# write_buildinfo <arch 描述>
+write_buildinfo() {
     {
         echo "appname=${APP_NAME}"
         echo "version=${VERSION}"
-        echo "arch=${arch}"
+        echo "arch=$1"
         echo "built_at=${BUILD_TIME}"
     } > "${APP_PAYLOAD}/BUILDINFO"
+}
+
+# build_backend <goarch>
+build_backend() {
+    local arch="$1"
+    clean_payload
+    compile_binaries "$arch"
+    write_buildinfo "$arch"
     ls -lh "${APP_PAYLOAD}"
+}
+
+# ---------------------------------------------------------------- 版本号防呆
+# 约定：任何影响安装包内容的改动，都应先 bump 版本再打包，这样设备上装的版本
+# 与日志、更新说明始终对得上。
+#
+# 这里在**构建之前**直接失败，而不是打包时警告一句：同版本的包在应用中心里升不上去，
+# 覆盖重打的结果是「改了半天，装到设备上还是旧的那一个」；只提醒不拦截挡不住这件事
+# —— 它和日志里那句被忽略的警告是同一类失效。
+# 确实需要原地重打（例如只想验证打包流程）时用 FNWG_ALLOW_REBUILD=1 显式放行。
+guard_version_not_built() {
+    compgen -G "${DIST_DIR}/${APP_NAME}-${VERSION}-*.fpk" >/dev/null 2>&1 || return 0
+    if [ "${FNWG_ALLOW_REBUILD:-}" = "1" ]; then
+        warn "版本 ${VERSION} 已有安装包，按 FNWG_ALLOW_REBUILD=1 覆盖重打"
+        return 0
+    fi
+    die "版本 ${VERSION} 的安装包已存在（${DIST_DIR}/${APP_NAME}-${VERSION}-*.fpk）
+       同版本的包在设备上无法升级（会被当作同一个版本），覆盖重打会让本次改动静默失效。
+       请先推进版本号：./scripts/version.sh patch \"这次改了什么\"
+       若确实要原地重打，请显式放行：FNWG_ALLOW_REBUILD=1 ./scripts/build.sh ${TARGET}"
 }
 
 # ---------------------------------------------------------------- 打包
@@ -84,16 +134,6 @@ package_fpk() {
         warn "下载: https://static2.fnnas.com/fnpack/fnpack-1.2.3-<darwin|linux>-<amd64|arm64>"
         return 0
     fi
-    # 约定：有任何改动都应先 bump 版本再打包，这样设备上装的版本与日志/更新说明始终对得上。
-    # 只在本次构建的第一个架构上提示，避免 all 模式下第二个架构被误报。
-    if [ -z "${VERSION_GUARD_DONE:-}" ]; then
-        VERSION_GUARD_DONE=1
-        if compgen -G "${DIST_DIR}/${APP_NAME}-${VERSION}-*.fpk" >/dev/null 2>&1; then
-            warn "版本 ${VERSION} 已有安装包，本次会覆盖它"
-            warn "如果这是一次新的改动，请先执行：./scripts/version.sh patch \"改动说明\""
-        fi
-    fi
-
     log "打包 ${arch} 安装包（$("$fnpack" --help 2>&1 | sed -n 's/^Version //p' | head -1)）"
 
     local stage_root="${DIST_DIR}/stage-${arch}"
@@ -136,16 +176,19 @@ case "$TARGET" in
         build_backend "$(go env GOARCH)"
         ;;
     amd64)
+        guard_version_not_built
         build_frontend
         build_backend amd64
         package_fpk amd64 x86
         ;;
     arm64)
+        guard_version_not_built
         build_frontend
         build_backend arm64
         package_fpk arm64 arm
         ;;
     all)
+        guard_version_not_built
         build_frontend
         build_backend amd64
         package_fpk amd64 x86

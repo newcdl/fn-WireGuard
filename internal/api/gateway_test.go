@@ -183,6 +183,84 @@ func TestGatewayStateExposedForLoginPage(t *testing.T) {
 	if !strings.Contains(string(body), `"login_mode"`) || !strings.Contains(string(body), `"gateway"`) {
 		t.Fatalf("auth/state 应包含登录方式与网关入口信息: %s", body)
 	}
+	// socket_ready 必须和 entry 一起给登录页：只有这两个布尔值同时成立，
+	// 页面才能把「入口没建起来」与「请求没走网关通道」分开说。
+	// 真机故障里两者被混成一句「请从飞牛桌面打开」，而用户本来就是从桌面打开的。
+	if !strings.Contains(string(body), `"socket_ready"`) {
+		t.Fatalf("auth/state 应上报网关入口 socket 是否就绪: %s", body)
+	}
+}
+
+// TestGatewayStateSocketReadyTracksListener 覆盖上面那条断言的取值语义：
+// socket_ready 说的是「本进程有没有在监听网关入口」，与这一次请求怎么来的无关。
+func TestGatewayStateSocketReadyTracksListener(t *testing.T) {
+	srv := newGatewayTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/state", nil)
+
+	got := srv.gatewayState(req)
+	if got["socket_ready"] != false {
+		t.Fatalf("入口未就绪时 socket_ready 应为 false，实际 %v", got["socket_ready"])
+	}
+	if got["entry"] != false {
+		t.Fatalf("TCP 请求上 entry 应为 false，实际 %v", got["entry"])
+	}
+
+	// 入口就绪，但这条请求仍然来自端口：这正是真机上「从桌面打开却拿不到身份」的形态，
+	// 页面必须据此说出「入口是好的，是这次请求没走到它上面」。
+	srv.SetGatewaySocket("/vol1/@appstore/fn-wireguard/target/app.sock", "")
+	got = srv.gatewayState(req)
+	if got["socket_ready"] != true {
+		t.Fatalf("入口就绪后 socket_ready 应为 true，实际 %v", got["socket_ready"])
+	}
+	if got["entry"] != false {
+		t.Fatalf("TCP 请求上 entry 仍应为 false，实际 %v", got["entry"])
+	}
+}
+
+// TestLoginModeStateReportsGatewaySocket 是「提示必须说实话」的回归。
+//
+// 设置页要靠 gateway_socket 区分两种截然不同的失败：入口本身没起来（环境问题，
+// 去点多少次飞牛桌面图标都没用），与入口正常但还没走过（确实该去点一次）。
+// 真机故障里两者被混为一谈，用户于是在两个入口之间反复来回、拿到的却是同一句提示。
+func TestLoginModeStateReportsGatewaySocket(t *testing.T) {
+	srv := newGatewayTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/login-mode", nil)
+
+	// 启动方还没上报（例如 socket 没建起来）：必须按「未就绪」告知界面
+	got := srv.loginModeState(req)
+	if got["gateway_socket"] != false {
+		t.Fatalf("未上报网关 socket 时 gateway_socket 应为 false，实际 %v", got["gateway_socket"])
+	}
+	if got["gateway_proven"] != false {
+		t.Fatalf("从未成功免密登录过时 gateway_proven 应为 false，实际 %v", got["gateway_proven"])
+	}
+
+	// socket 就绪：界面应改回「去飞牛桌面打开一次」的指引
+	srv.SetGatewaySocket("/vol1/@appstore/fn-wireguard/target/app.sock", "")
+	got = srv.loginModeState(req)
+	if got["gateway_socket"] != true {
+		t.Fatalf("socket 就绪后 gateway_socket 应为 true，实际 %v", got["gateway_socket"])
+	}
+	if got["gateway_diagnosis"] != "" {
+		t.Fatalf("入口正常时不应带诊断信息，实际 %q", got["gateway_diagnosis"])
+	}
+}
+
+// TestGatewayDiagnosisRecorded 覆盖「入口通了但身份不被信任」这类静默失败：
+// 前端自动免密登录是静默失败的，不在这里留痕，用户在界面上就完全看不到原因。
+func TestGatewayDiagnosisRecorded(t *testing.T) {
+	srv := newGatewayTestServer(t)
+	srv.noteGatewayDiag("连接方身份未被信任：uid=1234 不在放行名单内")
+
+	diag := srv.gatewayDiagnosis()
+	if !strings.Contains(diag, "1234") {
+		t.Fatalf("诊断信息应被记录并可展示给用户，实际 %q", diag)
+	}
+	// 启动方给出「已就绪」时不带原因，等于把上一轮的失败线索清掉
+	srv.SetGatewaySocket("/vol1/@appstore/fn-wireguard/target/app.sock", "")
+	if srv.gatewayDiagnosis() != "" {
+		t.Fatalf("入口重新就绪后不应保留旧诊断，实际 %q", srv.gatewayDiagnosis())
+	}
 }
 
 // TestSPAServedUnderGatewayPrefix 覆盖子路径部署：

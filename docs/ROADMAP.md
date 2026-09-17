@@ -257,6 +257,10 @@
   `gatewayPrefix` + `gatewaySocket` 注册入口，**请求先由 fnOS 校验用户会话**，再转发到应用
   `target` 目录下的 Unix Socket，并注入可信身份头 `X-Trim-Userid` / `X-Trim-Username` / `X-Trim-Isadmin`。
   二次验证与「信任本设备」**由飞牛侧全权负责**，本应用零代码。
+- **⚠️ 硬前提**：manifest 必须声明 `os_min_version = 1.1.3100`。飞牛口径是「**声明这个版本即表示应用
+  使用统一网关**」，它同时是网关能力的最低系统版本。若仍声明更低的值（如 `0.9.0`），飞牛按**旧模型**
+  解析桌面入口，而入口配置里已没有 `protocol`/`port`，没有可用上游 —— 点图标当场 **502 Bad Gateway**，
+  故障点全在声明里，应用自身（socket、端口、日志）看起来一切正常。
 - **不采用的路线**：飞牛的 OAuth 服务（`/oauthapi/authorize` + `/v/api/v1/auth`）**不对外开放**，
   `trim.oauth_app` 只预置「影视」「相册」两个第一方应用，第三方无法接入。
 - **已确认的边界**：网关模式启用后**关闭独立端口的密码登录**，端口降级为「安全码应急入口」。
@@ -270,7 +274,7 @@
      启动时先 unlink 旧 socket 再 bind，bind 后放开文件权限：文件权限只能回答「能不能连上」，
      回答不了「是谁连的」，真正的准入在下一步。
   2. **身份可信性的三重判定**（缺一不可，`internal/api/gateway.go`）：
-     ① 请求必须经 Unix Socket 到达（依据 `http.LocalAddrContextKey` 的地址类型，属连接层事实，无法伪造）；
+     ① 请求必须经 Unix Socket 到达（连接建立时就断言 `net.Conn` 是 `*net.UnixConn`，属连接层事实，无法伪造）；
      ② 该连接的对端进程身份必须在允许列表内（`SO_PEERCRED`，默认只信 root 与本进程用户，
      可用 `FNWG_GATEWAY_UIDS` 放行其它 UID）—— **单靠 ① 不够**：socket 是本机文件，
      别的第三方应用同样连得上来，没有这一步就等于把管理员权限发给本机所有用户；
@@ -292,9 +296,34 @@
      后端把同一套 API 与静态资源挂在 `/app/fn-wireguard` 下。
      于是**同一份产物在两种入口下都能正常工作**，包括 WebSocket。
   6. **打包配套**：Web 服务单元的 `ReadWritePaths` 增加 `${TRIM_APPDEST}`；
-     安装脚本把 target 目录设为「同组可写 + sticky 位」—— sticky 位让 Web 进程只能建/删自己的 socket，
-     动不了 root 拥有的 `fnwg-agent` 等二进制（少了这一位，被攻陷的 Web 进程可能替换掉下次以 root 启动的 agent）；
-     卸载时一并清掉 socket 残骸。
+      安装脚本把 target 目录设为「同组可写 + sticky 位」—— sticky 位让 Web 进程只能建/删自己的 socket，
+      动不了 root 拥有的 `fnwg-agent` 等二进制（少了这一位，被攻陷的 Web 进程可能替换掉下次以 root 启动的 agent）；
+      卸载时一并清掉 socket 残骸。
+    7. **真机验证发现并修复（0.8.8）**：真机上「从飞牛桌面打开即免密进入」整条不通，免密从未成功过一次，
+      于是「关闭端口登录」的防自锁校验永远通不过，而界面只会提示「请先从飞牛桌面打开一次」——
+      这句话在那台机器上**无论如何都做不到**。根因在 6 的启动参数里漏了一项：`TRIM_APPDEST` 只存在于
+      安装脚本的进程环境，**systemd 不会继承**，Web 服务单元又没把应用目录显式传进去，进程于是按默认值 `.`
+      取址，把 socket 当成相对路径（systemd 下即 `/`）去建 —— 普通用户对 `/` 没有写权限，bind 直接失败，
+      统一网关入口整个不存在，而日志里只有一句容易被忽略的警告。修复分两层：
+      ① 单元与 pidfile 两条启动路径都显式传 `--appdest ${TRIM_APPDEST}`；
+      ② `Config.AppSockPath` 在拿不到绝对应用目录时退到**可执行文件所在目录**
+      （二进制就装在 target 里，这条事实与启动方式无关），使这个位置不可能再被算错。
+      同时补上可观测性：`/auth/login-mode` 回报 `gateway_socket` 与 `gateway_diagnosis`，
+      设置页据此区分「入口没起来」（环境问题）与「入口正常但还没走过」（确实该去点一次），
+      不再把用户送去反复做一件做不到的事。
+    8. **登录页不再对「看不到飞牛入口」保持沉默（0.8.9）**：起因是登录方式默认为 `both`
+      （两种都允许），用户却只看到账号密码表单，只能反过来问「为什么没有飞牛的登录」——
+      问题不在开关，而在页面没说自己观察到什么。`gateway.available` 只表达「本次请求带着
+      飞牛身份头」，于是按两种事实分别给出指引：`gateway.entry` 为假（请求走的是端口，网关
+      没经由 socket）提示「免密只在从飞牛桌面打开时可用」，为真却无身份头（刷新过页面、
+      链接被复制到别处打开）提示「回飞牛桌面重新点开」。凡是「入口存在但这次用不上」的情形，
+      都应能就地读到原因，而不是让用户去猜功能是没做还是坏了。
+   9. **换了入口模型却没同步声明（0.8.12）**：桌面入口从端口模型改为统一网关后，从飞牛桌面点开报
+     **502 Bad Gateway**，而应用自身一切正常 —— socket 已按 target 目录正确建立、端口入口可访问、
+     日志无异常。根因不在代码：manifest 的 `os_min_version` 还是网关能力之前的 `0.9.0`，飞牛据此仍按
+     旧模型解析入口，可入口配置里 `protocol` 已留空、也没有 `port`，拼不出上游，于是 502。
+     修复即上面那条硬前提（改为 `1.1.3100`）。教训：**换入口模型时必须同时核对声明** ——
+     只改 `app/ui/config` 而不改 manifest，两边各自看都「正确」，故障恰好落在它们之间。
 
 #### P2-5 防自锁后手（安全码 + CLI + 登录方式开关，已完成）
 - **背景**：P2-4 选定「关闭独立端口登录」后，必须有退路，否则飞牛网关侧一旦异常就再也进不去。
@@ -526,6 +555,12 @@ P2-3 快照回滚    （独立，但 P3 报表可复用其快照数据）
   → `TestGatewayOnlyRequiresProvenGateway`、`TestGenericSettingsCannotBypassLoginModeGuard`。
 - 子路径部署：网关前缀下页面、接口、静态资源与 WebSocket 全部正常。
   → `TestSPAServedUnderGatewayPrefix`、`TestGatewayStateExposedForLoginPage`。
+- **免密登录本身要能在真机上真的走通**（本轮真机验证的第一条就没过：网关入口 socket 因启动参数漏项
+  而根本没建起来，见 P2-4 实际实现第 7 条）。
+  → `TestAppSockPathFallsBackToExecutableDir`、`TestAppSockPathHonoursAbsoluteAppDest`
+    （应用目录取不到时 socket 必须落到可执行文件所在目录，且显式给出的绝对目录优先）；
+    `TestLoginModeStateReportsGatewaySocket`、`TestGatewayDiagnosisRecorded`
+    （界面必须能区分「入口没起来」与「入口正常但还没走过」，否则只会给出无法执行的指引）。
 
 ### V10 流量报表（P3）
 - 可查询任意设备最近 7 天按天流量；与实时累计值误差 **< 5%**。

@@ -37,6 +37,17 @@
           :title="session.gateway.blocked_reason"
         />
 
+        <!-- 没有飞牛账号入口时说明缘由：它取决于「这次是怎么打开本应用的」，
+             而不是登录开关——不说清楚，用户只会以为功能没做或坏了 -->
+        <el-alert
+          v-else
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+          :title="gatewayEntryHint"
+        />
+
         <!-- 管理员关闭了端口登录：不展示表单，直接指路，避免用户白试一遍 -->
         <el-alert
           v-if="passwordLoginDisabled"
@@ -171,6 +182,33 @@ const form = reactive({ username: '', password: '' })
 const gatewayAvailable = computed(() => !!session.gateway.available)
 /** 管理员是否关闭了端口上的账号密码登录（安全码应急入口不受影响）。 */
 const passwordLoginDisabled = computed(() => session.loginMode === 'gateway_only')
+
+/**
+ * 「为什么这个页面上没有飞牛账号登录」的说明。
+ *
+ * 飞牛账号入口不看登录方式开关，只看**这次请求是怎么进来的**：身份是飞牛网关
+ * 校验会话后注入的请求头，而请求头是明文、可伪造的，所以服务端只认经 Unix Socket
+ * 通道到达的请求。直接用 IP:端口 打开时无法证明「你是谁」，因此这里只有账号密码 ——
+ * 这是通道事实，不是开关被关掉了。页面不说明的话，用户只能猜是功能没了还是坏了。
+ */
+const gatewayEntryHint = computed(() => {
+  if (session.gateway.entry) {
+    // 通道对，但身份头没到（例如登录页被直接刷新、链接被复制到别处打开）
+    return '本次请求确实走了飞牛网关通道，但没带上飞牛账号信息。常见原因是登录页被刷新过、或链接被复制到别处打开，回飞牛桌面重新点开本应用图标即可。'
+  }
+  // 请求没走网关通道。这时还剩两种**完全不同的**原因，必须分开说：
+  // 不说清就等于把用户送去反复点桌面图标，而他本来就是从飞牛桌面打开的。
+  if (session.gateway.socket_ready) {
+    // 入口本身是好的 → 问题在于这次请求没走到它上面（真机表现为桌面图标指向端口）
+    return '本次请求不是经飞牛网关通道进来的，所以无法确认你是哪个飞牛账号，这里只提供账号密码登录。' +
+      '本应用的网关入口（app.sock）是正常就绪的，说明这次请求没走到那条通道上——' +
+      '从飞牛桌面打开却仍看到这句话，就属于入口注册问题。' +
+      '请先用账号密码登录，再到「系统设置 → 登录方式」把网关诊断信息反馈给维护者。'
+  }
+  return '本次请求不是经飞牛网关通道进来的，所以无法确认你是哪个飞牛账号，这里只提供账号密码登录。' +
+    '而且本机当前没有监听网关入口（app.sock），这种情况下无论怎么打开都不会有免密登录。' +
+    '请先用账号密码登录，再到「系统设置 → 登录方式」查看诊断信息。'
+})
 
 /** 当前界面：password（账号口令）→ totp（二次验证）/ emergency（安全码）→ newcode（保存新安全码）。 */
 const step = ref<'password' | 'totp' | 'emergency' | 'newcode'>('password')

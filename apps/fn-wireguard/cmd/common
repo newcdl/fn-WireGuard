@@ -5,6 +5,8 @@
 # 或系统未使用 systemd 时，自动回退为 PID 文件方式管理进程，保证在任何 fnOS 环境下都能安装。
 
 FNWG_GROUP="fnwg"
+# 应用名：只用于卸载时的路径归属校验（见 fnwg_purge_user_data），必须与 manifest 的 appname 一致。
+FNWG_APPNAME="fn-wireguard"
 FNWG_UNIT_AGENT="fnwg-agent.service"
 FNWG_UNIT_WEB="fnwg-web.service"
 FNWG_UNIT_DIR="/etc/systemd/system"
@@ -78,12 +80,32 @@ fnwg_prepare_dirs() {
 # sticky 位让 fnwg 只能创建/删除自己的 socket，动不了 root 拥有的二进制 ——
 # 少这一位，一个被攻陷的 Web 进程就能替换掉下次以 root 启动的 agent。
 fnwg_prepare_gateway_socket() {
-    [ -n "${TRIM_APPDEST:-}" ] || return 0
-    [ -d "$TRIM_APPDEST" ] || return 0
-    chgrp "$FNWG_GROUP" "$TRIM_APPDEST" 2>/dev/null || true
-    chmod g+w,+t "$TRIM_APPDEST" 2>/dev/null || true
+    local dir="${TRIM_APPDEST:-}"
+    # 兜底：TRIM_APPDEST 只活在「飞牛调用脚本」的那个环境里，手工执行或某些升级
+    # 路径下它可能是空的。为空时不能直接放弃 —— unit 里的 --appdest 会一起写空，
+    # socket 于是退化成相对路径（systemd 下即 /），照样起不来。此时从脚本自身位置
+    # 反推：本文件位于 <target>/cmd/common，所以它的上一级就是 target。
+    if [ -z "$dir" ]; then
+        dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+    fi
+    [ -n "$dir" ] && [ -d "$dir" ] || return 0
+    chgrp "$FNWG_GROUP" "$dir" 2>/dev/null || true
+    # 分开写而不是 `chmod g+w,+t`：后者没有 who 前缀，语义受 umask 影响、各实现不统一，
+    # 拆成两条各自明确的写法更稳。
+    chmod g+w "$dir" 2>/dev/null || true
+    # 但光有 chmod 不够：飞牛会给 target 目录挂一条 user:<应用名>:rwx 的具名 ACL
+    # 条目，而目录一旦存在具名条目，chmod g+w 修改的就是 mask 位、不是 group:: 实体位。
+    # 于是 `ls -l` 里那串 "rwx" 其实是 mask，组权限仍是 r-x —— 外表完全正常，
+    # fnwg 属组却照旧建不出 socket（bind: permission denied），每次重启都一样。
+    # 必须用 setfacl 显式放开具名条目、组实体位和 mask，让真实权限与显示一致。
+    if command -v setfacl >/dev/null 2>&1; then
+        setfacl -m "u:${FNWG_GROUP}:rwx" "$dir" 2>/dev/null || true
+        setfacl -m "g:${FNWG_GROUP}:rwx" "$dir" 2>/dev/null || true
+        setfacl -m "m::rwx" "$dir" 2>/dev/null || true
+    fi
+    chmod +t "$dir" 2>/dev/null || true
     # 上一次运行留下的 socket 文件会让进程启动时 bind 失败，先清掉
-    rm -f "$TRIM_APPDEST/app.sock" 2>/dev/null || true
+    rm -f "$dir/app.sock" 2>/dev/null || true
 }
 
 # fnwg_fix_db_perms：修正数据库与主密钥属组，确保 Web 进程可读写。
@@ -136,6 +158,10 @@ EOF
 }
 
 fnwg_write_web_unit() {
+    # --appdest 必须显式传入：systemd 只继承 ExecStart 里写死的东西，安装脚本的
+    # TRIM_APPDEST 到不了服务进程里。少了它，Web 进程会退化成「相对当前工作目录」
+    # 去找网关 socket（systemd 下即 /），建不出来就等于统一网关入口整个不可用，
+    # 表现为「从飞牛桌面打开本应用也不免密」，而界面只会给出无从下手的提示。
     cat > "${FNWG_UNIT_DIR}/${FNWG_UNIT_WEB}" <<EOF
 [Unit]
 Description=fn-WireGuard web console (unprivileged)
@@ -147,7 +173,15 @@ PartOf=fnwg-agent.service
 Type=simple
 User=${FNWG_GROUP}
 Group=${FNWG_GROUP}
-ExecStart=${TRIM_APPDEST}/fnwg-web --bind 0.0.0.0 --port $(fnwg_service_port) --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock
+# ExecStartPre 前缀 + 表示「在沙箱外以完整权限执行」。每次拉起 Web 进程都先把
+# socket 落点调成同组可写，而不是只依赖安装脚本那一次 —— 因为飞牛的重新部署会
+# 重建 target 目录并把权限恢复成 root:root 755，之后 Restart=always 的自动重启
+# 不会再去走安装脚本，结果就是 Web 进程突然建不出 socket（网关入口整个不可用），
+# 而飞牛桌面只会显示 502，日志里也仅有一行容易被忽略的警告。
+# 注意这里必须带 setfacl：飞牛在 target 目录上挂了 user:<应用名>:rwx 的具名 ACL，
+# 有具名 ACL 时 chmod 只改 mask、改不动 group:: 实体位，光靠 chmod 会一直失败。
+ExecStartPre=+/bin/sh -c 'chgrp ${FNWG_GROUP} "${TRIM_APPDEST}" 2>/dev/null; chmod g+w "${TRIM_APPDEST}" 2>/dev/null; if command -v setfacl >/dev/null 2>&1; then setfacl -m u:${FNWG_GROUP}:rwx "${TRIM_APPDEST}" 2>/dev/null; setfacl -m g:${FNWG_GROUP}:rwx "${TRIM_APPDEST}" 2>/dev/null; setfacl -m m::rwx "${TRIM_APPDEST}" 2>/dev/null; fi; chmod +t "${TRIM_APPDEST}" 2>/dev/null; rm -f "${TRIM_APPDEST}/app.sock"'
+ExecStart=${TRIM_APPDEST}/fnwg-web --bind 0.0.0.0 --port $(fnwg_service_port) --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock --appdest ${TRIM_APPDEST}
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -226,7 +260,7 @@ fnwg_pidfile_start() {
         nohup fnwg_run_as_user "$TRIM_APPDEST/fnwg-web" \
             --bind 0.0.0.0 --port "$(fnwg_service_port)" \
             --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" \
-            --socket "$TRIM_PKGVAR/agent.sock" \
+            --socket "$TRIM_PKGVAR/agent.sock" --appdest "$TRIM_APPDEST" \
             >>"$logdir/web.log" 2>&1 &
         echo $! > "$TRIM_PKGVAR/web.pid"
     fi
@@ -339,4 +373,72 @@ fnwg_wait_health() {
         i=$((i + 1))
     done
     return 1
+}
+
+# ---------------------------------------------------------------- 卸载：数据处理
+
+# fnwg_uninstall_wants_purge：用户在卸载向导里是否选择了「删除全部数据」。
+#
+# 判定原则是「只有明确说要删才删」：变量缺失、取值看不懂、向导压根没弹出（命令行卸载、
+# 升级回滚、卸载中途异常）—— 一律按「保留」处理。拿不准时必须保住用户数据，
+# 那些连接、设备与账号是他唯一的一份，删掉就再也找不回来；而多留一份数据几乎没有代价，
+# 重装即可恢复。反过来（拿不准就删）造成的损失是不可逆的。
+fnwg_uninstall_wants_purge() {
+    local mode="${wizard_uninstall_mode:-}"
+    mode="$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$mode" in
+        purge | delete | remove | uninstall | 1 | true | yes) return 0 ;;
+        # 兜底：万一平台把选项的 label 而不是 value 传了过来（下拉项文案里「删除」只出现在
+        # 删除那一项，「保留数据」一项不含该词），也能正确识别。
+        *删除* | *清空*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# fnwg_purge_user_data：删除本应用的全部用户数据目录。
+#
+# 这是整个应用里唯一一处 rm -rf，删的又是用户唯一一份数据，因此防呆按最高等级写：
+# 逐个目录先过「绝对路径、不含上跳、末段确实是本应用名、不是符号链接」四道检查，
+# 任何一道不过就跳过并如实报告，绝不用「差不多就删」的方式处理。
+# 这一层挡的是真实发生过的失效形态：变量为空（变成 rm -rf 空参数）、
+# 变量被写成 / 或 /vol1（变成删系统或删整个存储卷），两者在别处都是灾难。
+#
+# 返回值：全部存在的目标目录都删成功才返回 0。
+fnwg_purge_user_data() {
+    local dir failed=0
+    for dir in "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGHOME"; do
+        [ -n "$dir" ] || continue
+        case "$dir" in
+            /*) ;;
+            *)
+                fnwg_log "跳过非绝对路径：${dir}"
+                continue
+                ;;
+        esac
+        case "$dir" in
+            / | *..*)
+                fnwg_log "跳过含上跳或根路径的写法：${dir}"
+                continue
+                ;;
+        esac
+        case "$dir" in
+            */"$FNWG_APPNAME") ;;
+            *)
+                fnwg_log "跳过不属于本应用的路径：${dir}"
+                continue
+                ;;
+        esac
+        if [ -L "$dir" ]; then
+            fnwg_log "跳过符号链接：${dir}"
+            continue
+        fi
+        [ -d "$dir" ] || continue
+        fnwg_log "删除 ${dir}"
+        rm -rf -- "$dir" 2>/dev/null || true
+        if [ -e "$dir" ]; then
+            fnwg_log "删除失败：${dir}"
+            failed=1
+        fi
+    done
+    return "$failed"
 }

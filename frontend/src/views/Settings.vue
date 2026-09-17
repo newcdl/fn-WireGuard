@@ -296,8 +296,11 @@
             :closable="false"
             show-icon
             style="margin: 10px 0 0"
-            title="还不能关闭端口登录：本应用尚未成功用过一次飞牛账号免密登录。请先从飞牛桌面用本应用图标打开一次，再回来开启。"
-          />
+            title="还不能关闭端口登录：本应用尚未成功用过一次飞牛账号免密登录"
+          >
+            <!-- 说清卡在哪一环：入口本身没起来时，让用户去点桌面图标是白费功夫。 -->
+            <div>{{ gatewayBlockReason }}</div>
+          </el-alert>
 
           <div class="fnwg-toolbar" style="margin-top: 14px">
             <el-button
@@ -783,9 +786,34 @@ const savingSettings = ref(false)
 
 // 登录方式：与「接入设置」分开保存。它决定谁能进得来，误改的后果比改错一个
 // 对外地址严重得多，因此不跟其它设置项共用一个保存按钮。
-const loginModeState = reactive<LoginModeState>({ mode: 'both', gateway_proven: false, gateway_entry: false })
+const loginModeState = reactive<LoginModeState>({
+  mode: 'both',
+  gateway_proven: false,
+  gateway_entry: false,
+  // 读取前不假定入口是坏的，免得刚进页面就吓人一跳
+  gateway_socket: true,
+  gateway_diagnosis: '',
+})
 const loginModeChoice = ref<LoginMode>('both')
 const loginModeSaving = ref(false)
+
+/**
+ * 「为什么现在还不能关闭端口登录」的准确说法。
+ *
+ * 必须把「入口本身没起来」和「入口正常但你还没走过」分开：前者无论点多少次
+ * 飞牛桌面图标都不会成功，得直说是环境问题；混在一起说，用户会在两个入口之间
+ * 反复来回，拿到的却始终是同一句提示。
+ */
+const gatewayBlockReason = computed(() => {
+  if (!loginModeState.gateway_socket) {
+    return (
+      loginModeState.gateway_diagnosis ||
+      '本机没有监听网关入口（app.sock），因此从飞牛桌面打开本应用也无法免密登录。请重新安装本应用后再试。'
+    )
+  }
+  if (loginModeState.gateway_diagnosis) return loginModeState.gateway_diagnosis
+  return '请先从飞牛桌面用本应用图标打开一次，再回来开启。'
+})
 
 async function loadLoginMode() {
   if (!session.isAdmin) return
@@ -794,6 +822,8 @@ async function loadLoginMode() {
     loginModeState.mode = st.mode
     loginModeState.gateway_proven = st.gateway_proven
     loginModeState.gateway_entry = st.gateway_entry
+    loginModeState.gateway_socket = st.gateway_socket
+    loginModeState.gateway_diagnosis = st.gateway_diagnosis || ''
     loginModeChoice.value = st.mode
   } catch {
     // 读不到不该影响其它设置页；保存时服务端仍会做同样的校验
@@ -806,6 +836,8 @@ async function saveLoginMode() {
     const out = await session.setLoginMode(loginModeChoice.value)
     loginModeState.mode = out.mode
     loginModeState.gateway_proven = out.gateway_proven
+    loginModeState.gateway_socket = out.gateway_socket
+    loginModeState.gateway_diagnosis = out.gateway_diagnosis || ''
     loginModeChoice.value = out.mode
     ElMessage.success('登录方式已更新')
   } catch (e) {

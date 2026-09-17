@@ -139,8 +139,8 @@ export const useSession = defineStore('session', {
     },
 
     /** 修改登录方式（管理员）。 */
-    async setLoginMode(mode: LoginMode) {
-      const data = await api.put<{ mode: LoginMode; gateway_proven: boolean }>('/auth/login-mode', { mode })
+    async setLoginMode(mode: LoginMode): Promise<LoginModeState> {
+      const data = await api.put<LoginModeState>('/auth/login-mode', { mode })
       this.loginMode = data.mode
       return data
     },

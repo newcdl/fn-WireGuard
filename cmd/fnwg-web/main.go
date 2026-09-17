@@ -117,12 +117,17 @@ func main() {
 
 	// 飞牛统一网关通道：请求先由 fnOS 校验飞牛账号会话，再经 Unix Socket 转发过来，
 	// 并带上可信身份头 —— 因此这条通道上的请求才可能以飞牛账号免密登录。
-	// socket 起不来不该阻断端口服务（安全码应急入口正是为此保留的），只记日志。
+	// socket 起不来不该阻断端口服务（安全码应急入口正是为此保留的），
+	// 但必须把状态与原因交给界面：这条通道一断，免密登录与「关闭端口登录」都会失效，
+	// 界面上只说「请从飞牛桌面打开一次」会让人白试很多次。
 	if sockPath := cfg.AppSockPath(); sockPath != "" {
 		gw, err := srv.ListenGateway(sockPath, srv.Router(assets))
 		if err != nil {
 			logger.Warn("飞牛统一网关入口不可用（端口入口不受影响）", "path", sockPath, "err", err)
+			srv.SetGatewaySocket("", fmt.Sprintf(
+				"本机未能监听网关入口 socket（%s）：%v。请重新安装本应用，或查看应用日志中「网关入口」相关记录。", sockPath, err))
 		} else {
+			srv.SetGatewaySocket(gw.Path, "")
 			go func() {
 				logger.Info("飞牛统一网关入口已就绪", "socket", gw.Path)
 				if err := gw.Serve(ctx); err != nil {
@@ -132,7 +137,9 @@ func main() {
 			defer func() { _ = gw.Close() }()
 		}
 	} else {
-		logger.Info("未提供应用目录（TRIM_APPDEST），跳过飞牛统一网关入口")
+		// 正常启动路径不会走到这里：AppSockPath 会兜底到可执行文件所在目录。
+		logger.Warn("无法定位应用目录，飞牛统一网关入口不可用", "appdest", cfg.AppDest)
+		srv.SetGatewaySocket("", "无法定位应用目录，网关入口 socket 未建立。请重新安装本应用。")
 	}
 
 	<-ctx.Done()

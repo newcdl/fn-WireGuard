@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -31,6 +32,13 @@ type Server struct {
 
 	loginMu    sync.Mutex
 	loginFails map[string]loginFail
+
+	// gatewaySockPath 是统一网关 socket 的实际监听路径（未监听时为空串），
+	// gatewayDiag 记录最近一次「网关入口没能用起来」的原因。
+	// 这两个字段是给界面用的：免密登录不可用时必须说清是哪一环断了，
+	// 否则用户只会拿到一句自己无法执行的指引（「请从飞牛桌面打开一次」）。
+	gatewaySockPath atomic.Pointer[string]
+	gatewayDiag     atomic.Pointer[string]
 }
 
 type loginFail struct {
@@ -198,6 +206,40 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), ctxUser, &authUser{User: u, Token: token, SrcIP: clientIP(r)})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// ---------------------------------------------------------------- 网关入口自检
+
+// SetGatewaySocket 由启动方告知「网关 socket 是否真的监听上了」。
+// path 非空表示就绪；否则 reason 说明断在哪一环，会被界面原样展示给用户。
+func (s *Server) SetGatewaySocket(path, reason string) {
+	s.gatewaySockPath.Store(&path)
+	s.gatewayDiag.Store(&reason)
+}
+
+// gatewaySocketReady 表示本进程确实在监听统一网关入口。
+func (s *Server) gatewaySocketReady() bool {
+	p := s.gatewaySockPath.Load()
+	return p != nil && *p != ""
+}
+
+// noteGatewayDiag 记录一次网关入口的失败线索（后写覆盖先写）。
+//
+// 只在「网关入口存在却没能用起来」时调用：这类失败发生在请求到达之前或身份校验阶段，
+// 不记下来在界面上就完全不可见，用户只能看到反复失败、却不知道去看哪个日志。
+func (s *Server) noteGatewayDiag(reason string) {
+	if reason == "" {
+		return
+	}
+	s.gatewayDiag.Store(&reason)
+}
+
+// gatewayDiagnosis 返回当前网关入口的诊断说明（正常时为空串）。
+func (s *Server) gatewayDiagnosis() string {
+	if d := s.gatewayDiag.Load(); d != nil {
+		return *d
+	}
+	return ""
 }
 
 func requirePerm(perm string) func(http.Handler) http.Handler {

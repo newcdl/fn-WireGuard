@@ -108,6 +108,14 @@ export type LoginMode = 'both' | 'gateway_only' | 'password_only'
 export interface GatewayEntry {
   /** 是否经由飞牛统一网关的 Unix Socket 到达。 */
   entry?: boolean
+  /**
+   * 本机是否真的在监听网关入口（app.sock）。
+   *
+   * 与 entry 合起来才能把「没有飞牛账号登录」拆成两种不同的原因：
+   * entry=false + socket_ready=true 说明入口是好的、只是这次请求没走那条通道；
+   * entry=false + socket_ready=false 说明入口压根没建起来，与用户怎么打开无关。
+   */
+  socket_ready?: boolean
   /** 是否拿到了可信的飞牛身份（可用于一键免密登录）。 */
   available?: boolean
   username?: string
@@ -131,6 +139,15 @@ export interface LoginModeState {
   gateway_proven: boolean
   /** 当前请求是否来自网关入口。 */
   gateway_entry: boolean
+  /**
+   * 本机是否真的在监听网关入口（app.sock）。
+   *
+   * 为 false 时「去飞牛桌面打开一次」是做不到的动作，界面必须改说环境问题，
+   * 否则用户会一直在两个入口之间来回试。
+   */
+  gateway_socket: boolean
+  /** 网关入口不可用/未被信任的原因（正常时为空串）。 */
+  gateway_diagnosis: string
 }
 
 export interface Health {

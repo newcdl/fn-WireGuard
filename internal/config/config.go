@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Config 是 fnwg-web / fnwg-agent 共用的运行期配置。
@@ -106,13 +107,40 @@ const AppSockFile = "app.sock"
 
 // AppSockPath 返回飞牛统一网关使用的 Unix Socket 路径。
 //
-// 固定为 <TRIM_APPDEST>/app.sock：这个位置不是我们的选择，而是网关的约定 ——
-// 写成别处网关就找不到，统一网关入口会直接不可用。
+// 位置由网关约定：必须是应用 target 目录下的 app.sock，写成别处网关就找不到。
+// 取址顺序是「显式传入的 --appdest / TRIM_APPDEST → 可执行文件所在目录」。
+//
+// 为什么必须有第二级兜底：二进制本身就装在 target 目录里，所以「可执行文件在哪，
+// socket 就在哪」恒成立；而 TRIM_APPDEST 只存在于安装/配置脚本的进程环境里，
+// **systemd 不会继承它**。只认 TRIM_APPDEST 的话，服务由 systemd 拉起时会退化成
+// 「相对当前工作目录」——systemd 下即 /，普通用户无权在那里建 socket，bind 直接失败，
+// 最终表现为「从飞牛桌面打开也不免密」，而日志里只有一句容易被忽略的警告。
 func (c *Config) AppSockPath() string {
-	if c.AppDest == "" {
+	if dir := c.appDestDir(); dir != "" {
+		return filepath.Join(dir, AppSockFile)
+	}
+	return ""
+}
+
+// appDestDir 返回应用 target 目录；两种来源都拿不到时返回空串。
+func (c *Config) appDestDir() string {
+	if d := strings.TrimSpace(c.AppDest); filepath.IsAbs(d) {
+		return d
+	}
+	// 回退到可执行文件目录。先解析软链：网关找的是真实 target 目录，
+	// 而不是软链所在的位置（fnOS 会在 /usr/local/bin 下建软链）。
+	exe, err := os.Executable()
+	if err != nil {
 		return ""
 	}
-	return filepath.Join(c.AppDest, AppSockFile)
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	dir := filepath.Dir(exe)
+	if dir == "" || dir == "." || dir == string(filepath.Separator) {
+		return ""
+	}
+	return dir
 }
 
 // ShareDir 返回面向用户的共享导出目录（fnOS data-share）。
