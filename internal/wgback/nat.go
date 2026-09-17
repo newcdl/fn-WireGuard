@@ -131,7 +131,7 @@ func parseIPNet(cidr string) (*net.IPNet, error) {
 }
 
 // syncNATLocked 让专用表里的规则（内网访问 + 设备间隔离）与全部连接的期望态一致。
-func (b *kernelBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOptions, diff *Diff) {
+func (b *linuxBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOptions, diff *Diff) {
 	plan, requested, isolateRequested := b.planNATLocked(specs)
 
 	if opts.DryRun {
@@ -219,7 +219,7 @@ func (b *kernelBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpt
 // 后两个返回值分别表示「是否有连接打开了内网访问开关」与「是否有连接打开了
 // 设备间隔离开关」。开关是用户意图，规则是否真的生效取决于环境条件，
 // 两者分开表达，界面才能说清卡在哪一层。
-func (b *kernelBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool, bool) {
+func (b *linuxBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool, bool) {
 	sources := []string{}
 	isoSources := []string{}
 	tunnels := []string{}
@@ -279,7 +279,7 @@ func specSubnets(s model.InterfaceSpec) []string {
 //	② 让内核自己做一次路由查询（UDP socket 不发送任何数据包），再把结果
 //	   源地址映射回网卡。有些环境里「默认路由」并不是一条 dst_len 为 0 的
 //	   条目（nexthop 对象、ip rule 策略路由），只有这步才问得出来真正的出口。
-func (b *kernelBackend) wanInterfacesLocked() ([]string, string) {
+func (b *linuxBackend) wanInterfacesLocked() ([]string, string) {
 	cands := b.routeWANCandidatesLocked()
 	wans, reason := PickWANs(cands)
 	if len(wans) > 0 {
@@ -295,7 +295,7 @@ func (b *kernelBackend) wanInterfacesLocked() ([]string, string) {
 }
 
 // routeWANCandidatesLocked 把路由表里的默认路由转成候选事实。
-func (b *kernelBackend) routeWANCandidatesLocked() []WANCandidate {
+func (b *linuxBackend) routeWANCandidatesLocked() []WANCandidate {
 	cands := []WANCandidate{}
 	for _, r := range defaultRoutesLocked() {
 		dev := routeDevName(r)
@@ -325,7 +325,7 @@ func hasResolvedWAN(cands []WANCandidate) bool {
 }
 
 // classifyWANLocked 把网卡名转成候选事实：是否是隧道、是否处于启用状态。
-func (b *kernelBackend) classifyWANLocked(name string, fromProbe bool) WANCandidate {
+func (b *linuxBackend) classifyWANLocked(name string, fromProbe bool) WANCandidate {
 	c := WANCandidate{Dev: name, Up: true, FromProbe: fromProbe}
 	if l, err := netlink.LinkByName(name); err == nil {
 		c.Up = l.Attrs().Flags&net.FlagUp != 0
@@ -449,7 +449,7 @@ func probeEgressDevLocked() string {
 }
 
 // hostNetworksLocked 返回主机上除本应用隧道之外的全部网段，用于冲突检测。
-func (b *kernelBackend) hostNetworksLocked() []string {
+func (b *linuxBackend) hostNetworksLocked() []string {
 	out := []string{}
 	links, err := netlink.LinkList()
 	if err != nil {
@@ -475,7 +475,7 @@ func (b *kernelBackend) hostNetworksLocked() []string {
 
 // ensureNATTableLocked 按决策重建专用表。
 // 表完全属于本应用，因此用「整表重建」保证结果确定，无需逐条跟踪。
-func (b *kernelBackend) ensureNATTableLocked(plan NATPlan) error {
+func (b *linuxBackend) ensureNATTableLocked(plan NATPlan) error {
 	c, err := nftConn()
 	if err != nil {
 		return err
@@ -621,7 +621,7 @@ func ipForwardEnabled() bool {
 // 系统自身的网络；装过 Docker 的机器上通常本来就是开着的。
 // 出于安全考虑，本应用只负责开启、不负责还原（关闭内网访问后仍保持开启），
 // 以免影响机器上其它依赖转发的服务。
-func (b *kernelBackend) ensureIPForward() (bool, error) {
+func (b *linuxBackend) ensureIPForward() (bool, error) {
 	if ipForwardEnabled() {
 		return false, nil
 	}
@@ -641,7 +641,7 @@ func (b *kernelBackend) ensureIPForward() (bool, error) {
 //   - 不会给任何其它来源的转发流量增加可达性。
 //
 // 规则带 UserData 标记，关闭开关时按标记精确删除，绝不误删系统自己的规则。
-func (b *kernelBackend) ensureSystemForwardLocked(c *nftables.Conn, plan NATPlan) error {
+func (b *linuxBackend) ensureSystemForwardLocked(c *nftables.Conn, plan NATPlan) error {
 	tables, err := c.ListTables()
 	if err != nil {
 		return nil // 读不到系统表就不额外处理，也不阻断内网访问本身
@@ -701,7 +701,7 @@ func (b *kernelBackend) ensureSystemForwardLocked(c *nftables.Conn, plan NATPlan
 // clearNATLocked 撤销本应用创建的全部内网访问痕迹：
 // 专用表整表删除 + 系统转发链里带标记的放行规则。
 // 返回是否真的删除过内容。
-func (b *kernelBackend) clearNATLocked() bool {
+func (b *linuxBackend) clearNATLocked() bool {
 	removed := false
 	if n, err := b.removeSystemForwardRules(); err == nil && n > 0 {
 		removed = true
@@ -713,7 +713,7 @@ func (b *kernelBackend) clearNATLocked() bool {
 }
 
 // removeNATTable 删除本应用专用表（连带其中所有链与规则）。
-func (b *kernelBackend) removeNATTable() (bool, error) {
+func (b *linuxBackend) removeNATTable() (bool, error) {
 	c, err := nftConn()
 	if err != nil {
 		return false, err
@@ -733,7 +733,7 @@ func (b *kernelBackend) removeNATTable() (bool, error) {
 }
 
 // removeSystemForwardRules 删除系统转发链里由本应用插入的放行规则（按 UserData 标记识别）。
-func (b *kernelBackend) removeSystemForwardRules() (int, error) {
+func (b *linuxBackend) removeSystemForwardRules() (int, error) {
 	c, err := nftConn()
 	if err != nil {
 		return 0, err
@@ -774,7 +774,7 @@ func (b *kernelBackend) removeSystemForwardRules() (int, error) {
 }
 
 // NATStatus 返回内网访问规则的实际状态。
-func (b *kernelBackend) NATStatus() model.NATStatus {
+func (b *linuxBackend) NATStatus() model.NATStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.natStatusLocked()
@@ -782,7 +782,7 @@ func (b *kernelBackend) NATStatus() model.NATStatus {
 
 // systemForwardPolicyDropLocked 判断系统的转发链是否会把本应用的转发流量丢掉。
 // 装过 Docker 的机器上 FORWARD 策略常常是 drop。
-func (b *kernelBackend) systemForwardPolicyDropLocked() bool {
+func (b *linuxBackend) systemForwardPolicyDropLocked() bool {
 	c, err := nftConn()
 	if err != nil {
 		return false
@@ -808,7 +808,7 @@ func (b *kernelBackend) systemForwardPolicyDropLocked() bool {
 }
 
 // natStatusLocked 汇总专用表的当前状态与逐项自检结果。
-func (b *kernelBackend) natStatusLocked() model.NATStatus {
+func (b *linuxBackend) natStatusLocked() model.NATStatus {
 	st := model.NATStatus{
 		Sources:              b.state.NATSources(),
 		WANs:                 b.state.NATWANs(),
@@ -863,7 +863,7 @@ func (b *kernelBackend) natStatusLocked() model.NATStatus {
 // 两类规则分别核对：内网访问写在 postrouting 链，设备隔离写在 forward 链。
 // 只核对其中一类的话，「隔离开着、内网访问关着」这种组合会被误判成规则丢失，
 // 于是每轮收敛都重建一次规则 —— 规则抖动正是之前花力气消除的问题。
-func (b *kernelBackend) rulesPresent(plan NATPlan) bool {
+func (b *linuxBackend) rulesPresent(plan NATPlan) bool {
 	if plan.Enable {
 		if n, err := b.natRuleCount(); err != nil || n == 0 {
 			return false
@@ -879,7 +879,7 @@ func (b *kernelBackend) rulesPresent(plan NATPlan) bool {
 
 // isoRuleCount 返回专用表转发链里「丢弃」类规则的条数，
 // 用来确认隔离规则确实落到内核里了（而不是只看表存不存在）。
-func (b *kernelBackend) isoRuleCount() (int, error) {
+func (b *linuxBackend) isoRuleCount() (int, error) {
 	c, err := nftConn()
 	if err != nil {
 		return 0, err
@@ -909,7 +909,7 @@ func (b *kernelBackend) isoRuleCount() (int, error) {
 }
 
 // natRuleCount 返回专用表里源地址改写链上的规则条数，用于确认规则确实落到内核里了。
-func (b *kernelBackend) natRuleCount() (int, error) {
+func (b *linuxBackend) natRuleCount() (int, error) {
 	c, err := nftConn()
 	if err != nil {
 		return 0, err
@@ -936,7 +936,7 @@ func (b *kernelBackend) natRuleCount() (int, error) {
 // 逐项列出来，用户就不必靠猜，也能直接告诉我们是哪一层出问题。
 //
 // 入参是已查好的状态（含内网访问与隔离两侧的事实），避免在这里重复读内核。
-func (b *kernelBackend) natChecksLocked(st model.NATStatus) []model.NATCheck {
+func (b *linuxBackend) natChecksLocked(st model.NATStatus) []model.NATCheck {
 	checks := []model.NATCheck{}
 
 	requested := b.state.NATSwitchOn()

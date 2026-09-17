@@ -207,7 +207,7 @@
         </el-descriptions-item>
         <el-descriptions-item label="工作模式">{{ backendLabel }}</el-descriptions-item>
         <el-descriptions-item label="加密网络支持">
-          <el-tag size="small" :type="health?.kernel_module ? 'success' : 'danger'" effect="plain">
+          <el-tag size="small" :type="kernelTagType" effect="plain">
             {{ health?.kernel_module ? '已开启' : '未开启' }}
           </el-tag>
         </el-descriptions-item>
@@ -228,8 +228,8 @@
         style="margin-top: 12px"
       />
       <div class="fnwg-explain">
-        <div><strong>加密网络支持</strong>：标准模式，速度最快、资源占用最低。显示「未开启」时新建的连接无法工作。</div>
-        <div><strong>兼容模式支持</strong>：内核不支持标准模式时的备选方案，速度稍慢，目前版本尚未启用。</div>
+        <div><strong>加密网络支持</strong>：标准模式，速度最快、资源占用最低。显示「未开启」时若兼容模式可用，会自动改用兼容模式。</div>
+        <div><strong>兼容模式支持</strong>：内核不支持标准模式时的备选方案，功能完整、速度与资源占用略逊；两项都不可用时新建的连接无法工作。</div>
       </div>
     </div>
   </div>
@@ -275,6 +275,12 @@ const netAlert = computed<{ type: 'success' | 'warning' | 'error'; title: string
 const backendLabel = computed(() => {
   const b = health.value?.backend
   return ({ kernel: '标准模式', userspace: '兼容模式', mock: '演示模式' } as Record<string, string>)[b || ''] || b || '-'
+})
+
+// 内核模块没开不等于「不可用」：兼容模式能顶上时是警告级，只有两条路都断了才是红色。
+const kernelTagType = computed(() => {
+  if (health.value?.kernel_module) return 'success'
+  return health.value?.tun_device ? 'warning' : 'danger'
 })
 
 const uptime = computed(() => {

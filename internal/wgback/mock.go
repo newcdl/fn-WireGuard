@@ -22,7 +22,7 @@ import (
 //     CI 的 runner 以非 root 运行，真实的 netlink 调用必然返回 operation not permitted。
 //
 // 因为第 2 条，本文件不限定平台：NewMock 在所有平台都可用，
-// 只有「默认后端是谁」按平台区分（Linux 用 kernelBackend，见 linux.go）。
+// 只有「默认后端是谁」按平台区分（Linux 用 linuxBackend，见 linux.go）。
 //
 // 它同样遵守安全契约：只操作自己创建过的接口，不做任何路由操作。
 type mockBackend struct {
