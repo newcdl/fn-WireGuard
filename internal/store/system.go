@@ -709,6 +709,14 @@ func (s *Store) AllSettings(ctx context.Context) (map[string]string, error) {
 
 // ---------------------------------------------------------------- 备份记录
 
+// 备份记录类型。快照与备份同表存放，靠该字段分流：
+// 备份列表只显示 manual/imported，快照列表只显示 auto。
+const (
+	BackupKindManual   = "manual"   // 用户主动创建的全量备份
+	BackupKindImported = "imported" // 用户从外部导入的备份文件
+	BackupKindAuto     = "auto"     // 关键配置操作前自动留下的配置快照
+)
+
 type BackupRecord struct {
 	ID         int64     `json:"id"`
 	Filename   string    `json:"filename"`
@@ -734,10 +742,30 @@ func (s *Store) CreateBackupRecord(ctx context.Context, r *BackupRecord) error {
 	return nil
 }
 
-// ListBackups 返回备份记录。
+// ListBackups 返回备份记录（含自动快照，调用方按 kind 自行区分）。
 func (s *Store) ListBackups(ctx context.Context) ([]BackupRecord, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id,filename,size,sha256,kind,note,include_key,created_at FROM backup_record ORDER BY id DESC`)
+	return s.ListBackupsByKind(ctx)
+}
+
+// ListBackupsByKind 按类型返回备份记录，结果按时间倒序。
+//
+// 快照（kind=auto）与用户备份共用 backup_record 表：前者只含配置、可随时回滚，
+// 后者是用户主动存档的全量备份。列表接口靠 kind 分流，
+// 否则每次改一条设备都会冒出一行快照，把真正的备份挤得看不见。
+// 不传 kinds 表示不限类型。
+func (s *Store) ListBackupsByKind(ctx context.Context, kinds ...string) ([]BackupRecord, error) {
+	query := `SELECT id,filename,size,sha256,kind,note,include_key,created_at FROM backup_record`
+	args := make([]any, 0, len(kinds))
+	if len(kinds) > 0 {
+		holders := make([]string, 0, len(kinds))
+		for _, k := range kinds {
+			holders = append(holders, "?")
+			args = append(args, k)
+		}
+		query += ` WHERE kind IN (` + strings.Join(holders, ",") + `)`
+	}
+	query += ` ORDER BY id DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

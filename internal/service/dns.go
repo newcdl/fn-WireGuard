@@ -28,6 +28,7 @@ func (s *Service) CreateDNSRecord(ctx context.Context, in DNSRecordInput, a Acto
 		return nil, err
 	}
 	r := &store.DNSRecord{Name: name, IP: ip, Note: strings.TrimSpace(in.Note)}
+	s.snapshotBefore(ctx, "dns.create", "新增内网域名「"+name+"」")
 	if err := s.Store.CreateDNSRecord(ctx, r); err != nil {
 		return nil, dnsWriteErr(err, name)
 	}
@@ -48,6 +49,7 @@ func (s *Service) UpdateDNSRecord(ctx context.Context, id int64, in DNSRecordInp
 	}
 	before := cur.Name + " → " + cur.IP
 	cur.Name, cur.IP, cur.Note = name, ip, strings.TrimSpace(in.Note)
+	s.snapshotBefore(ctx, "dns.update", "修改内网域名「"+name+"」")
 	if err := s.Store.UpdateDNSRecord(ctx, cur); err != nil {
 		return nil, dnsWriteErr(err, name)
 	}
@@ -62,6 +64,7 @@ func (s *Service) DeleteDNSRecord(ctx context.Context, id int64, a Actor) error 
 	if err != nil {
 		return fmt.Errorf("记录不存在，请刷新页面后重试")
 	}
+	s.snapshotBefore(ctx, "dns.delete", "删除内网域名「"+cur.Name+"」")
 	if err := s.Store.DeleteDNSRecord(ctx, id); err != nil {
 		return err
 	}

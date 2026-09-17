@@ -129,6 +129,7 @@ func (s *Service) CreateInterface(ctx context.Context, in CreateInterfaceInput, 
 	if err := s.validateInterface(ctx, it, 0); err != nil {
 		return nil, err
 	}
+	s.snapshotBefore(ctx, "iface.create", "新建连接「"+it.Name+"」")
 	if err := s.Store.CreateInterface(ctx, it); err != nil {
 		return nil, err
 	}
@@ -181,6 +182,7 @@ func (s *Service) UpdateInterface(ctx context.Context, id int64, in CreateInterf
 	if err := s.validateInterface(ctx, it, id); err != nil {
 		return nil, err
 	}
+	s.snapshotBefore(ctx, "iface.update", "修改连接「"+it.Name+"」")
 	if err := s.Store.UpdateInterface(ctx, it); err != nil {
 		return nil, err
 	}
@@ -196,6 +198,7 @@ func (s *Service) DeleteInterface(ctx context.Context, id int64, a Actor) error 
 	if err != nil {
 		return err
 	}
+	s.snapshotBefore(ctx, "iface.delete", "删除连接「"+it.Name+"」")
 	if err := s.Store.DeleteInterface(ctx, id); err != nil {
 		return err
 	}
@@ -218,6 +221,11 @@ func (s *Service) ToggleInterface(ctx context.Context, id int64, enabled bool, a
 	if enabled {
 		it.Autostart = true
 	}
+	note := "停用连接「" + it.Name + "」"
+	if enabled {
+		note = "启用连接「" + it.Name + "」"
+	}
+	s.snapshotBefore(ctx, "iface.toggle", note)
 	if err := s.Store.UpdateInterface(ctx, it); err != nil {
 		return err
 	}
@@ -240,6 +248,11 @@ func (s *Service) SetLanAccess(ctx context.Context, id int64, enabled bool, a Ac
 		return it, nil
 	}
 	it.AllowLAN = enabled
+	note := "关闭内网访问「" + it.Name + "」"
+	if enabled {
+		note = "开启内网访问「" + it.Name + "」"
+	}
+	s.snapshotBefore(ctx, "iface.lan_access", note)
 	if err := s.Store.UpdateInterface(ctx, it); err != nil {
 		return nil, err
 	}
@@ -269,6 +282,11 @@ func (s *Service) SetPeerIsolation(ctx context.Context, id int64, enabled bool, 
 		return it, nil
 	}
 	it.IsolatePeers = enabled
+	note := "关闭设备间隔离「" + it.Name + "」"
+	if enabled {
+		note = "开启设备间隔离「" + it.Name + "」"
+	}
+	s.snapshotBefore(ctx, "iface.isolate", note)
 	if err := s.Store.UpdateInterface(ctx, it); err != nil {
 		return nil, err
 	}
@@ -305,6 +323,7 @@ func (s *Service) RegenerateInterfaceKey(ctx context.Context, id int64, a Actor)
 		return "", err
 	}
 	it.PrivateKey = priv
+	s.snapshotBefore(ctx, "iface.rotate_key", "轮换连接密钥「"+it.Name+"」")
 	if err := s.Store.UpdateInterface(ctx, it); err != nil {
 		return "", err
 	}

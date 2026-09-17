@@ -206,6 +206,49 @@ export interface BackupRecord {
   created_at: string
 }
 
+/** 配置快照与当前配置之间的一处变化 */
+export interface SnapshotDiffItem {
+  key: string
+  name: string
+  /** 字段级差异说明；新增/删除时为空 */
+  details?: string[]
+}
+
+/** 一类对象的三组变化：新增 / 删除 / 修改 */
+export interface SnapshotDiffSection {
+  added: SnapshotDiffItem[]
+  removed: SnapshotDiffItem[]
+  changed: SnapshotDiffItem[]
+}
+
+/** 一条设置项变化（只给键名、不给取值，避免把凭据摊给只读账号） */
+export interface SnapshotSettingDiff {
+  key: string
+}
+
+/** 「快照 → 当前配置」的差异，用于回滚前确认会撤销什么 */
+export interface SnapshotDiff {
+  snapshot_id: number
+  filename: string
+  note: string
+  created_at: string
+  /** 一句话结论，形如「回滚将撤销：连接 +1 -0 ~0」 */
+  summary: string
+  /** 与当前配置完全一致 */
+  empty: boolean
+  interfaces: SnapshotDiffSection
+  peers: SnapshotDiffSection
+  dns: SnapshotDiffSection
+  settings: SnapshotSettingDiff[]
+}
+
+/** 手动留档结果：created=false 表示与最近一份快照一致，未重复留档 */
+export interface SnapshotCreateResult {
+  created: boolean
+  message?: string
+  item?: BackupRecord
+}
+
 /** 可配置的事件通知类型（由后端下发，避免前后端各维护一份清单） */
 export interface NotifyKind {
   kind: string

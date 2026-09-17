@@ -445,6 +445,84 @@
         </div>
       </el-tab-pane>
 
+      <!-- 配置快照与一键回滚 -->
+      <el-tab-pane label="配置快照" name="snapshot">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+          <template #title>
+            每次改动连接、设备、内网域名或系统设置前，系统会先自动留一份配置快照（不含账号密码）。
+            改坏了可以在这里看清「会撤销什么」，再一键回滚到那一刻。默认只保留最近
+            {{ snapshotKeep }} 份，超出的会从最旧的开始自动清理。
+          </template>
+        </el-alert>
+
+        <div class="fnwg-toolbar">
+          <el-button
+            v-if="session.can('backup.restore')"
+            type="primary"
+            :icon="Plus"
+            :loading="snapshotCreating"
+            @click="createSnapshot"
+          >
+            手动留档
+          </el-button>
+          <el-button :icon="Refresh" @click="loadSnapshots">刷新</el-button>
+          <div style="flex: 1"></div>
+          <span class="fnwg-hint">共 {{ snapshots.length }} 份 · 保留上限 {{ snapshotKeep }} 份</span>
+        </div>
+
+        <div v-if="!isMobile" class="fnwg-card">
+          <el-table :data="snapshots" size="small" empty-text="还没有配置快照，改动一次配置就会自动生成">
+            <el-table-column prop="filename" label="快照文件" min-width="240" />
+            <el-table-column label="大小" width="100">
+              <template #default="{ row }">{{ formatBytes(row.size) }}</template>
+            </el-table-column>
+            <el-table-column label="留档时间" width="180">
+              <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column prop="note" label="说明" min-width="200" />
+            <el-table-column label="操作" width="210">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="openDiff(row)">查看差异</el-button>
+                <el-button v-if="session.can('backup.restore')" link type="warning" @click="openDiff(row)">
+                  回滚
+                </el-button>
+                <el-button v-if="session.can('backup.restore')" link type="danger" @click="removeSnapshot(row)">
+                  删除
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-else>
+          <ItemCard v-for="row in snapshots" :key="row.id" :title="row.filename">
+            <template #extra>
+              <el-tag size="small" type="info" effect="plain">配置快照</el-tag>
+            </template>
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">留档时间</span>
+              <span class="fnwg-kv-val">{{ formatTime(row.created_at) }}</span>
+            </div>
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">大小</span>
+              <span class="fnwg-kv-val">{{ formatBytes(row.size) }}</span>
+            </div>
+            <div v-if="row.note" class="fnwg-kv">
+              <span class="fnwg-kv-key">说明</span>
+              <span class="fnwg-kv-val">{{ row.note }}</span>
+            </div>
+            <template #actions>
+              <el-button size="small" type="primary" @click="openDiff(row)">查看差异</el-button>
+              <el-button v-if="session.can('backup.restore')" size="small" @click="openDiff(row)">回滚</el-button>
+              <el-button v-if="session.can('backup.restore')" size="small" @click="removeSnapshot(row)">
+                删除
+              </el-button>
+            </template>
+          </ItemCard>
+          <div v-if="!snapshots.length" class="fnwg-empty">还没有配置快照</div>
+        </div>
+      </el-tab-pane>
+
       <!-- 关于 -->
       <el-tab-pane label="关于" name="about">
         <div class="fnwg-card" style="max-width: 760px">
@@ -523,6 +601,82 @@
       </template>
     </el-dialog>
 
+    <!-- 快照差异对比：把「回滚会撤销什么」摊开，确认后再回滚 -->
+    <el-dialog v-model="diffVisible" title="快照差异对比" :width="dialogWidth || '720px'">
+      <div v-if="diffLoading" class="fnwg-hint">正在比对差异…</div>
+      <template v-else-if="diff">
+        <el-alert
+          :type="diff.empty ? 'success' : 'warning'"
+          :closable="false"
+          show-icon
+          :title="diff.summary"
+          style="margin-bottom: 12px"
+        />
+        <div class="fnwg-hint" style="margin-bottom: 10px">
+          快照：{{ diff.note || diff.filename }} · {{ formatTime(diff.created_at) }}
+        </div>
+
+        <div class="fnwg-diff">
+          <div v-for="sec in diffSections" :key="sec.label" class="fnwg-diff-sec">
+            <div class="fnwg-diff-head">
+              <strong>{{ sec.label }}</strong>
+              <span class="fnwg-hint">
+                新增 {{ sec.added.length }} · 删除 {{ sec.removed.length }} · 修改 {{ sec.changed.length }}
+              </span>
+            </div>
+            <div
+              v-if="!sec.added.length && !sec.removed.length && !sec.changed.length"
+              class="fnwg-hint"
+            >
+              无变化
+            </div>
+            <div v-for="it in sec.added" :key="'a-' + it.key" class="fnwg-diff-item">
+              <el-tag size="small" type="success" effect="plain">新增</el-tag>
+              <span>{{ it.name }}</span>
+            </div>
+            <div v-for="it in sec.removed" :key="'r-' + it.key" class="fnwg-diff-item">
+              <el-tag size="small" type="danger" effect="plain">删除</el-tag>
+              <span>{{ it.name }}</span>
+            </div>
+            <div v-for="it in sec.changed" :key="'c-' + it.key" class="fnwg-diff-item">
+              <el-tag size="small" type="warning" effect="plain">修改</el-tag>
+              <div class="fnwg-diff-item-body">
+                <div>{{ it.name }}</div>
+                <div v-for="(d, i) in it.details || []" :key="i" class="fnwg-diff-detail">{{ d }}</div>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="diff.settings.length" class="fnwg-diff-sec">
+            <div class="fnwg-diff-head">
+              <strong>系统设置</strong>
+              <span class="fnwg-hint">{{ diff.settings.length }} 项变更（只显示键名）</span>
+            </div>
+            <div v-for="s in diff.settings" :key="'s-' + s.key" class="fnwg-diff-item">
+              <el-tag size="small" type="warning" effect="plain">修改</el-tag>
+              <span class="fnwg-mono">{{ s.key }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="fnwg-hint" style="margin-top: 10px">
+          回滚只恢复连接、设备、内网域名与设置项，不会回退账号密码与二次验证；回滚前会自动为当前状态留一份快照。
+        </div>
+      </template>
+
+      <template #footer>
+        <el-button @click="diffVisible = false">关闭</el-button>
+        <el-button
+          v-if="diff && !diff.empty && session.can('backup.restore')"
+          type="warning"
+          :loading="rollingBack"
+          @click="confirmRollback"
+        >
+          确认回滚到这份快照
+        </el-button>
+      </template>
+    </el-dialog>
+
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
@@ -532,7 +686,16 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Upload, Reading, Refresh } from '@element-plus/icons-vue'
 import { api, download, postRaw } from '@/api/client'
-import type { BackupRecord, DNSRecord, Health, NotifyResult, NotifyStatus, User } from '@/api/types'
+import type {
+  BackupRecord,
+  DNSRecord,
+  Health,
+  NotifyResult,
+  NotifyStatus,
+  SnapshotDiff,
+  SnapshotDiffSection,
+  User,
+} from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import SecurityCodeBlock from '@/components/SecurityCodeBlock.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
@@ -580,6 +743,29 @@ const backups = ref<BackupRecord[]>([])
 const shareDir = ref('')
 const backupFileInput = ref<HTMLInputElement | null>(null)
 
+// 配置快照：关键改动前自动留档，可看差异、可一键回滚。
+const snapshots = ref<BackupRecord[]>([])
+const snapshotKeep = ref(50)
+const snapshotCreating = ref(false)
+const diffVisible = ref(false)
+const diffLoading = ref(false)
+const diff = ref<SnapshotDiff | null>(null)
+const rollingBack = ref(false)
+
+/**
+ * 差异分组：把后端按对象类型给的三个小段拼成便于渲染的列表。
+ * 空段也保留，好让用户看到「这一类无变化」，而不是以为漏了什么。
+ */
+const diffSections = computed<(SnapshotDiffSection & { label: string })[]>(() => {
+  const d = diff.value
+  if (!d) return []
+  return [
+    { label: '连接', ...d.interfaces },
+    { label: '设备', ...d.peers },
+    { label: '内网域名', ...d.dns },
+  ]
+})
+
 // 内网域名解析：开关走设置项，记录走独立接口；
 // 运行状态复用全局体检的同一份数据，避免「设置页说正常、维护页说异常」。
 const dnsEnabled = ref(false)
@@ -622,6 +808,7 @@ async function loadAll() {
   await loadHealth()
   if (session.isAdmin) await loadUsers()
   await loadBackups()
+  await loadSnapshots()
   await loadDNS()
   void refreshSystemHealth()
 }
@@ -779,6 +966,99 @@ async function loadBackups() {
     shareDir.value = data.share_dir || ''
   } catch {
     /* 忽略 */
+  }
+}
+
+async function loadSnapshots() {
+  try {
+    const data = await api.get<{ items: BackupRecord[]; keep: number }>('/snapshots')
+    snapshots.value = data.items || []
+    snapshotKeep.value = data.keep || 50
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 手动留档。
+ *
+ * 若当前配置与最近一份快照一致，后端不会重复落盘（否则连点几次会堆出一串同样的文件），
+ * 此时要如实告诉用户「这次没留下新的」，而不是让他以为存了、回头却找不到。
+ */
+async function createSnapshot() {
+  let note = ''
+  try {
+    const r = await ElMessageBox.prompt('给这份快照写个说明（可留空）', '手动留档', { inputValue: '' })
+    note = r.value
+  } catch {
+    return
+  }
+  snapshotCreating.value = true
+  try {
+    const res = await api.post<{ created: boolean; message?: string }>('/snapshots', { note })
+    if (res.created) ElMessage.success('已留档')
+    else ElMessage.info(res.message || '当前配置与最近一份快照一致，未重复留档')
+    await loadSnapshots()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    snapshotCreating.value = false
+  }
+}
+
+/** 查看快照与当前配置的差异；回滚的确认按钮也在这个弹窗里，先看清再决定。 */
+async function openDiff(row: BackupRecord) {
+  diff.value = null
+  diffVisible.value = true
+  diffLoading.value = true
+  try {
+    diff.value = await api.get<SnapshotDiff>(`/snapshots/${row.id}/diff`)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+    diffVisible.value = false
+  } finally {
+    diffLoading.value = false
+  }
+}
+
+/** 确认回滚：用差异结论做二次确认，回滚后刷新全部数据与系统自检。 */
+async function confirmRollback() {
+  const d = diff.value
+  if (!d) return
+  try {
+    await ElMessageBox.confirm(
+      `${d.summary}。\n\n` +
+        '回滚会覆盖当前的连接、设备、内网域名与设置项，并立即下发到内核。\n' +
+        '账号密码与二次验证不受影响；回滚前会自动为当前状态留一份快照，滚错了还能再滚回来。\n\n确认回滚？',
+      '回滚配置',
+      { type: 'warning', confirmButtonText: '确认回滚', cancelButtonText: '再想想' },
+    )
+  } catch {
+    return
+  }
+  rollingBack.value = true
+  try {
+    const res = await api.post<{ restored_interfaces: number }>(`/snapshots/${d.snapshot_id}/rollback`)
+    ElMessage.success(`已回滚 ${res.restored_interfaces} 条连接`)
+    diffVisible.value = false
+    await loadAll()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    rollingBack.value = false
+  }
+}
+
+async function removeSnapshot(row: BackupRecord) {
+  try {
+    await ElMessageBox.confirm(`确认删除快照「${row.filename}」？删除后无法再用它回滚。`, '删除快照', {
+      type: 'warning',
+    })
+    await api.del(`/snapshots/${row.id}`)
+    ElMessage.success('已删除')
+    await loadSnapshots()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error((e as Error).message)
   }
 }
 
@@ -1025,6 +1305,51 @@ onMounted(async () => {
   color: var(--el-text-color-regular);
   line-height: 1.9;
   font-size: 13.5px;
+}
+
+/* 快照差异：分段列出新增/删除/修改，改动详情缩进显示便于扫读 */
+.fnwg-diff {
+  max-height: 52vh;
+  overflow-y: auto;
+}
+
+.fnwg-diff-sec {
+  padding: 8px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.fnwg-diff-sec:first-child {
+  border-top: none;
+}
+
+.fnwg-diff-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.fnwg-diff-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.fnwg-diff-item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.fnwg-diff-detail {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  padding-left: 2px;
 }
 
 </style>

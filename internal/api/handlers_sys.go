@@ -697,7 +697,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------- 备份
 
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
-	items, err := s.svc.ListBackups(r.Context())
+	items, err := s.svc.ListUserBackups(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

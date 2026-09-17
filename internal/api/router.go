@@ -111,6 +111,15 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.With(requirePerm(model.PermBackupRestore)).Delete("/backups/{id}", s.handleDeleteBackup)
 			r.With(requirePerm(model.PermBackupRestore)).Post("/backups/{id}/restore", s.handleRestoreBackup)
 
+			// 配置快照与一键回滚：关键改动前自动留档，可看差异、可整体回滚。
+			// 查看类接口对所有登录用户开放（与备份列表一致）；
+			// 留档/回滚/删除会改动线上配置，需要备份还原权限。
+			r.Get("/snapshots", s.handleListSnapshots)
+			r.With(requirePerm(model.PermBackupRestore)).Post("/snapshots", s.handleCreateSnapshot)
+			r.Get("/snapshots/{id}/diff", s.handleSnapshotDiff)
+			r.With(requirePerm(model.PermBackupRestore)).Post("/snapshots/{id}/rollback", s.handleRollbackSnapshot)
+			r.With(requirePerm(model.PermBackupRestore)).Delete("/snapshots/{id}", s.handleDeleteSnapshot)
+
 			// 内网域名解析（设备用主机名访问家里设备）
 			r.Get("/dns/records", s.handleListDNSRecords)
 			r.With(requirePerm(model.PermIfaceWrite)).Post("/dns/records", s.handleCreateDNSRecord)

@@ -26,6 +26,14 @@ import (
 // 「创建接口失败: operation not permitted」。
 func newTestEnv(t *testing.T) (*service.Service, *store.Store) {
 	t.Helper()
+	svc, st, _ := newTestEnvWithDir(t)
+	return svc, st
+}
+
+// newTestEnvWithDir 与 newTestEnv 相同，但额外返回共享目录。
+// 配置快照要落盘到共享目录，测试需要显式 svc.SetSnapshotDir(dir) 才会启用自动留档。
+func newTestEnvWithDir(t *testing.T) (*service.Service, *store.Store, string) {
+	t.Helper()
 	dir := t.TempDir()
 	box, err := secretbox.New(make([]byte, 32))
 	if err != nil {
@@ -41,7 +49,7 @@ func newTestEnv(t *testing.T) (*service.Service, *store.Store) {
 	backend := wgback.NewMock(filepath.Join(dir, "netstate.json"))
 	engine := reconcile.New(st, backend, logger)
 	svc := service.New(st, core.NewLocal(engine), logger, "test")
-	return svc, st
+	return svc, st, dir
 }
 
 func TestInterfaceAndPeerLifecycle(t *testing.T) {

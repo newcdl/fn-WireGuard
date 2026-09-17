@@ -73,6 +73,11 @@ type PeerInput struct {
 
 // CreatePeer 新增节点。
 func (s *Service) CreatePeer(ctx context.Context, in PeerInput, a Actor) (*model.Peer, error) {
+	note := "新增设备"
+	if n := strings.TrimSpace(in.Name); n != "" {
+		note += "「" + n + "」"
+	}
+	s.snapshotBefore(ctx, "peer.create", note)
 	p, err := s.createPeer(ctx, in, a)
 	if err != nil {
 		return nil, err
@@ -197,6 +202,8 @@ func (s *Service) ImportPeers(ctx context.Context, ifaceID int64, rows []PeerImp
 	if _, err := s.Store.GetInterface(ctx, ifaceID); err != nil {
 		return nil, fmt.Errorf("所选连接不存在，请刷新页面后重试")
 	}
+	// 整批只留一份快照：循环里每台都留一次，500 台的导入会生成 500 份全量文件。
+	s.snapshotBefore(ctx, "peer.import", fmt.Sprintf("批量导入设备（%d 台）", len(rows)))
 	res := &PeerImportResult{Items: make([]PeerImportItem, 0, len(rows))}
 	for i, r := range rows {
 		name := strings.TrimSpace(r.Name)
@@ -287,6 +294,7 @@ func (s *Service) UpdatePeer(ctx context.Context, id int64, in PeerInput, a Acto
 	if err := s.validatePeer(ctx, p, id); err != nil {
 		return nil, err
 	}
+	s.snapshotBefore(ctx, "peer.update", "修改设备「"+p.Name+"」")
 	if err := s.Store.UpdatePeer(ctx, p); err != nil {
 		return nil, err
 	}
@@ -303,6 +311,7 @@ func (s *Service) DeletePeer(ctx context.Context, id int64, a Actor) error {
 	if err != nil {
 		return err
 	}
+	s.snapshotBefore(ctx, "peer.delete", "删除设备「"+p.Name+"」")
 	if err := s.Store.DeletePeer(ctx, id); err != nil {
 		return err
 	}
@@ -327,6 +336,7 @@ func (s *Service) BatchPeers(ctx context.Context, req BatchPeerRequest, a Actor)
 	if len(req.IDs) == 0 {
 		return "", fmt.Errorf("请先勾选要操作的设备")
 	}
+	s.snapshotBefore(ctx, "peer.batch_"+req.Action, batchPeerActionNote(req.Action, len(req.IDs)))
 	switch req.Action {
 	case "enable", "disable":
 		n, err := s.Store.BatchSetPeerEnabled(ctx, req.IDs, req.Action == "enable")

@@ -40,6 +40,9 @@ type loginFail struct {
 
 // NewServer 创建 API 服务。
 func NewServer(svc *service.Service, logger *slog.Logger, version, shareDir string) *Server {
+	// 配置快照与备份共用共享目录：那里已经被应用中心授予了组读写权限，
+	// 另开子目录还得再走一遍权限自愈，不如同目录、靠文件名前缀区分。
+	svc.SetSnapshotDir(shareDir)
 	return &Server{
 		svc:        svc,
 		log:        logger,

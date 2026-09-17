@@ -56,6 +56,7 @@ func (s *Service) ImportConf(ctx context.Context, text, nameOverride string, a A
 	if err := s.validateInterface(ctx, it, 0); err != nil {
 		return nil, 0, err
 	}
+	s.snapshotBefore(ctx, "config.import", "导入配置「"+it.Name+"」")
 	if err := s.Store.CreateInterface(ctx, it); err != nil {
 		return nil, 0, err
 	}
@@ -137,7 +138,7 @@ type BackupUser struct {
 	Status       int    `json:"status"` // 1 启用 0 禁用
 }
 
-// BackupPayload 是备份文件内容（全量：连接、设备、设置、账号与密钥）。
+// BackupPayload 是备份文件内容（全量：连接、设备、设置、内网域名、账号与密钥）。
 type BackupPayload struct {
 	Version    string            `json:"version"`
 	CreatedAt  time.Time         `json:"created_at"`
@@ -146,18 +147,30 @@ type BackupPayload struct {
 	Peers      []model.Peer      `json:"peers"`
 	Settings   map[string]string `json:"settings"`
 	Users      []BackupUser      `json:"users"`
+	// HasDNSRecords 标记这份文件是否带有内网域名段。
+	//
+	// 老备份没有这个字段，此时绝不能把 dns_record 表清空——
+	// 否则「从旧备份还原」会顺手删掉用户后来加的域名映射，
+	// 而备份里根本没这些东西，等于凭空丢配置。只有明确带段落的新文件才覆盖。
+	HasDNSRecords bool              `json:"has_dns_records,omitempty"`
+	DNSRecords    []store.DNSRecord `json:"dns_records,omitempty"`
 }
 
-// CreateBackup 生成全量备份并落盘到共享目录。
+// buildBackupPayload 采集当前配置生成备份内容。
 //
-// 全量意味着：连接私钥、设备预共享密钥与代管私钥、全部设置、全部账号
-// （含管理员密码哈希与 TOTP 密钥）一并写入，还原时能原样恢复。
-func (s *Service) CreateBackup(ctx context.Context, dir, note string, a Actor) (*store.BackupRecord, error) {
+// includeUsers 控制是否带上账号（含密码哈希与 TOTP 密钥）：
+//   - 全量备份为 true，还原后管理员密码与二次验证状态都能回来；
+//   - 配置快照为 false，回滚配置时不会顺带把账号安全设置退回旧值。
+//
+// 运行时字段（上下线、实时速率、握手时间、派生的公钥等）一律清零：
+// 它们每几秒就变，混进文件不仅让快照无法做「内容相同即跳过」的去重，
+// 还会让快照之间的差异对比全是噪声。
+func (s *Service) buildBackupPayload(ctx context.Context, includeUsers bool) (*BackupPayload, error) {
 	ifaces, err := s.Store.ListInterfaces(ctx)
 	if err != nil {
 		return nil, err
 	}
-	payload := BackupPayload{
+	payload := &BackupPayload{
 		Version:    s.Version,
 		CreatedAt:  time.Now(),
 		IncludeKey: true,
@@ -172,12 +185,32 @@ func (s *Service) CreateBackup(ctx context.Context, dir, note string, a Actor) (
 	payload.Settings = settings
 	for _, it := range ifaces {
 		it.Revision = 0
+		it.PublicKey, it.Backend = "", ""
+		it.Up, it.PeerCount, it.PeerOnline = false, 0, 0
+		it.RxBytes, it.TxBytes, it.RxRate, it.TxRate = 0, 0, 0, 0
 		payload.Interfaces = append(payload.Interfaces, it)
 		peers, err := s.Store.ListPeers(ctx, it.ID)
 		if err != nil {
 			continue
 		}
+		for i := range peers {
+			peers[i].Online = false
+			peers[i].LastHandshake = time.Time{}
+			peers[i].Endpoint = ""
+			peers[i].RxBytes, peers[i].TxBytes = 0, 0
+			peers[i].RxRate, peers[i].TxRate = 0, 0
+			peers[i].ConfigStale = false
+		}
 		payload.Peers = append(payload.Peers, peers...)
+	}
+	// 内网域名映射同样属于「配置」：不回滚它，就会出现「配置已回到过去，
+	// 但设备用主机名访问的地址还是三天前那一版」这种半回滚状态。
+	if recs, err := s.Store.ListDNSRecords(ctx); err == nil {
+		payload.HasDNSRecords = true
+		payload.DNSRecords = recs
+	}
+	if !includeUsers {
+		return payload, nil
 	}
 	users, err := s.Store.ListUsers(ctx)
 	if err != nil {
@@ -191,6 +224,18 @@ func (s *Service) CreateBackup(ctx context.Context, dir, note string, a Actor) (
 			Role:         u.Role,
 			Status:       u.Status,
 		})
+	}
+	return payload, nil
+}
+
+// CreateBackup 生成全量备份并落盘到共享目录。
+//
+// 全量意味着：连接私钥、设备预共享密钥与代管私钥、全部设置、内网域名、全部账号
+// （含管理员密码哈希与 TOTP 密钥）一并写入，还原时能原样恢复。
+func (s *Service) CreateBackup(ctx context.Context, dir, note string, a Actor) (*store.BackupRecord, error) {
+	payload, err := s.buildBackupPayload(ctx, true)
+	if err != nil {
+		return nil, err
 	}
 	raw, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -209,7 +254,7 @@ func (s *Service) CreateBackup(ctx context.Context, dir, note string, a Actor) (
 		Filename:   filename,
 		Size:       int64(len(raw)),
 		SHA256:     hex.EncodeToString(sum[:]),
-		Kind:       "manual",
+		Kind:       store.BackupKindManual,
 		Note:       note,
 		IncludeKey: true,
 	}
@@ -294,7 +339,7 @@ func (s *Service) ImportBackup(ctx context.Context, dir string, raw []byte, file
 		Filename:   name,
 		Size:       int64(len(raw)),
 		SHA256:     hex.EncodeToString(sum[:]),
-		Kind:       "imported",
+		Kind:       store.BackupKindImported,
 		Note:       note,
 		IncludeKey: payload.IncludeKey,
 	}
@@ -305,11 +350,11 @@ func (s *Service) ImportBackup(ctx context.Context, dir string, raw []byte, file
 	return rec, nil
 }
 
-// RestoreBackup 从备份文件全量恢复（覆盖式）：连接、设备、设置与账号一并还原。
-func (s *Service) RestoreBackup(ctx context.Context, dir string, id int64, a Actor) (int, error) {
+// LoadBackupPayload 读取备份文件内容（不落任何改动），供还原与差异对比使用。
+func (s *Service) LoadBackupPayload(ctx context.Context, dir string, id int64) (*BackupPayload, *store.BackupRecord, error) {
 	recs, err := s.Store.ListBackups(ctx)
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	var target *store.BackupRecord
 	for i := range recs {
@@ -319,16 +364,50 @@ func (s *Service) RestoreBackup(ctx context.Context, dir string, id int64, a Act
 		}
 	}
 	if target == nil {
-		return 0, fmt.Errorf("备份记录不存在")
+		return nil, nil, fmt.Errorf("记录不存在")
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, target.Filename))
 	if err != nil {
-		return 0, fmt.Errorf("读取备份文件失败: %w", err)
+		return nil, nil, fmt.Errorf("读取文件失败: %w", err)
 	}
 	var payload BackupPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return 0, fmt.Errorf("备份文件格式错误: %w", err)
+		return nil, nil, fmt.Errorf("文件格式错误: %w", err)
 	}
+	return &payload, target, nil
+}
+
+// ListUserBackups 返回用户可见的备份（manual/imported），不含自动快照。
+//
+// 自动快照每次改配置都会新增一条，混进备份列表会把用户自己存的那几份顶到看不见的地方，
+// 所以两个列表各自分流：备份页只看备份，快照页只看快照。
+func (s *Service) ListUserBackups(ctx context.Context) ([]store.BackupRecord, error) {
+	return s.Store.ListBackupsByKind(ctx, store.BackupKindManual, store.BackupKindImported)
+}
+
+// RestoreBackup 从备份文件全量恢复（覆盖式）：连接、设备、设置、内网域名与账号一并还原。
+func (s *Service) RestoreBackup(ctx context.Context, dir string, id int64, a Actor) (int, error) {
+	payload, target, err := s.LoadBackupPayload(ctx, dir, id)
+	if err != nil {
+		return 0, err
+	}
+	// 还原是破坏性操作，先给当前状态留一份快照：还原错了还能滚回来。
+	s.snapshotBefore(ctx, "backup.restore", "还原备份前："+target.Filename)
+	n, err := s.applyBackupPayload(ctx, payload, true)
+	if err != nil {
+		return n, err
+	}
+	s.audit(ctx, a, "backup.restore", "backup", fmt.Sprint(id), "", fmt.Sprint(n), "ok", target.Filename)
+	_ = s.reconcile(ctx)
+	return n, nil
+}
+
+// applyBackupPayload 把备份内容覆盖式写入数据库，返回恢复的接口数量。
+//
+// restoreAccounts 为假时不动账号：配置快照回滚走的就是这条路。
+// 「回滚配置」若顺带把管理员密码、二次验证密钥退回旧值，那不是恢复而是安全倒退
+// ——旧快照里的密码可能早已因为泄露而改掉。
+func (s *Service) applyBackupPayload(ctx context.Context, payload *BackupPayload, restoreAccounts bool) (int, error) {
 	if _, err := s.Store.DB().ExecContext(ctx, `DELETE FROM wg_interface`); err != nil {
 		return 0, err
 	}
@@ -372,17 +451,41 @@ func (s *Service) RestoreBackup(ctx context.Context, dir string, id int64, a Act
 			continue
 		}
 		if err := s.Store.SetSetting(ctx, k, v); err != nil {
-			return 0, fmt.Errorf("恢复设置 %s 失败: %w", k, err)
+			return n, fmt.Errorf("恢复设置 %s 失败: %w", k, err)
 		}
+	}
+	if payload.HasDNSRecords {
+		if err := s.replaceDNSRecords(ctx, payload.DNSRecords); err != nil {
+			return n, fmt.Errorf("恢复内网域名失败: %w", err)
+		}
+	}
+	if !restoreAccounts {
+		return n, nil
 	}
 	// 恢复账号（含管理员密码哈希与 TOTP）。
 	// 账号恢复失败不应阻断网络配置恢复，但必须留痕，否则用户以为密码已经还原、实则没有。
 	if err := s.restoreUsers(ctx, payload.Users); err != nil {
 		_ = s.Store.AddLog(ctx, "warn", "backup", "备份还原时账号恢复失败", err.Error())
 	}
-	s.audit(ctx, a, "backup.restore", "backup", fmt.Sprint(id), "", fmt.Sprint(n), "ok", target.Filename)
-	_ = s.reconcile(ctx)
 	return n, nil
+}
+
+// replaceDNSRecords 用给定记录整体替换内网域名表（覆盖式回滚语义）。
+func (s *Service) replaceDNSRecords(ctx context.Context, recs []store.DNSRecord) error {
+	if _, err := s.Store.DB().ExecContext(ctx, `DELETE FROM dns_record`); err != nil {
+		return err
+	}
+	for _, r := range recs {
+		src := r
+		src.ID = 0
+		if strings.TrimSpace(src.Name) == "" {
+			continue
+		}
+		if err := s.Store.CreateDNSRecord(ctx, &src); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // restoreUsers 按备份恢复账号。按用户名 upsert：同名的走 UPDATE（保留主键，
