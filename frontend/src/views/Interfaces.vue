@@ -373,8 +373,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Upload, Download, Refresh, ArrowDown, Reading } from '@element-plus/icons-vue'
 import { api, download } from '@/api/client'
@@ -391,6 +391,7 @@ import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes } from '@/utils/format'
 
+const route = useRoute()
 const router = useRouter()
 const session = useSession()
 const realtime = useRealtime()
@@ -689,5 +690,19 @@ function gotoPeers(row: WgInterface) {
   router.push({ name: 'peers', query: { iface: String(row.id) } })
 }
 
-onMounted(load)
+/** 从全局搜索跳转过来时自动打开目标连接 */
+function openFromQuery() {
+  const edit = route.query.edit
+  if (!edit) return
+  const target = list.value.find((it) => it.id === Number(edit))
+  if (target) openEdit(target)
+}
+
+onMounted(async () => {
+  await load()
+  openFromQuery()
+})
+
+// 页面已挂载时再次从搜索跳过来（query 变化不会再触发 onMounted），需要单独监听
+watch(() => route.query.edit, () => openFromQuery())
 </script>

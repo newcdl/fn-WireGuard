@@ -73,6 +73,20 @@ type PeerInput struct {
 
 // CreatePeer 新增节点。
 func (s *Service) CreatePeer(ctx context.Context, in PeerInput, a Actor) (*model.Peer, error) {
+	p, err := s.createPeer(ctx, in, a)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.reconcile(ctx)
+	return p, nil
+}
+
+// createPeer 落库一台设备，但**不触发收敛**。
+//
+// 单台创建走 CreatePeer（落库后立即收敛）。批量导入则逐条调用本函数、
+// 最后统一收敛一次：否则 100 台设备会触发 100 次全量收敛，既慢又会把
+// 收敛循环搅乱（这正是 V6「导入 100 台 ≤ 10 秒」能否达成的关键）。
+func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model.Peer, error) {
 	it, err := s.Store.GetInterface(ctx, in.InterfaceID)
 	if err != nil {
 		return nil, fmt.Errorf("所选连接不存在，请刷新页面后重试")
@@ -141,8 +155,89 @@ func (s *Service) CreatePeer(ctx context.Context, in PeerInput, a Actor) (*model
 	}
 	p.InterfaceName = it.Name
 	s.audit(ctx, a, "peer.create", "peer", fmt.Sprint(p.ID), "", p.Name, "ok", "")
-	_ = s.reconcile(ctx)
 	return p, nil
+}
+
+// PeerImportRow 是批量导入里的一台设备。
+type PeerImportRow struct {
+	Name      string `json:"name"`
+	PublicKey string `json:"public_key"`
+	Remark    string `json:"remark"`
+	GroupTag  string `json:"group_tag"`
+}
+
+// PeerImportItem 是单台设备的导入结果（逐条回传成功或失败原因）。
+type PeerImportItem struct {
+	Index  int    `json:"index"`
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
+	PeerID int64  `json:"peer_id,omitempty"`
+}
+
+// PeerImportResult 是批量导入汇总。
+type PeerImportResult struct {
+	Created int              `json:"created"`
+	Failed  int              `json:"failed"`
+	Items   []PeerImportItem `json:"items"`
+}
+
+// ImportPeers 批量创建设备：逐条创建并汇总结果，最后统一收敛一次。
+//
+// 与「一次导入整份 wg-quick 配置」不同：这里导入的是**已有的连接下的多台设备**，
+// 且必须逐条给出成功/失败明细 —— 重复识别码、格式非法等问题要能定位到具体哪一行，
+// 否则用户面对一堆设备根本不知道该改哪一台。
+func (s *Service) ImportPeers(ctx context.Context, ifaceID int64, rows []PeerImportRow, a Actor) (*PeerImportResult, error) {
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("没有可导入的设备")
+	}
+	if len(rows) > 500 {
+		return nil, fmt.Errorf("单次最多导入 500 台设备，当前 %d 台，请分批导入", len(rows))
+	}
+	if _, err := s.Store.GetInterface(ctx, ifaceID); err != nil {
+		return nil, fmt.Errorf("所选连接不存在，请刷新页面后重试")
+	}
+	res := &PeerImportResult{Items: make([]PeerImportItem, 0, len(rows))}
+	for i, r := range rows {
+		name := strings.TrimSpace(r.Name)
+		item := PeerImportItem{Index: i, Name: name}
+		if name == "" {
+			item.Error = "缺少设备名称"
+			res.Failed++
+			res.Items = append(res.Items, item)
+			continue
+		}
+		pub := strings.TrimSpace(r.PublicKey)
+		p, err := s.createPeer(ctx, PeerInput{
+			InterfaceID: ifaceID,
+			Name:        name,
+			PublicKey:   pub,
+			Remark:      strings.TrimSpace(r.Remark),
+			GroupTag:    strings.TrimSpace(r.GroupTag),
+			Keepalive:   25,
+			Enabled:     true,
+			AutoAddress: true,
+			// 没给识别码的就自动生成密钥对（等同于在界面点「自动生成」）
+			GenerateKeys: pub == "",
+			GeneratePSK:  true,
+		}, a)
+		if err != nil {
+			item.Error = err.Error()
+			res.Failed++
+		} else {
+			item.OK = true
+			item.PeerID = p.ID
+			item.Name = p.Name
+			res.Created++
+		}
+		res.Items = append(res.Items, item)
+	}
+	if res.Created > 0 {
+		_ = s.reconcile(ctx)
+	}
+	s.audit(ctx, a, "peer.import", "peer", fmt.Sprint(ifaceID), "",
+		fmt.Sprintf("成功 %d / 失败 %d", res.Created, res.Failed), "ok", "")
+	return res, nil
 }
 
 // UpdatePeer 更新节点。
@@ -328,7 +423,7 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		ClientPrivateKey: p.ClientPrivateKey,
 		ClientAddress:    clientAddrs,
 		AllowedIPs:       clientAllowed,
-		DNS:              it.DNS,
+		DNS:              s.clientDNS(ctx, it),
 		MTU:              it.MTU,
 		Keepalive:        p.Keepalive,
 	})
@@ -338,7 +433,7 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		Endpoint:    endpoint,
 		ClientAddrs: clientAddrs,
 		AllowedIPs:  clientAllowed,
-		DNS:         it.DNS,
+		DNS:         s.clientDNS(ctx, it),
 		MTU:         it.MTU,
 		Keepalive:   p.Keepalive,
 		ServerPub:   serverPub,
@@ -357,6 +452,24 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		QRPayload:       conf,
 		Warning:         warn,
 	}, nil
+}
+
+// clientDNS 返回下发给设备的 DNS 服务器地址。
+//
+// 打开了「内网域名解析」时，设备必须把 NAS 当作解析器，否则它解析不了家里设备名：
+// 此时下发的是**本连接的隧道地址**，而连接里配置的 DNS 变成本应用解析器的上游。
+// 关闭时保持原样（下发连接里配置的 DNS），行为与升级前完全一致。
+func (s *Service) clientDNS(ctx context.Context, it *model.Interface) []string {
+	if s.Store.GetSetting(ctx, model.SettingDNSResolve, "") != "1" {
+		return it.DNS
+	}
+	for _, a := range it.Addresses {
+		if ip, _, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil && ip.To4() != nil {
+			return []string{ip.String()}
+		}
+	}
+	// 没有可用的 IPv4 隧道地址时退回原值：宁可不生效，也不要下发一个设备连不上的地址
+	return it.DNS
 }
 
 // clientAllowedIPs 生成客户端侧的通行范围（决定设备上哪些流量走隧道）。

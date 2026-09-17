@@ -229,6 +229,20 @@ const issues = computed<HealthIssue[]>(() => {
     })
   }
 
+  // ⑨ 内网域名解析：开关开着但解析服务没起来（连接未启用、绑定失败等）。
+  //    现象是「设备解析不了名字」，不主动说用户根本查不出来。
+  const dnss = n?.dns
+  if (dnss?.enabled && !(dnss.listen || []).length) {
+    out.push({
+      key: 'dns',
+      level: 'warning',
+      title: '「内网域名解析」已开启，但还没真正生效',
+      detail: dnss.note || '当前没有可用的隧道地址：请确认至少有一条连接已启用并正常工作。',
+      fix: '确认连接已启用且正常工作；本应用每 10 秒会自动重试，也可到「系统维护」点「立即应用」。',
+      to: 'settings',
+    })
+  }
+
   return out
 })
 

@@ -172,6 +172,18 @@ CREATE TABLE IF NOT EXISTS backup_record (
   include_key INTEGER NOT NULL DEFAULT 0,
   created_at TEXT    NOT NULL
 );
+
+-- 内网域名解析：用户维护的「主机名 → 家里设备地址」对照表。
+-- name 统一以小写去重（DNS 大小写不敏感），ip 目前只支持 IPv4。
+CREATE TABLE IF NOT EXISTS dns_record (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT    NOT NULL,
+  ip         TEXT    NOT NULL,
+  note       TEXT    NOT NULL DEFAULT '',
+  created_at TEXT    NOT NULL,
+  updated_at TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dns_name ON dns_record(name);
 `
 
 func (s *Store) migrate() error {

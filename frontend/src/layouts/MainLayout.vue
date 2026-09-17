@@ -36,7 +36,11 @@
           <span class="fnwg-header-title">{{ title }}</span>
         </div>
 
-        <div style="display: flex; align-items: center; gap: 8px">
+        <div class="fnwg-header-actions">
+          <!-- 全局搜索：一个入口搜连接与设备，选中后跳到对应页面并打开详情 -->
+          <GlobalSearch v-if="!isMobile" ref="searchRef" />
+          <el-button v-else link :icon="Search" @click="mobileSearchVisible = true" />
+
           <!-- 系统状态栏：任意页面都能看到当前是否正常，点击直达处理入口 -->
           <el-tooltip :content="toneLabel" placement="bottom">
             <button type="button" class="fnwg-health-chip" :class="tone" @click="goMaintenance">
@@ -136,6 +140,10 @@
 
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
 
+    <el-dialog v-model="mobileSearchVisible" title="搜索连接与设备" :width="dialogWidth || '92%'" top="8vh">
+      <GlobalSearch mobile />
+    </el-dialog>
+
     <el-dialog v-model="pwVisible" title="修改密码" :width="dialogWidth || '420px'">
       <el-form class="fnwg-form" :label-position="isMobile ? 'top' : 'right'" label-width="90px">
         <el-form-item label="原密码">
@@ -170,9 +178,11 @@ import {
   Reading,
   Connection,
   WarningFilled,
+  Search,
 } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import GlobalSearch from '@/components/GlobalSearch.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
@@ -260,6 +270,8 @@ const syncTip = computed(() =>
 const helpGroups = allHelpGroups
 
 const navVisible = ref(false)
+const searchRef = ref()
+const mobileSearchVisible = ref(false)
 const helpVisible = ref(false)
 const pwVisible = ref(false)
 const pw = ref({ old: '', next: '' })
@@ -276,14 +288,25 @@ function openHelp() {
   helpVisible.value = true
 }
 
+/** Ctrl/⌘ + K 聚焦搜索：搜索是高频动作，值得给一个快捷键 */
+function onHotkey(e: KeyboardEvent) {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault()
+    if (isMobile.value) mobileSearchVisible.value = true
+    else searchRef.value?.focus?.()
+  }
+}
+
 onMounted(() => {
   realtime.connect()
   // 全局体检：顶栏状态栏与异常横幅都读它，任意页面都能即时感知
   startHealth()
+  window.addEventListener('keydown', onHotkey)
 })
 
 onUnmounted(() => {
   stopHealth()
+  window.removeEventListener('keydown', onHotkey)
 })
 
 async function onCommand(cmd: string) {
@@ -356,6 +379,25 @@ async function submitPassword() {
   background: var(--el-color-primary-light-9);
 }
 
+/* 顶栏右侧动作区：允许整体压缩，但内部状态项不压缩（压缩交给搜索框）。
+   空格不足时若让状态文字被压，中文的最小宽度只有一个字，会变成一字一行的竖排。 */
+.fnwg-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* 状态标签、按钮与账号菜单一律不参与压缩、不换行。
+   中文的最小宽度只有一个字，被压缩时就会变成一字一行的竖排。 */
+.fnwg-header-actions :deep(.el-tag),
+.fnwg-header-actions :deep(.el-dropdown),
+.fnwg-header-actions :deep(.el-button) {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 /* 顶栏系统状态栏：颜色跟随总体状态，点击直达系统维护 */
 .fnwg-health-chip {
   display: inline-flex;
@@ -371,6 +413,9 @@ async function submitPassword() {
   font-size: 12px;
   cursor: pointer;
   transition: all 0.15s;
+  /* 不换行 + 不压缩：否则「系统正常 / N 项异常」会被挤成竖排 */
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .fnwg-health-chip .fnwg-dot {

@@ -8,6 +8,7 @@
       <el-button v-if="session.can('peer.write')" type="primary" :icon="Plus" @click="openCreate">
         添加设备
       </el-button>
+      <el-button v-if="session.can('peer.write')" :icon="Upload" @click="openImport">批量导入</el-button>
       <el-dropdown v-if="session.can('peer.write')" :disabled="!selectedIds.length" @command="batch">
         <el-button :disabled="!selectedIds.length">
           批量操作（{{ selectedIds.length }}）<el-icon><ArrowDown /></el-icon>
@@ -159,17 +160,63 @@
       <div v-if="!filtered.length && !loading" class="fnwg-empty">还没有设备，点击上方「添加设备」开始</div>
     </div>
 
-    <!-- 添加 / 编辑设备 -->
-    <el-drawer v-model="drawerVisible" :title="form.id ? '编辑设备' : '添加设备'" :size="drawerSize">
-      <el-form :model="form" class="fnwg-form" :label-position="isMobile ? 'top' : 'right'" label-width="130px">
+    <!-- 添加 / 编辑设备：新建走分步向导（选用途 → 填信息 → 扫码），编辑仍是整页表单 -->
+    <el-drawer
+      v-model="drawerVisible"
+      :title="form.id ? '编辑设备' : '添加设备'"
+      :size="drawerSize"
+      @closed="onDrawerClosed"
+    >
+      <el-steps v-if="!form.id" :active="createStep" simple style="margin-bottom: 16px">
+        <el-step title="选择用途" />
+        <el-step title="填写信息" />
+        <el-step title="扫码连接" />
+      </el-steps>
+
+      <!-- 向导最后一步：创建完成，直接在本抽屉里扫码，不再跳到另一个弹窗 -->
+      <div v-if="!form.id && createStep === 2">
+        <el-alert
+          v-if="cfg?.warning"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="cfg.warning"
+          style="margin-bottom: 12px"
+        />
+        <div class="fnwg-steps">
+          <span>1. 手机应用商店安装 <strong>WireGuard</strong> 官方 App</span>
+          <span>2. 打开 App 点击「+」→「扫描二维码」</span>
+          <span>3. 扫下方二维码，完成后打开开关即可连回家</span>
+        </div>
+        <div class="fnwg-qr">
+          <img v-if="qrDataUrl" :src="qrDataUrl" alt="连接二维码" />
+          <div style="font-size: 12px; opacity: 0.7; text-align: center; line-height: 1.7">
+            连接地址：{{ cfg?.endpoint || '未配置（请到系统设置填写对外访问地址）' }}<br />
+            分配给本设备的内部地址：{{ (cfg?.client_address || []).join(', ') || '-' }}
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px; justify-content: center; margin-top: 12px">
+          <el-button @click="copy(cfg?.conf || '')">复制配置内容</el-button>
+          <el-button @click="downloadConf">下载配置文件</el-button>
+        </div>
+      </div>
+
+      <el-form
+        v-show="form.id || createStep < 2"
+        :model="form"
+        class="fnwg-form"
+        :label-position="isMobile ? 'top' : 'right'"
+        label-width="130px"
+      >
         <ScenarioPicker
-          v-if="!form.id"
+          v-if="!form.id && createStep === 0"
           v-model="scenario"
           :presets="peerPresets"
           title="这台设备要怎么用？"
           @apply="applyScenario"
         />
 
+        <template v-if="form.id || createStep === 1">
         <el-form-item>
           <template #label><FieldLabel :meta="P.name" /></template>
           <el-input v-model="form.name" placeholder="例如：妈妈的手机" />
@@ -308,14 +355,28 @@
           <el-switch v-model="form.enabled" active-text="允许这台设备连接" />
           <FieldTips :meta="P.enabled" />
         </el-form-item>
+        </template>
       </el-form>
 
       <template #footer>
         <div style="display: flex; gap: 8px; justify-content: flex-end; width: 100%">
-          <el-button @click="drawerVisible = false">取消</el-button>
-          <el-button type="primary" :loading="saving" @click="submit">
-            {{ form.id ? '保存' : '创建并生成二维码' }}
-          </el-button>
+          <!-- 编辑：单一保存按钮 -->
+          <template v-if="form.id">
+            <el-button @click="drawerVisible = false">取消</el-button>
+            <el-button type="primary" :loading="saving" @click="submit">保存</el-button>
+          </template>
+          <!-- 新建向导：按步骤推进 -->
+          <template v-else-if="createStep === 0">
+            <el-button @click="drawerVisible = false">取消</el-button>
+            <el-button type="primary" @click="createStep = 1">下一步</el-button>
+          </template>
+          <template v-else-if="createStep === 1">
+            <el-button @click="createStep = 0">上一步</el-button>
+            <el-button type="primary" :loading="saving" @click="submit">创建并生成二维码</el-button>
+          </template>
+          <template v-else>
+            <el-button type="primary" @click="drawerVisible = false">完成</el-button>
+          </template>
         </div>
       </template>
     </el-drawer>
@@ -351,18 +412,91 @@
       </template>
     </el-dialog>
 
+    <!-- 批量导入设备 -->
+    <el-dialog v-model="importVisible" title="批量添加设备" :width="dialogWidth || '760px'">
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+        <template #title>
+          每行一台设备，用「逗号」或「制表符」分隔：<code>名称,识别码,备注,分组</code>。识别码可留空（留空会自动生成密钥并托管）。
+        </template>
+      </el-alert>
+
+      <el-form label-width="90px" :label-position="isMobile ? 'top' : 'right'">
+        <el-form-item label="导入到">
+          <el-select v-model="importIface" style="width: 100%">
+            <el-option v-for="it in interfaces" :key="it.id" :label="it.name" :value="it.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="设备清单">
+          <el-input
+            v-model="importText"
+            type="textarea"
+            :rows="7"
+            :placeholder="importPlaceholder"
+          />
+        </el-form-item>
+      </el-form>
+
+      <div v-if="importRows.length" class="fnwg-hint" style="margin-bottom: 8px">
+        共解析出 {{ importRows.length }} 行，将导入 {{ importReady.length }} 台<template v-if="importRows.length - importReady.length">
+          （跳过 {{ importRows.length - importReady.length }} 行空名称）</template
+        >。
+      </div>
+      <el-table v-if="importRows.length" :data="importRows.slice(0, 50)" size="small" max-height="220">
+        <el-table-column type="index" label="#" width="50" />
+        <el-table-column prop="name" label="名称" min-width="120" />
+        <el-table-column label="识别码" min-width="200">
+          <template #default="{ row }">
+            <span v-if="!row.public_key" class="fnwg-hint">留空，自动生成</span>
+            <span v-else-if="row.public_key.length !== 44" class="fnwg-warn">长度 {{ row.public_key.length }}，应为 44 位</span>
+            <span v-else class="fnwg-mono">{{ row.public_key.slice(0, 14) }}…</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="group_tag" label="分组" width="90" />
+        <el-table-column prop="remark" label="备注" width="110" />
+      </el-table>
+      <div v-if="importRows.length > 50" class="fnwg-hint">预览只显示前 50 行，实际会全部导入。</div>
+
+      <div v-if="importResult" style="margin-top: 12px">
+        <el-alert
+          :type="importResult.failed ? 'warning' : 'success'"
+          :closable="false"
+          show-icon
+          :title="`导入完成：成功 ${importResult.created} 台${importResult.failed ? `，失败 ${importResult.failed} 台` : ''}`"
+        />
+        <div v-if="importResult.failed" style="margin-top: 8px">
+          <el-button size="small" @click="copyFailures">复制失败清单</el-button>
+          <el-table
+            :data="importResult.items.filter((i) => !i.ok)"
+            size="small"
+            max-height="200"
+            style="margin-top: 8px"
+          >
+            <el-table-column prop="name" label="名称" width="140" />
+            <el-table-column prop="error" label="失败原因" min-width="260" />
+          </el-table>
+        </div>
+      </div>
+
+      <template #footer>
+        <el-button @click="importVisible = false">关闭</el-button>
+        <el-button type="primary" :loading="importing" :disabled="!importReady.length" @click="submitImport">
+          开始导入（{{ importReady.length }}）
+        </el-button>
+      </template>
+    </el-dialog>
+
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Refresh, ArrowDown, Reading } from '@element-plus/icons-vue'
+import { Plus, Refresh, ArrowDown, Reading, Upload } from '@element-plus/icons-vue'
 import QRCode from 'qrcode'
 import { api } from '@/api/client'
-import type { PeerConfigResult, WgInterface, WgPeer } from '@/api/types'
+import type { PeerConfigResult, PeerImportResult, PeerImportRow, WgInterface, WgPeer } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
@@ -407,6 +541,16 @@ const helpVisible = ref(false)
 const cfg = ref<PeerConfigResult | null>(null)
 const qrDataUrl = ref('')
 const scenario = ref('split')
+// 新建向导当前步骤：0 选用途 / 1 填信息 / 2 扫码
+const createStep = ref(0)
+
+// 批量导入
+const importVisible = ref(false)
+const importText = ref('')
+const importIface = ref<number | undefined>(undefined)
+const importing = ref(false)
+const importResult = ref<PeerImportResult | null>(null)
+const importPlaceholder = '妈妈的手机\n爸爸的手机\n客厅电视,<44 位识别码>,客厅,固定设备'
 
 const emptyForm = () => ({
   id: 0,
@@ -444,6 +588,27 @@ const filtered = computed(() => {
 const onlineCount = computed(
   () => filtered.value.filter((p) => handshakeLevel(p.last_handshake) !== 'off').length,
 )
+
+/** 解析批量导入文本：每行一台设备，逗号或制表符分隔，`#` 开头为注释。 */
+function parseImportText(text: string): PeerImportRow[] {
+  const out: PeerImportRow[] = []
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const cols = line.split(/[,\t]/).map((s) => s.trim())
+    out.push({
+      name: cols[0] || '',
+      public_key: cols[1] || '',
+      remark: cols[2] || '',
+      group_tag: cols[3] || '',
+    })
+  }
+  return out
+}
+
+const importRows = computed(() => parseImportText(importText.value))
+// 只有带名称的行才提交；没有名称的行无法标识，导入也没有意义
+const importReady = computed(() => importRows.value.filter((r) => r.name.trim() !== ''))
 
 /** 把技术化的 AllowedIPs 翻译成用户能理解的描述 */
 function describeAllowed(ips?: string[]): string {
@@ -513,7 +678,13 @@ function openCreate() {
   Object.assign(form, emptyForm())
   form.interface_id = ifaceFilter.value || interfaces.value[0].id
   scenario.value = 'split'
+  createStep.value = 0
   drawerVisible.value = true
+}
+
+/** 关闭抽屉时复位向导步骤，下次打开从第一步开始 */
+function onDrawerClosed() {
+  createStep.value = 0
 }
 
 function openEdit(row: WgPeer) {
@@ -567,17 +738,19 @@ async function submit() {
       quota_tx: form.quota_tx,
       enabled: form.enabled,
     }
-    let created: WgPeer | null = null
     if (form.id) {
       await api.patch(`/peers/${form.id}`, payload)
       ElMessage.success('已保存')
-    } else {
-      created = await api.post<WgPeer>('/peers', payload)
-      ElMessage.success('设备已添加')
+      drawerVisible.value = false
+      await load()
+      return
     }
-    drawerVisible.value = false
+    const created = await api.post<WgPeer>('/peers', payload)
+    ElMessage.success('设备已添加')
     await load()
-    if (created) await showConfig(created)
+    // 向导最后一步：在本抽屉里直接展示二维码，用户不必再点一次「扫码连接」
+    await loadConfig(created)
+    createStep.value = 2
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
@@ -585,18 +758,60 @@ async function submit() {
   }
 }
 
+/** 拉取并渲染某台设备的二维码/配置（不打开弹窗），供向导与扫码弹窗共用。 */
+async function loadConfig(row: WgPeer) {
+  const res = await api.get<PeerConfigResult>(`/peers/${row.id}/config`)
+  cfg.value = res
+  qrDataUrl.value = await QRCode.toDataURL(res.qr_payload || res.conf, { margin: 1, width: 480 })
+  // 生成配置等于把最新设置交付给了设备，服务端已记下这次交付；
+  // 立刻刷新列表，让「需重新扫码」标记当场消失（否则要等下次手动刷新）。
+  if (row.config_stale) await load()
+}
+
 async function showConfig(row: WgPeer) {
   try {
-    const res = await api.get<PeerConfigResult>(`/peers/${row.id}/config`)
-    cfg.value = res
-    qrDataUrl.value = await QRCode.toDataURL(res.qr_payload || res.conf, { margin: 1, width: 480 })
+    await loadConfig(row)
     cfgVisible.value = true
-    // 生成配置等于把最新设置交付给了设备，服务端已记下这次交付；
-    // 立刻刷新列表，让「需重新扫码」标记当场消失（否则要等下次手动刷新）。
-    if (row.config_stale) await load()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
+}
+
+function openImport() {
+  if (!interfaces.value.length) {
+    ElMessage.warning('请先创建一条连接，再批量导入设备')
+    return
+  }
+  importText.value = ''
+  importResult.value = null
+  importIface.value = ifaceFilter.value || interfaces.value[0].id
+  importVisible.value = true
+}
+
+async function submitImport() {
+  const devices = importReady.value
+  if (!devices.length) return
+  importing.value = true
+  try {
+    const res = await api.post<PeerImportResult>('/peers/import', {
+      interface_id: importIface.value,
+      devices,
+    })
+    importResult.value = res
+    if (res.failed) ElMessage.warning(`成功 ${res.created} 台，失败 ${res.failed} 台`)
+    else ElMessage.success(`已创建 ${res.created} 台设备`)
+    await load()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    importing.value = false
+  }
+}
+
+/** 把失败清单复制成「名称 + 原因」两列文本，方便用户回去改源头数据 */
+async function copyFailures() {
+  const items = (importResult.value?.items || []).filter((i) => !i.ok)
+  await copy(items.map((i) => `${i.name}\t${i.error}`).join('\n'))
 }
 
 function downloadConf() {
@@ -682,11 +897,31 @@ async function copy(text: string) {
 }
 
 onMounted(async () => {
-  const q = route.query.iface
-  if (q) ifaceFilter.value = Number(q)
+  const q = route.query
+  if (q.iface) ifaceFilter.value = Number(q.iface)
   await loadInterfaces()
   await load()
+  // 从全局搜索跳过来时自动打开目标设备
+  if (q.edit) {
+    const target = peers.value.find((p) => p.id === Number(q.edit))
+    if (target) openEdit(target)
+  }
 })
+
+// 页面已挂载时再次从搜索跳过来（query 变化不会再触发 onMounted），需要单独监听
+watch(
+  () => route.query,
+  async (q) => {
+    if (q.iface && Number(q.iface) !== ifaceFilter.value) {
+      ifaceFilter.value = Number(q.iface)
+      await load()
+    }
+    if (q.edit) {
+      const target = peers.value.find((p) => p.id === Number(q.edit))
+      if (target) openEdit(target)
+    }
+  },
+)
 </script>
 
 <style scoped>
@@ -701,5 +936,11 @@ onMounted(async () => {
   padding: 10px 12px;
   border-radius: 8px;
   background: var(--el-fill-color-light);
+}
+
+/* 批量导入预览里的「识别码长度不对」提示 */
+.fnwg-warn {
+  color: var(--el-color-warning);
+  font-size: 12px;
 }
 </style>

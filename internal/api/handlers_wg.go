@@ -285,6 +285,24 @@ func (s *Server) handleBatchPeers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": msg})
 }
 
+// handleImportPeers 批量导入设备到指定连接，逐条回传成功/失败。
+func (s *Server) handleImportPeers(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		InterfaceID int64                   `json:"interface_id"`
+		Devices     []service.PeerImportRow `json:"devices"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := s.svc.ImportPeers(r.Context(), in.InterfaceID, in.Devices, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 func (s *Server) handlePeerConfig(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.idOrFail(w, r)
 	if !ok {

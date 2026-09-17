@@ -49,6 +49,8 @@ type NetworkCheckResult struct {
 	NAT model.NATStatus `json:"nat"`
 	// ForwardPolicyDrop 系统转发链策略是否为丢弃（装过 Docker 的机器常见）。
 	ForwardPolicyDrop bool `json:"forward_policy_drop"`
+	// DNS 内网域名解析（设备用主机名访问家里设备）的运行状态。
+	DNS model.DNSStatus `json:"dns"`
 	// HomeSubnets 是探测到的 NAS 所在局域网网段。
 	//
 	// 暴露给界面是为了让「按设备划分访问范围」能直接给出可选项：
@@ -83,6 +85,7 @@ func (s *Service) CheckNetwork(ctx context.Context) (*NetworkCheckResult, error)
 		ForeignInterfaces: orEmptyForeign(rep.ForeignInterfaces),
 		NAT:               rep.NAT,
 		ForwardPolicyDrop: rep.ForwardPolicyDrop,
+		DNS:               rep.DNS,
 		HomeSubnets:       orEmptyStrings(s.homeLANSubnets(ctx)),
 		AccessIssues:      orEmptyAccessIssues(s.DiagnoseAccess(ctx)),
 	}
@@ -91,6 +94,9 @@ func (s *Service) CheckNetwork(ctx context.Context) (*NetworkCheckResult, error)
 	}
 	if res.NAT.WANs == nil {
 		res.NAT.WANs = []string{}
+	}
+	if res.DNS.Listen == nil {
+		res.DNS.Listen = []string{}
 	}
 	res.RouteInfoReadable = rep.RouteInfoReadable
 	if len(rep.ManagedInterfaces) == 0 {

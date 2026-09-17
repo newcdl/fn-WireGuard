@@ -217,6 +217,111 @@
         </div>
       </el-tab-pane>
 
+      <!-- 内网域名：让设备用主机名访问家里设备 -->
+      <el-tab-pane label="内网域名" name="dns">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+          <template #title>
+            让连进来的设备用「主机名」访问家里设备（例如手机浏览器输入 nas.lan），不用去记 IP。
+            开启后，下发给设备的 DNS 会指向本连接的隧道地址，由本应用代为解析：登记的域名由本应用应答，
+            其余上网域名原样转发到你在连接里配置的 DNS。
+          </template>
+        </el-alert>
+
+        <el-form-item>
+          <template #label><FieldLabel :meta="S.dns_resolve" /></template>
+          <el-switch
+            v-model="dnsEnabled"
+            :disabled="!session.isAdmin"
+            :before-change="confirmDNSChange"
+            active-text="开启内网域名解析"
+            @change="saveDNSEnabled"
+          />
+          <FieldTips :meta="S.dns_resolve" />
+          <div v-if="!session.isAdmin" class="fnwg-hint">仅管理员可以修改这项开关。</div>
+        </el-form-item>
+
+        <!--
+          这条提示必须醒目：改动开关会波及**所有已接入设备**。
+          用户最容易误解的就是「改完就生效了」—— 实际上设备用的是它自己那份配置，
+          服务端改不到，必须让用户事先知道要重新扫码，并知道为什么。
+        -->
+        <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 12px">
+          <template #title>注意：改动这个开关后，所有已接入的设备都需要重新扫码</template>
+          <div class="fnwg-dns-warn">
+            <p>
+              <strong>为什么：</strong>DNS 是写在「设备自己那份配置」里的。手机、电脑连上后用的是它当初扫码导入的那份配置，
+              NAS 这边改不到设备里的东西，所以服务端换了 DNS，设备并不会自动知道。
+            </p>
+            <p>
+              <strong>怎么做：</strong>改动后，设备列表里这些设备会被标出「<strong>需重新扫码</strong>」，
+              点一下重新生成二维码、用设备再扫一次即可。<strong>不需要删除设备</strong>，设备上的其它设置也不会变。
+            </p>
+          </div>
+        </el-alert>
+
+        <!-- 运行状态：只说「开关是开着的」不够，用户要知道它到底有没有在工作 -->
+        <el-alert
+          v-if="dnsStatus?.enabled && !(dnsStatus.listen || []).length"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+          :title="`已开启但解析服务还没生效：${dnsStatus.note || '当前没有可用的隧道地址（连接可能未启用）'}`"
+        />
+        <div v-else-if="dnsStatus?.enabled" class="fnwg-hint" style="margin-bottom: 12px">
+          正在监听 {{ (dnsStatus.listen || []).join('、') }}，已登记 {{ dnsStatus.records }} 条记录，
+          累计查询 {{ dnsStatus.queries }} 次<template v-if="dnsStatus.failed">（失败 {{ dnsStatus.failed }} 次）</template>。
+        </div>
+
+        <div class="fnwg-toolbar">
+          <el-button v-if="session.can('iface.write')" type="primary" :icon="Plus" @click="openDNSRecord()">
+            添加域名
+          </el-button>
+          <el-button :icon="Refresh" @click="loadDNS">刷新</el-button>
+          <div style="flex: 1"></div>
+          <span class="fnwg-hint">共 {{ dnsRecords.length }} 条</span>
+        </div>
+
+        <el-table :data="dnsRecords" size="small" empty-text="还没有域名记录">
+          <el-table-column prop="name" label="主机名" min-width="160" />
+          <el-table-column prop="ip" label="指向的地址" min-width="140" />
+          <el-table-column prop="note" label="备注" min-width="140" />
+          <el-table-column label="操作" width="140">
+            <template #default="{ row }">
+              <el-button v-if="session.can('iface.write')" link type="primary" @click="openDNSRecord(row)">
+                编辑
+              </el-button>
+              <el-button v-if="session.can('iface.write')" link type="danger" @click="removeDNSRecord(row)">
+                删除
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <!-- 新增 / 编辑域名 -->
+        <el-dialog v-model="dnsVisible" :title="dnsForm.id ? '编辑域名' : '添加域名'" :width="dialogWidth || '460px'">
+          <el-form class="fnwg-form" :label-position="isMobile ? 'top' : 'right'" label-width="100px">
+            <el-form-item>
+              <template #label><FieldLabel :meta="S.dns_name" /></template>
+              <el-input v-model="dnsForm.name" placeholder="例如 nas.lan" />
+              <FieldTips :meta="S.dns_name" example />
+            </el-form-item>
+            <el-form-item>
+              <template #label><FieldLabel :meta="S.dns_ip" /></template>
+              <el-input v-model="dnsForm.ip" placeholder="例如 192.168.1.10" />
+              <FieldTips :meta="S.dns_ip" example />
+            </el-form-item>
+            <el-form-item label="备注">
+              <el-input v-model="dnsForm.note" placeholder="例如 家里的 NAS" />
+            </el-form-item>
+          </el-form>
+          <template #footer>
+            <el-button @click="dnsVisible = false">取消</el-button>
+            <el-button type="primary" :loading="dnsSaving" @click="saveDNSRecord">保存</el-button>
+          </template>
+        </el-dialog>
+      </el-tab-pane>
+
       <!-- 备份与还原 -->
       <el-tab-pane label="备份还原" name="backup">
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
@@ -358,15 +463,16 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Upload, Reading } from '@element-plus/icons-vue'
+import { Plus, Upload, Reading, Refresh } from '@element-plus/icons-vue'
 import { api, download, postRaw } from '@/api/client'
-import type { BackupRecord, Health, NotifyResult, NotifyStatus, User } from '@/api/types'
+import type { BackupRecord, DNSRecord, Health, NotifyResult, NotifyStatus, User } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
 import { allHelpGroups, settingFields, userFields } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
+import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes, formatTime } from '@/utils/format'
@@ -406,6 +512,16 @@ const backups = ref<BackupRecord[]>([])
 const shareDir = ref('')
 const backupFileInput = ref<HTMLInputElement | null>(null)
 
+// 内网域名解析：开关走设置项，记录走独立接口；
+// 运行状态复用全局体检的同一份数据，避免「设置页说正常、维护页说异常」。
+const dnsEnabled = ref(false)
+const dnsRecords = ref<DNSRecord[]>([])
+const dnsVisible = ref(false)
+const dnsSaving = ref(false)
+const dnsForm = reactive({ id: 0, name: '', ip: '', note: '' })
+const { net } = useSystemHealth()
+const dnsStatus = computed(() => net.value?.dns)
+
 const backendLabel = computed(() => {
   const b = health.value?.backend || realtime.status?.backend
   return (
@@ -430,6 +546,7 @@ async function loadAll() {
     notify.format = (['text', 'markdown'] as string[]).includes(kv.notify_format || '')
       ? kv.notify_format
       : 'json'
+    dnsEnabled.value = kv.dns_resolve_enabled === '1'
   } catch {
     /* 忽略 */
   }
@@ -437,6 +554,87 @@ async function loadAll() {
   await loadHealth()
   if (session.isAdmin) await loadUsers()
   await loadBackups()
+  await loadDNS()
+  void refreshSystemHealth()
+}
+
+async function loadDNS() {
+  try {
+    const data = await api.get<{ items: DNSRecord[] }>('/dns/records')
+    dnsRecords.value = data.items || []
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 改动开关会波及所有已接入设备，先让用户确认（返回 false 表示不改）。 */
+function confirmDNSChange(): Promise<boolean> {
+  const turningOn = !dnsEnabled.value
+  return ElMessageBox.confirm(
+    `${turningOn ? '开启' : '关闭'}后，下发给设备的 DNS 会${
+      turningOn ? '改成本连接的隧道地址' : '恢复成你在连接里配置的 DNS'
+    }。\n\n` +
+      'DNS 写在设备自己那份配置里，服务端改不到它，所以：\n' +
+      '所有已接入的设备都需要重新扫码导入一次才会生效。\n\n' +
+      '设备列表会标出「需重新扫码」，点一下重新生成二维码即可，不需要删除设备。',
+    turningOn ? '确认开启内网域名解析？' : '确认关闭内网域名解析？',
+    { type: 'warning', confirmButtonText: turningOn ? '确认开启' : '确认关闭', cancelButtonText: '先不改' },
+  )
+    .then(() => true)
+    .catch(() => false)
+}
+
+async function saveDNSEnabled() {
+  const v = dnsEnabled.value ? '1' : ''
+  try {
+    await api.put('/settings', { dns_resolve_enabled: v })
+    ElMessage.success(
+      v
+        ? '已开启：请到设备列表，对标记「需重新扫码」的设备重新生成二维码'
+        : '已关闭：设备同样需要重新扫码才会恢复原来的 DNS',
+    )
+    await refreshSystemHealth()
+  } catch (e) {
+    dnsEnabled.value = !dnsEnabled.value // 保存失败要回滚，否则界面显示的开关状态是假的
+    ElMessage.error((e as Error).message)
+  }
+}
+
+function openDNSRecord(row?: DNSRecord) {
+  Object.assign(
+    dnsForm,
+    row ? { id: row.id, name: row.name, ip: row.ip, note: row.note } : { id: 0, name: '', ip: '', note: '' },
+  )
+  dnsVisible.value = true
+}
+
+async function saveDNSRecord() {
+  dnsSaving.value = true
+  try {
+    const payload = { name: dnsForm.name, ip: dnsForm.ip, note: dnsForm.note }
+    if (dnsForm.id) await api.patch(`/dns/records/${dnsForm.id}`, payload)
+    else await api.post('/dns/records', payload)
+    ElMessage.success('已保存')
+    dnsVisible.value = false
+    await loadDNS()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    dnsSaving.value = false
+  }
+}
+
+async function removeDNSRecord(row: DNSRecord) {
+  try {
+    await ElMessageBox.confirm(`确认删除域名「${row.name}」？删除后设备将无法再用它访问。`, '删除域名', {
+      type: 'warning',
+    })
+    await api.del(`/dns/records/${row.id}`)
+    ElMessage.success('已删除')
+    await loadDNS()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error((e as Error).message)
+  }
 }
 
 async function loadNotify() {
@@ -679,6 +877,16 @@ onMounted(async () => {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   line-height: 1.6;
+}
+
+/* 内网域名解析的影响提示：正文分「为什么 / 怎么做」两段，行距放松一点便于扫读 */
+.fnwg-dns-warn {
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.fnwg-dns-warn p {
+  margin: 4px 0 0;
 }
 
 .fnwg-about-text {

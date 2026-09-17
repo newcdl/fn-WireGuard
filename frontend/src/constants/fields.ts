@@ -411,6 +411,43 @@ export const settingFields: Record<string, FieldMeta> = {
       { title: '只留档不推送', value: '全部取消', desc: '不推送任何消息，界面与运行记录照常显示。' },
     ],
   },
+  dns_resolve: {
+    label: '内网域名解析',
+    hint: '让设备用主机名（如 nas.lan）访问家里设备，不用记 IP',
+    what: '开启后，本应用在每条连接的隧道地址上提供域名解析：下面登记的主机名由本应用直接应答，其它上网域名原样转发到连接里配置的 DNS。',
+    why: '家里设备一多（NAS、打印机、路由器管理页、各台电脑），让手机去记一串 192.168.x.x 很不现实，而且地址还可能变。',
+    effect: '【会波及已接入的设备】开关一改动，下发给设备的 DNS 就变了。DNS 写在设备自己那份配置里，服务端改不到它，所以所有已接入的设备都需要重新扫码导入一次才会生效；设备列表会标出「需重新扫码」，点一下重新生成二维码即可，不需要删除设备。',
+    risk: '解析服务只绑定本应用连接的隧道地址，不占用 53 端口、也不改动系统 DNS；NAS 上已有的 DNS 服务（Docker/AdGuard）不受影响。',
+    examples: [
+      {
+        title: '典型用法',
+        value: '登记 nas.lan → 192.168.1.10',
+        desc: '手机连回家后在浏览器输入 nas.lan 即可打开 NAS。',
+      },
+    ],
+  },
+  dns_name: {
+    label: '主机名',
+    hint: '设备上要输入的名字，例如 nas.lan',
+    what: '设备将来访问时输入的名字。填 nas.lan 就用 nas.lan；只填 nas 的话，nas 与 nas.lan / nas.local 都能解析。',
+    why: '名字要短、好记、好打字，才可能真的被用起来。',
+    effect: '大小写不敏感；只能用字母、数字、连字符与点号。同一个名字只能登记一条。',
+    examples: [
+      { title: '带后缀（推荐）', value: 'nas.lan', desc: '最不容易和别的域名混淆。' },
+      { title: '不带后缀', value: 'nas', desc: '输入最短，nas / nas.lan / nas.local 都能解析。' },
+    ],
+  },
+  dns_ip: {
+    label: '指向的地址',
+    hint: '这台设备在家里局域网中的 IP，例如 192.168.1.10',
+    what: '主机名最终解析成的 IPv4 地址。',
+    why: '这里填「家里设备」的局域网地址，不是隧道地址：解析出来之后设备是直接访问家里那台机器的。',
+    effect: '只支持 IPv4；家里那台设备的地址变了要回来改，否则解析会指向旧地址。',
+    examples: [
+      { title: 'NAS 自己', value: '192.168.1.10', desc: '等于用一个好记的名字访问 NAS。' },
+      { title: '路由器管理页', value: '192.168.1.1', desc: '在手机上输入 router.lan 就能打开路由器后台。' },
+    ],
+  },
 }
 
 export const userFields: Record<string, FieldMeta> = {

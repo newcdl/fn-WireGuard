@@ -12,10 +12,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
+	"fnwg/internal/dnsserver"
 	"fnwg/internal/model"
 	"fnwg/internal/notify"
 	"fnwg/internal/store"
@@ -56,7 +58,9 @@ type Engine struct {
 	back     wgback.Backend
 	log      *slog.Logger
 	notifier *notify.Sender
-	start    time.Time
+	// dns 是内网域名解析服务：只绑定隧道地址，随每次收敛对齐期望态。
+	dns   *dnsserver.Server
+	start time.Time
 
 	mu         sync.RWMutex
 	status     model.Status
@@ -67,6 +71,8 @@ type Engine struct {
 	lastReconc time.Time
 	lastErr    error
 	lastDiff   []string
+	// dnsOn 记录当前「内网域名解析」开关状态，供状态上报使用。
+	dnsOn bool
 
 	trigger chan struct{}
 }
@@ -81,6 +87,7 @@ func New(st *store.Store, back wgback.Backend, logger *slog.Logger) *Engine {
 		back:     back,
 		log:      logger,
 		notifier: notify.New(st, logger),
+		dns:      dnsserver.New(logger),
 		start:    time.Now(),
 		prev:     map[string]peerSample{},
 		online:   map[string]bool{},
@@ -118,6 +125,7 @@ func (e *Engine) Desired(ctx context.Context) ([]model.InterfaceSpec, error) {
 			RouteTable:   it.RouteTable,
 			AllowLAN:     it.AllowLAN,
 			IsolatePeers: it.IsolatePeers,
+			DNS:          it.DNS,
 			Up:           it.Autostart,
 		}
 		peers, err := e.store.ListPeers(ctx, it.ID)
@@ -149,6 +157,10 @@ func (e *Engine) Reconcile(ctx context.Context) (wgback.Diff, error) {
 		return wgback.Diff{}, err
 	}
 	diff, err := e.back.Apply(specs, wgback.ApplyOptions{RemoveMissing: true})
+
+	// 内网域名解析跟着收敛走：隧道地址由内核下发，解析服务要先有地址才能绑定，
+	// 因此放在 Apply 之后。开关未打开时它会把监听全部关掉。
+	e.syncDNS(ctx, specs)
 
 	e.mu.Lock()
 	e.lastReconc = time.Now()
@@ -189,7 +201,74 @@ func (e *Engine) DeleteInterface(ctx context.Context, name string) error {
 
 // InspectNetwork 网络自检（只读），用于界面展示与排障。
 func (e *Engine) InspectNetwork(ctx context.Context) (model.NetworkReport, error) {
-	return e.back.Inspect(ctx)
+	rep, err := e.back.Inspect(ctx)
+	e.mu.RLock()
+	on := e.dnsOn
+	e.mu.RUnlock()
+	rep.DNS = e.dns.Status(on)
+	return rep, err
+}
+
+// syncDNS 让内网域名解析服务与当前期望态一致。
+//
+// 监听地址只取本应用连接的隧道地址：绝不监听 0.0.0.0:53，
+// 因此不会与 NAS 上已有的 DNS 服务抢端口，也不影响系统解析。
+func (e *Engine) syncDNS(ctx context.Context, specs []model.InterfaceSpec) {
+	enabled := e.store.GetSetting(ctx, model.SettingDNSResolve, "") == "1"
+	e.mu.Lock()
+	e.dnsOn = enabled
+	e.mu.Unlock()
+	if !enabled {
+		e.dns.Sync(dnsserver.Config{})
+		return
+	}
+
+	recs, err := e.store.ListDNSRecords(ctx)
+	if err != nil {
+		e.log.Warn("读取内网域名记录失败", "err", err)
+		return
+	}
+
+	listen := []string{}
+	own := map[string]bool{}
+	for _, s := range specs {
+		if !s.Up {
+			continue
+		}
+		for _, a := range s.Addresses {
+			ip, _, err := net.ParseCIDR(strings.TrimSpace(a))
+			if err != nil || ip.To4() == nil {
+				continue
+			}
+			listen = append(listen, net.JoinHostPort(ip.String(), "53"))
+			own[ip.String()] = true
+		}
+	}
+
+	// 上游取连接里配置的 DNS。必须排除自己的隧道地址：
+	// 把上游设成自己会形成解析环，查询一进来就自己转自己，直到超时。
+	upstreams := []string{}
+	seen := map[string]bool{}
+	for _, s := range specs {
+		for _, d := range s.DNS {
+			d = strings.TrimSpace(d)
+			host := d
+			if h, _, err := net.SplitHostPort(d); err == nil {
+				host = h
+			}
+			if d == "" || own[host] || seen[d] {
+				continue
+			}
+			seen[d] = true
+			upstreams = append(upstreams, d)
+		}
+	}
+
+	records := make([]dnsserver.Record, 0, len(recs))
+	for _, r := range recs {
+		records = append(records, dnsserver.Record{Name: r.Name, IP: net.ParseIP(r.IP)})
+	}
+	e.dns.Sync(dnsserver.Config{Listen: listen, Records: records, Upstreams: upstreams})
 }
 
 // RepairNetwork 清除本应用残留在系统上的危险路由（自愈）。
