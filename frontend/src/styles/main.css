@@ -41,9 +41,11 @@ body {
   overflow: hidden;
 }
 
+/* 220px：200px 时品牌名「WireGuard 管理工具」在部分字体（加粗 + 中文回退字体）下
+   会被挤到把最后一个字换行，视觉上非常显眼。加宽 20px 后底部菜单项也更好读。 */
 .fnwg-sidebar {
-  width: 200px;
-  flex: 0 0 200px;
+  width: 220px;
+  flex: 0 0 220px;
   border-right: 1px solid var(--fnwg-border);
   background: var(--fnwg-card);
   display: flex;
@@ -58,6 +60,8 @@ body {
   font-weight: 600;
   font-size: 15px;
   border-bottom: 1px solid var(--fnwg-border);
+  /* 品牌名一律不换行：宁可略微溢出，也不要出现「具」单独掉到第二行 */
+  white-space: nowrap;
 }
 
 .fnwg-main {
