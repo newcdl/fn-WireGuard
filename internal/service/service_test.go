@@ -612,6 +612,56 @@ func TestImportPeersRejectsDuplicateKey(t *testing.T) {
 	}
 }
 
+func TestDNSRecordsCRUDAndValidation(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+
+	r, err := svc.CreateDNSRecord(ctx, service.DNSRecordInput{Name: " NAS.Lan ", IP: "192.168.1.10"}, actor)
+	if err != nil {
+		t.Fatalf("新增失败: %v", err)
+	}
+	if r.Name != "nas.lan" || r.IP != "192.168.1.10" {
+		t.Fatalf("名字应归一化为小写并去空白: %+v", r)
+	}
+
+	// 重名（大小写不同也算重名）
+	if _, err := svc.CreateDNSRecord(ctx, service.DNSRecordInput{Name: "nas.lan", IP: "192.168.1.11"}, actor); err == nil {
+		t.Fatal("重名应被拒绝")
+	}
+
+	for _, bad := range []service.DNSRecordInput{
+		{Name: "", IP: "192.168.1.1"},
+		{Name: "nas", IP: "not-an-ip"},
+		{Name: "nas", IP: "fd00::1"}, // 目前只支持 IPv4
+		{Name: "bad_name", IP: "192.168.1.1"},
+		{Name: "-bad.lan", IP: "192.168.1.1"},
+	} {
+		if _, err := svc.CreateDNSRecord(ctx, bad, actor); err == nil {
+			t.Fatalf("非法输入应被拒绝: %+v", bad)
+		}
+	}
+
+	up, err := svc.UpdateDNSRecord(ctx, r.ID, service.DNSRecordInput{Name: "nas.lan", IP: "192.168.1.20", Note: "改过"}, actor)
+	if err != nil {
+		t.Fatalf("编辑失败: %v", err)
+	}
+	if up.IP != "192.168.1.20" || up.Note != "改过" {
+		t.Fatalf("编辑未生效: %+v", up)
+	}
+
+	list, err := svc.ListDNSRecords(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("列表条数不对: %d (%v)", len(list), err)
+	}
+	if err := svc.DeleteDNSRecord(ctx, r.ID, actor); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if list, _ := svc.ListDNSRecords(ctx); len(list) != 0 {
+		t.Fatalf("删除后应为空: %d", len(list))
+	}
+}
+
 func TestAuthAndAudit(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()

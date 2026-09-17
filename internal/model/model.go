@@ -60,6 +60,12 @@ func PermissionsOf(role string) map[string]bool {
 	}
 }
 
+// SettingDNSResolve 是「内网域名解析」总开关的设置名。
+//
+// 放在 model 里而不是各写一遍字面量：Web 进程读它决定下发给设备的 DNS，
+// 代理进程读它决定要不要起解析服务，两边写错一个字就是「开关打开但不生效」。
+const SettingDNSResolve = "dns_resolve_enabled"
+
 // OnlineWindow 是判定设备在线的时间窗：最近一次握手落在窗口内视为在线。
 //
 // 单点定义。此前这个阈值在收敛引擎与状态缓存里各写了一遍，
@@ -252,6 +258,23 @@ type NetworkReport struct {
 	// ForwardPolicyDrop 系统转发链策略是否为丢弃（装过 Docker 的机器常见），
 	// 为真时即使规则正确也可能被系统拦下。
 	ForwardPolicyDrop bool `json:"forward_policy_drop"`
+	// DNS 内网域名解析（设备用主机名访问家里设备）的运行状态。
+	DNS DNSStatus `json:"dns"`
+}
+
+// DNSStatus 是内网域名解析的运行状态。
+type DNSStatus struct {
+	// Enabled 用户是否打开了「内网域名解析」开关。
+	Enabled bool `json:"enabled"`
+	// Listen 实际在监听的地址（形如 10.10.0.1:53）。
+	Listen []string `json:"listen"`
+	// Records 已加载的域名记录条数。
+	Records int `json:"records"`
+	// Queries / Failed 累计查询次数与失败次数，用于判断解析是否真的在工作。
+	Queries int64 `json:"queries"`
+	Failed  int64 `json:"failed"`
+	// Note 监听失败等异常的原因（为空表示正常）。
+	Note string `json:"note,omitempty"`
 }
 
 // ForeignInterface 描述一个不是本应用创建的 WireGuard 接口。
@@ -366,8 +389,11 @@ type InterfaceSpec struct {
 	AllowLAN bool
 	// IsolatePeers 为真时禁止这条连接里的设备互相访问。
 	IsolatePeers bool
-	Up           bool
-	Peers        []PeerSpec
+	// DNS 是连接里配置的 DNS 服务器地址（下发给设备，同时作为内网域名解析的上游）。
+	DNS []string
+	Up  bool
+	// Peers 是下发给内核的节点集合。
+	Peers []PeerSpec
 }
 
 // NATStatus 描述内网访问（NAT 转发）的当前状态，用于界面诊断。

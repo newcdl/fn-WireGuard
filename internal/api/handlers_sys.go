@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"fnwg/internal/model"
+	"fnwg/internal/service"
 )
 
 // ---------------------------------------------------------------- 认证
@@ -221,6 +222,61 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// ---------------------------------------------------------------- 内网域名解析
+
+func (s *Server) handleListDNSRecords(w http.ResponseWriter, r *http.Request) {
+	items, err := s.svc.ListDNSRecords(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleCreateDNSRecord(w http.ResponseWriter, r *http.Request) {
+	var in service.DNSRecordInput
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rec, err := s.svc.CreateDNSRecord(r.Context(), in, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) handleUpdateDNSRecord(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	var in service.DNSRecordInput
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rec, err := s.svc.UpdateDNSRecord(r.Context(), id, in, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) handleDeleteDNSRecord(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	if err := s.svc.DeleteDNSRecord(r.Context(), id, actorOf(r)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
 // ---------------------------------------------------------------- 审计与日志

@@ -423,7 +423,7 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		ClientPrivateKey: p.ClientPrivateKey,
 		ClientAddress:    clientAddrs,
 		AllowedIPs:       clientAllowed,
-		DNS:              it.DNS,
+		DNS:              s.clientDNS(ctx, it),
 		MTU:              it.MTU,
 		Keepalive:        p.Keepalive,
 	})
@@ -433,7 +433,7 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		Endpoint:    endpoint,
 		ClientAddrs: clientAddrs,
 		AllowedIPs:  clientAllowed,
-		DNS:         it.DNS,
+		DNS:         s.clientDNS(ctx, it),
 		MTU:         it.MTU,
 		Keepalive:   p.Keepalive,
 		ServerPub:   serverPub,
@@ -452,6 +452,24 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		QRPayload:       conf,
 		Warning:         warn,
 	}, nil
+}
+
+// clientDNS 返回下发给设备的 DNS 服务器地址。
+//
+// 打开了「内网域名解析」时，设备必须把 NAS 当作解析器，否则它解析不了家里设备名：
+// 此时下发的是**本连接的隧道地址**，而连接里配置的 DNS 变成本应用解析器的上游。
+// 关闭时保持原样（下发连接里配置的 DNS），行为与升级前完全一致。
+func (s *Service) clientDNS(ctx context.Context, it *model.Interface) []string {
+	if s.Store.GetSetting(ctx, model.SettingDNSResolve, "") != "1" {
+		return it.DNS
+	}
+	for _, a := range it.Addresses {
+		if ip, _, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil && ip.To4() != nil {
+			return []string{ip.String()}
+		}
+	}
+	// 没有可用的 IPv4 隧道地址时退回原值：宁可不生效，也不要下发一个设备连不上的地址
+	return it.DNS
 }
 
 // clientAllowedIPs 生成客户端侧的通行范围（决定设备上哪些流量走隧道）。

@@ -95,6 +95,12 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.With(requirePerm(model.PermBackupRestore)).Delete("/backups/{id}", s.handleDeleteBackup)
 			r.With(requirePerm(model.PermBackupRestore)).Post("/backups/{id}/restore", s.handleRestoreBackup)
 
+			// 内网域名解析（设备用主机名访问家里设备）
+			r.Get("/dns/records", s.handleListDNSRecords)
+			r.With(requirePerm(model.PermIfaceWrite)).Post("/dns/records", s.handleCreateDNSRecord)
+			r.With(requirePerm(model.PermIfaceWrite)).Patch("/dns/records/{id}", s.handleUpdateDNSRecord)
+			r.With(requirePerm(model.PermIfaceWrite)).Delete("/dns/records/{id}", s.handleDeleteDNSRecord)
+
 			// 审计与日志
 			r.Get("/audit", s.handleListAudit)
 			r.Get("/audit/verify", s.handleVerifyAudit)

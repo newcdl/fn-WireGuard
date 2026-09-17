@@ -291,7 +291,31 @@ export interface NetworkCheckResult {
   home_subnets: string[]
   /** 访问控制相关的配置矛盾（已按连接聚合，数量与连接数同阶） */
   access_issues: AccessIssue[]
+  /** 内网域名解析的运行状态 */
+  dns: DNSStatus
   messages: string[]
+}
+
+/** 内网域名解析的运行状态 */
+export interface DNSStatus {
+  enabled: boolean
+  /** 实际在监听的地址（形如 10.10.0.1:53） */
+  listen: string[]
+  records: number
+  queries: number
+  failed: number
+  /** 监听失败等异常原因（为空表示正常） */
+  note?: string
+}
+
+/** 一条内网域名记录（主机名 → 家里设备地址） */
+export interface DNSRecord {
+  id: number
+  name: string
+  ip: string
+  note: string
+  created_at: string
+  updated_at: string
 }
 
 export interface PeerConfigResult {
