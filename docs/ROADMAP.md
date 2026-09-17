@@ -251,7 +251,7 @@
   `TestRevokeTrustedDevice`、`TestAdminResetUserTOTP`、`TestAdminResetPasswordKicksSessions`、
   `TestChangePasswordKicksOtherSessions`。
 
-#### P2-4 接入飞牛统一网关（NAS 账号免密登录、计划中）
+#### P2-4 接入飞牛统一网关（NAS 账号免密登录、已完成）
 - **目标**：登录页同时提供「飞牛 NAS 账号」与「自建账号密码」两种方式，前者免密。
 - **官方机制**（`developer.fnnas.com` 核心概念 → 统一网关）：在 `app/ui/config` 用
   `gatewayPrefix` + `gatewaySocket` 注册入口，**请求先由 fnOS 校验用户会话**，再转发到应用
@@ -263,12 +263,40 @@
 - **⚠️ 最高风险点**：**只能在 Unix Socket 监听器上信任 `X-Trim-*`**。应用同时监听 TCP 端口，
   若在 TCP 上也信任这些头，任何人只要访问该端口就能伪造 `X-Trim-Isadmin: true` 冒充管理员。
   这对应官方安全红线第 1 条（绝不信任客户端传入的用户 ID）。
-- **其它待办**：`fnwg-web` 增监听 `${TRIM_APPDEST}/app.sock`；前端支持子路径部署
-  （现为绝对路径 `/api/v1`）；WebSocket 走 `/app/{appname}/ws`；`X-Trim-Username` → 本地角色映射
-  （已定：飞牛管理员 → admin，普通用户 → viewer）。
 - **依赖**：P2-5（安全码后手）需先具备，否则关闭端口登录后一旦网关异常就彻底无入口。
+- **实际实现**：
+  1. **通道**：`fnwg-web` 额外监听 `${TRIM_APPDEST}/app.sock`（官方要求 socket 必须是应用 target 目录下的
+     文件名），与端口监听**共用同一份路由** —— 业务逻辑只有一份，两条通道的差别仅限于「身份头是否可信」。
+     启动时先 unlink 旧 socket 再 bind，bind 后放开文件权限：文件权限只能回答「能不能连上」，
+     回答不了「是谁连的」，真正的准入在下一步。
+  2. **身份可信性的三重判定**（缺一不可，`internal/api/gateway.go`）：
+     ① 请求必须经 Unix Socket 到达（依据 `http.LocalAddrContextKey` 的地址类型，属连接层事实，无法伪造）；
+     ② 该连接的对端进程身份必须在允许列表内（`SO_PEERCRED`，默认只信 root 与本进程用户，
+     可用 `FNWG_GATEWAY_UIDS` 放行其它 UID）—— **单靠 ① 不够**：socket 是本机文件，
+     别的第三方应用同样连得上来，没有这一步就等于把管理员权限发给本机所有用户；
+     ③ TCP 通道上还有一道中间件把这些头**直接删除**，使「在端口上伪造身份」在结构上不可能，
+     而不是依赖每处代码自觉。
+  3. **身份映射**（`sys_gateway_identity` 表 + `service.GatewayLogin`）：以飞牛 **UID** 为唯一键，
+     本地账号名固定为 `nas:<uid>`，角色按 `X-Trim-Isadmin` 映射（管理员 → admin，其余 → viewer），
+     每次登录都同步一次 —— 飞牛侧撤权后本应用必须跟着降权。
+     **不按用户名匹配**：那样一个叫 admin 的飞牛普通用户会直接对上本地管理员账号，是提权漏洞；
+     同时禁止自建用户名包含冒号，避免两个命名空间撞车。
+     映射账号的口令散列是一个**格式非法的占位值**，因此它永远不可能用密码登录。
+  4. **登录方式开关**（P2-5 的第 3 层后手）：`both`（默认）/ `gateway_only` / `password_only`，
+     放在「系统设置 → 登录方式」页签，能进飞牛桌面就能改回来。
+     **防自锁**：只有**成功用过一次**飞牛账号免密登录之后，才允许关闭端口登录；否则拒绝并说明该怎么做。
+     该键也被通用设置接口拒绝 —— 前端不展示它，不代表服务端可以接受它。
+     安全码应急登录**始终可用**，不受登录方式影响。
+  5. **子路径部署**：前端资源由 `vite base: './'` 相对加载、路由用 hash 模式，
+     请求地址由 `frontend/src/api/base.ts` 统一按当前入口前缀拼出（`/app/fn-wireguard` 或空）；
+     后端把同一套 API 与静态资源挂在 `/app/fn-wireguard` 下。
+     于是**同一份产物在两种入口下都能正常工作**，包括 WebSocket。
+  6. **打包配套**：Web 服务单元的 `ReadWritePaths` 增加 `${TRIM_APPDEST}`；
+     安装脚本把 target 目录设为「同组可写 + sticky 位」—— sticky 位让 Web 进程只能建/删自己的 socket，
+     动不了 root 拥有的 `fnwg-agent` 等二进制（少了这一位，被攻陷的 Web 进程可能替换掉下次以 root 启动的 agent）；
+     卸载时一并清掉 socket 残骸。
 
-#### P2-5 防自锁后手（安全码 + CLI，已完成后两项；登录方式开关随 P2-4）
+#### P2-5 防自锁后手（安全码 + CLI + 登录方式开关，已完成）
 - **背景**：P2-4 选定「关闭独立端口登录」后，必须有退路，否则飞牛网关侧一旦异常就再也进不去。
 - **三层后手**（经确认）：
   1. **安全码（已完成）**：首次初始化时生成并**强制确认保存**后才放行进入控制台
@@ -281,7 +309,9 @@
   2. **`fnwg-cli` 用户管理（已完成）**：新增 `user list` / `user reset-password` / `user reset-2fa` /
      `security-code`，复用与界面完全相同的安全约束（重置口令即作废受信任设备与全部在线会话），
      操作以 `fnwg-cli` 身份写入审计日志。
-  3. **飞牛应用设置里的登录方式开关**：能进飞牛桌面即可切回自建账号模式 —— 随 P2-4 一起做。
+  3. **登录方式开关（已完成，随 P2-4）**：应用内「系统设置 → 登录方式」页签，能进飞牛桌面即可切回
+     自建账号模式。启用「只用飞牛账号」前必须先**成功用过一次**免密登录，否则拒绝并说明该怎么做 ——
+     没验证过就把端口登录关掉，等于亲手把自己锁在门外。安全码应急登录始终可用。
 
 #### P2-3 配置快照与一键回滚（已完成）
 - **目标**：关键操作自动留快照，可查看差异并回滚。
@@ -345,7 +375,7 @@ P2-3 快照回滚    （独立，但 P3 报表可复用其快照数据）
 |---|---|---|---|
 | 0.7.0 | 访问控制与通知 | 2~3 周 | **已完成**：功能实现 + 回归用例 + 文档更新 + 版本 bump（真机验证待做） |
 | 0.8.0 | 内网体验与管理效率 | 2~3 周 | **已完成**：P1-1 / P1-3 / P1-4 落地；P1-2 DDNS 取消（飞牛系统自带） |
-| 0.9.0 | 兼容性与账号安全 | 2~3 周 | **进行中**：P2-2 TOTP（0.8.2）/ P2-2b 对齐官方 2FA（0.8.3）/ P2-5 安全码与 CLI 后手（0.8.4）/ P2-3 快照回滚（0.8.5）/ P2-1 用户态回退（0.8.6）已完成；P2-4 统一网关待做 |
+| 0.9.0 | 兼容性与账号安全 | 2~3 周 | **已完成**：P2-2 TOTP（0.8.2）/ P2-2b 对齐官方 2FA（0.8.3）/ P2-5 安全码、CLI 与登录方式开关（0.8.4、0.8.7）/ P2-3 快照回滚（0.8.5）/ P2-1 用户态回退（0.8.6）/ P2-4 统一网关（0.8.7） |
 | 1.0.0 | 正式版 | 视前三版收敛情况 | 同上 + 全量回归 + 升级路径验证 |
 
 **每版固定动作**（与[附：发布与分支约定](#附发布与分支约定)配套）：
@@ -371,6 +401,7 @@ P2-3 快照回滚    （独立，但 P3 报表可复用其快照数据）
 | ~~DDNS~~（不做） | — | — | 飞牛系统自带 DDNS，本应用不重复实现 |
 | 批量导入 | 现有 `/config/import` | 现有解析与设备创建 | 单条导入行为 |
 | 用户态回退 | `Backend` 接口 | 接口契约与安全约束（只操作自己创建的对象） | 内核可用时的默认路径 |
+| 统一网关登录 | `internal/api/gateway.go` 的通道判定 | 现有会话与角色体系、审计日志 | 端口入口的既有行为（端口仍可用，只是身份头被删除） |
 | 快照回滚 | 现有备份/还原 | 审计日志、幂等收敛 | 系统网络（回滚只涉及本应用对象） |
 
 **一条通用约束**：任何新增的网络能力都必须落在「本应用自己的对象 / 自己的表」里，并能一键清理干净；涉及内核规则的改动一律配套穷举回归测试。
@@ -479,6 +510,22 @@ P2-3 快照回滚    （独立，但 P3 报表可复用其快照数据）
 - 关键操作各自留档、内容未变不重复留档、超出份数连文件一起清理、自动快照不淹没手动备份。
   → `TestSnapshotPruneKeepsLimit`、`TestSnapshotSkipsUnchangedConfig`、`TestSnapshotsStayOutOfBackupList`、
     `TestRollbackRejectsNonSnapshot`、`TestBackupCoversDNSRecords`。
+
+### V9b 统一网关（P2-4）
+- 从飞牛桌面打开本应用即免密进入；飞牛管理员 → 应用管理员，普通用户 → 只读。
+  → `TestGatewayLoginProvisionsAccountAndSyncsRole`（按网关注入的身份开通本地账号并同步角色）、
+    `TestGatewayLoginRejectsBadIdentity`（身份头缺失或格式非法时拒绝，绝不猜一个身份）。
+- **端口上伪造 `X-Trim-Isadmin: true` 绝不能拿到管理员会话**（本版最高风险点）。
+  → `TestGatewayLoginRejectedOnTCPPort`（端口通道伪造身份返回 403，且不下发会话 Cookie）；
+    `TestStripGatewayHeaders`（身份头在进入业务逻辑前就被删除）。
+- 飞牛侧一个叫 `admin` 的普通用户不得对上本地自建管理员账号；飞牛撤权后本应用同步降权。
+  → `TestGatewayIdentityKeyedByUIDNotUsername`、`TestGatewayLoginProvisionsAccountAndSyncsRole`。
+- 映射账号无法用密码登录；本地停用的账号不能靠网关「登回来」。
+  → 上述两用例中的口令断言 + `TestDisabledGatewayAccountStaysDisabled`。
+- 防自锁：未验证过网关可用时不允许关闭端口登录；通用设置接口也不能绕过该校验；安全码入口始终可用。
+  → `TestGatewayOnlyRequiresProvenGateway`、`TestGenericSettingsCannotBypassLoginModeGuard`。
+- 子路径部署：网关前缀下页面、接口、静态资源与 WebSocket 全部正常。
+  → `TestSPAServedUnderGatewayPrefix`、`TestGatewayStateExposedForLoginPage`。
 
 ### V10 流量报表（P3）
 - 可查询任意设备最近 7 天按天流量；与实时累计值误差 **< 5%**。

@@ -260,6 +260,62 @@
         </div>
       </el-tab-pane>
 
+      <!-- 登录方式：决定「谁能用什么方式进来」。
+           单独一个页签而不是塞进「账号管理」，是因为它管的是入口，
+           与「有哪些账号」是两件事。 -->
+      <el-tab-pane v-if="session.isAdmin" label="登录方式" name="login">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+          <template #title>
+            从飞牛桌面打开本应用时，飞牛已经确认了你的账号，可直接免密进入；
+            飞牛的管理员在本应用里也是管理员，普通用户为只读。
+          </template>
+        </el-alert>
+
+        <div class="fnwg-card" style="max-width: 860px">
+          <el-radio-group v-model="loginModeChoice" :disabled="loginModeSaving">
+            <el-radio value="both" class="fnwg-radio-line">两种方式都允许（推荐）</el-radio>
+            <el-radio value="gateway_only" class="fnwg-radio-line">只用飞牛账号（关闭端口登录）</el-radio>
+            <el-radio value="password_only" class="fnwg-radio-line">只用应用账号密码</el-radio>
+          </el-radio-group>
+
+          <div class="fnwg-hint" style="margin-top: 4px">
+            <div v-if="loginModeChoice === 'gateway_only'">
+              关闭后，直接访问端口将无法用账号密码登录，端口只保留「安全码应急登录」。
+              只要还能进飞牛桌面，就随时可以回到这里改回来。
+            </div>
+            <div v-else-if="loginModeChoice === 'password_only'">
+              关闭后，从飞牛桌面进入时也要输入应用账号密码；由飞牛账号自动创建的账号本来就没有密码，
+              将无法登录，需要管理员为它单独设置密码。
+            </div>
+            <div v-else>手机、电脑用应用账号密码登录；从飞牛桌面进入时免密。</div>
+          </div>
+
+          <el-alert
+            v-if="loginModeChoice === 'gateway_only' && !loginModeState.gateway_proven"
+            type="warning"
+            :closable="false"
+            show-icon
+            style="margin: 10px 0 0"
+            title="还不能关闭端口登录：本应用尚未成功用过一次飞牛账号免密登录。请先从飞牛桌面用本应用图标打开一次，再回来开启。"
+          />
+
+          <div class="fnwg-toolbar" style="margin-top: 14px">
+            <el-button
+              type="primary"
+              :loading="loginModeSaving"
+              :disabled="loginModeChoice === loginModeState.mode"
+              @click="saveLoginMode"
+            >
+              保存
+            </el-button>
+            <el-tag v-if="loginModeState.gateway_entry" size="small" type="success" effect="plain">
+              当前正通过飞牛桌面入口访问
+            </el-tag>
+            <el-tag v-else size="small" type="info" effect="plain">当前正通过端口访问</el-tag>
+          </div>
+        </div>
+      </el-tab-pane>
+
       <!-- 内网域名：让设备用主机名访问家里设备 -->
       <el-tab-pane label="内网域名" name="dns">
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
@@ -690,6 +746,8 @@ import type {
   BackupRecord,
   DNSRecord,
   Health,
+  LoginMode,
+  LoginModeState,
   NotifyResult,
   NotifyStatus,
   SnapshotDiff,
@@ -722,6 +780,42 @@ const settings = reactive<Record<string, string>>({
   default_dns: '',
 })
 const savingSettings = ref(false)
+
+// 登录方式：与「接入设置」分开保存。它决定谁能进得来，误改的后果比改错一个
+// 对外地址严重得多，因此不跟其它设置项共用一个保存按钮。
+const loginModeState = reactive<LoginModeState>({ mode: 'both', gateway_proven: false, gateway_entry: false })
+const loginModeChoice = ref<LoginMode>('both')
+const loginModeSaving = ref(false)
+
+async function loadLoginMode() {
+  if (!session.isAdmin) return
+  try {
+    const st = await session.loadLoginMode()
+    loginModeState.mode = st.mode
+    loginModeState.gateway_proven = st.gateway_proven
+    loginModeState.gateway_entry = st.gateway_entry
+    loginModeChoice.value = st.mode
+  } catch {
+    // 读不到不该影响其它设置页；保存时服务端仍会做同样的校验
+  }
+}
+
+async function saveLoginMode() {
+  loginModeSaving.value = true
+  try {
+    const out = await session.setLoginMode(loginModeChoice.value)
+    loginModeState.mode = out.mode
+    loginModeState.gateway_proven = out.gateway_proven
+    loginModeChoice.value = out.mode
+    ElMessage.success('登录方式已更新')
+  } catch (e) {
+    // 服务端会说明「为什么现在不能这么改」（例如还没验证过网关可用），
+    // 不能吞掉它，否则用户只会看到一个点了没反应的按钮。
+    ElMessage.error((e as Error).message)
+  } finally {
+    loginModeSaving.value = false
+  }
+}
 
 // 事件通知单独一组状态，与「接入设置」各自保存：
 // 改通知渠道不该连带改动对外访问地址这类会影响所有设备的配置。
@@ -1281,6 +1375,7 @@ async function onImportFile(e: Event) {
 
 onMounted(async () => {
   await loadAll()
+  await loadLoginMode()
 })
 </script>
 

@@ -9,21 +9,65 @@
 
       <!-- 第一步：账号与口令 -->
       <el-form v-if="step === 'password'" :model="form" label-position="top" @submit.prevent="submit">
-        <el-form-item label="登录账号">
-          <el-input v-model="form.username" placeholder="请输入登录账号" autofocus />
-        </el-form-item>
-        <el-form-item label="登录密码">
-          <el-input
-            v-model="form.password"
-            type="password"
-            show-password
-            placeholder="请输入登录密码"
-            @keyup.enter="submit"
-          />
-        </el-form-item>
-        <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="submit">
-          登录
-        </el-button>
+        <!-- 飞牛桌面入口：NAS 账号免密登录，一次点击（正常情况下已自动完成） -->
+        <template v-if="gatewayAvailable">
+          <el-alert type="success" :closable="false" show-icon style="margin-bottom: 12px">
+            <template #title>
+              已识别飞牛账号「{{ session.gateway.username || '当前用户' }}」，可直接免密进入。
+            </template>
+          </el-alert>
+          <el-button
+            type="primary"
+            size="large"
+            style="width: 100%; margin-bottom: 12px"
+            :loading="loading"
+            @click="submitGateway"
+          >
+            用飞牛账号进入
+          </el-button>
+        </template>
+
+        <!-- 网关通道存在但身份不可信：把原因说清楚，而不是只说一句「失败」 -->
+        <el-alert
+          v-else-if="session.gateway.blocked_reason"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+          :title="session.gateway.blocked_reason"
+        />
+
+        <!-- 管理员关闭了端口登录：不展示表单，直接指路，避免用户白试一遍 -->
+        <el-alert
+          v-if="passwordLoginDisabled"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+        >
+          <template #title>管理员已关闭「账号密码登录」，请从飞牛桌面打开本应用。</template>
+          <template #default>
+            若进不去，可用下方的「安全码应急登录」——它始终可用，是防止把自己锁在门外的最后入口。
+          </template>
+        </el-alert>
+
+        <template v-if="!passwordLoginDisabled">
+          <el-form-item label="登录账号">
+            <el-input v-model="form.username" placeholder="请输入登录账号" autofocus />
+          </el-form-item>
+          <el-form-item label="登录密码">
+            <el-input
+              v-model="form.password"
+              type="password"
+              show-password
+              placeholder="请输入登录密码"
+              @keyup.enter="submit"
+            />
+          </el-form-item>
+          <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="submit">
+            登录
+          </el-button>
+        </template>
         <el-button link style="width: 100%; margin: 10px 0 0" @click="step = 'emergency'">
           密码和验证码都用不了？用安全码应急登录
         </el-button>
@@ -109,7 +153,7 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useSession } from '@/stores/session'
@@ -123,6 +167,11 @@ const realtime = useRealtime()
 const loading = ref(false)
 const form = reactive({ username: '', password: '' })
 
+/** 当前是不是飞牛桌面打开的应用（可用 NAS 账号免密登录）。 */
+const gatewayAvailable = computed(() => !!session.gateway.available)
+/** 管理员是否关闭了端口上的账号密码登录（安全码应急入口不受影响）。 */
+const passwordLoginDisabled = computed(() => session.loginMode === 'gateway_only')
+
 /** 当前界面：password（账号口令）→ totp（二次验证）/ emergency（安全码）→ newcode（保存新安全码）。 */
 const step = ref<'password' | 'totp' | 'emergency' | 'newcode'>('password')
 const challenge = ref('')
@@ -133,6 +182,19 @@ const emCode = ref('')
 const emPassword = ref('')
 const newCode = ref('')
 const savedNew = ref(false)
+
+/** 飞牛账号免密登录（正常情况下进页面前已自动完成，这里是手动兜底）。 */
+async function submitGateway() {
+  loading.value = true
+  try {
+    await session.gatewayLogin()
+    enter()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    loading.value = false
+  }
+}
 
 async function submit() {
   if (!form.username || !form.password) {

@@ -16,15 +16,15 @@ case "$arch" in
     *) fnwg_fail "不支持的系统架构：${arch}" ;;
 esac
 
-# 内核模块：内核态可用则最佳，不可用则提示将依赖用户态实现（当前版本会明确报错，便于定位）
+# 数据面可用性：内核模块优先（标准模式）；缺失时只要有 /dev/net/tun，
+# 应用会自动改用用户态实现（兼容模式），功能相同、速度略低，因此不算致命。
 if modprobe wireguard >/dev/null 2>&1 || [ -e /sys/module/wireguard ]; then
-    fnwg_log "内核 wireguard 模块可用"
+    fnwg_log "内核 wireguard 模块可用，将使用标准模式"
+elif [ -e /dev/net/tun ]; then
+    fnwg_log "未检测到内核 wireguard 模块，将自动使用兼容模式（用户态实现），功能不受影响"
 else
-    fnwg_log "警告：未检测到内核 wireguard 模块，接口将无法创建。请确认系统内核版本（建议 5.6 以上）后重试。"
-fi
-
-if [ ! -e /dev/net/tun ]; then
-    fnwg_log "提示：未检测到 /dev/net/tun，内核态工作不受影响；如需用户态回退请在系统设置中启用 TUN/TAP。"
+    fnwg_log "警告：内核 wireguard 模块与 /dev/net/tun 都不可用，新建的连接将无法工作。" \
+        "请确认系统内核版本（建议 5.6 以上），或在系统中启用 TUN/TAP 后重试。"
 fi
 
 port="$(fnwg_service_port)"

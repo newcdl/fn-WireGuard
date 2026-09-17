@@ -101,6 +101,38 @@ export interface Status {
   updated_at: string
 }
 
+/** 登录方式：网关免密 / 端口账号密码 的组合。 */
+export type LoginMode = 'both' | 'gateway_only' | 'password_only'
+
+/** 当前页面所处入口的描述（登录前就要知道，用于决定登录页怎么展示）。 */
+export interface GatewayEntry {
+  /** 是否经由飞牛统一网关的 Unix Socket 到达。 */
+  entry?: boolean
+  /** 是否拿到了可信的飞牛身份（可用于一键免密登录）。 */
+  available?: boolean
+  username?: string
+  is_admin?: boolean
+  /** 通道存在但身份未被信任时的原因，直接展示给用户/运维。 */
+  blocked_reason?: string
+}
+
+export interface AuthState {
+  initialized: boolean
+  authenticated: boolean
+  user: User | null
+  login_mode: LoginMode
+  gateway: GatewayEntry
+}
+
+/** 登录方式开关的当前状态。 */
+export interface LoginModeState {
+  mode: LoginMode
+  /** 是否已成功用过飞牛账号免密登录（未验证前不允许关闭端口登录）。 */
+  gateway_proven: boolean
+  /** 当前请求是否来自网关入口。 */
+  gateway_entry: boolean
+}
+
 export interface Health {
   agent_up: boolean
   agent_version: string

@@ -13,6 +13,8 @@ if fnwg_have_systemd; then
     fnwg_systemd_remove
 fi
 rm -f "$TRIM_PKGVAR/agent.pid" "$TRIM_PKGVAR/web.pid" "$TRIM_PKGVAR/agent.sock"
+# 飞牛统一网关注册的 socket：留着会是一个连不上的残骸，一并清掉
+rm -f "$TRIM_APPDEST/app.sock" 2>/dev/null || true
 
 # 再次确认内核对象已清理（uninstall_init 已执行过一次；此处为兜底，且此时 target 可能已删除）
 if [ -x "$TRIM_APPDEST/fnwg-agent" ]; then

@@ -6,7 +6,9 @@
             "type": "iframe",
             "protocol": "http",
             "port": "34567",
-            "url": "/",
+            "gatewayPrefix": "/app/fn-wireguard",
+            "gatewaySocket": "app.sock",
+            "url": "/app/fn-wireguard",
             "allUsers": true
         }
     }

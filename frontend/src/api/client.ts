@@ -1,4 +1,7 @@
-const BASE = '/api/v1'
+import { API_BASE } from './base'
+
+// 接口根地址随入口变化（独立端口 / 飞牛统一网关子路径），见 base.ts。
+const BASE = API_BASE
 
 export class ApiError extends Error {
   status: number

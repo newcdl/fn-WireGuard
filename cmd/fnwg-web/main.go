@@ -100,8 +100,9 @@ func main() {
 	srv := api.NewServer(svc, logger, cfg.Version, cfg.ShareDir())
 
 	httpSrv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port),
-		Handler:           srv.Router(assets),
+		Addr: fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port),
+		// 端口通道：入口处删除网关注入类身份头，杜绝伪造管理员（见 api.TCPRouter）。
+		Handler:           srv.TCPRouter(assets),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -113,6 +114,26 @@ func main() {
 			stop()
 		}
 	}()
+
+	// 飞牛统一网关通道：请求先由 fnOS 校验飞牛账号会话，再经 Unix Socket 转发过来，
+	// 并带上可信身份头 —— 因此这条通道上的请求才可能以飞牛账号免密登录。
+	// socket 起不来不该阻断端口服务（安全码应急入口正是为此保留的），只记日志。
+	if sockPath := cfg.AppSockPath(); sockPath != "" {
+		gw, err := srv.ListenGateway(sockPath, srv.Router(assets))
+		if err != nil {
+			logger.Warn("飞牛统一网关入口不可用（端口入口不受影响）", "path", sockPath, "err", err)
+		} else {
+			go func() {
+				logger.Info("飞牛统一网关入口已就绪", "socket", gw.Path)
+				if err := gw.Serve(ctx); err != nil {
+					logger.Error("飞牛统一网关入口异常退出", "err", err)
+				}
+			}()
+			defer func() { _ = gw.Close() }()
+		}
+	} else {
+		logger.Info("未提供应用目录（TRIM_APPDEST），跳过飞牛统一网关入口")
+	}
 
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

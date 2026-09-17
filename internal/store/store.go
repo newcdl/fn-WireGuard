@@ -206,6 +206,23 @@ CREATE TABLE IF NOT EXISTS app_log (
 );
 CREATE INDEX IF NOT EXISTS idx_applog_ts ON app_log(ts DESC);
 
+-- 飞牛统一网关的身份映射：网关校验会话后通过 X-Trim-* 头告知「当前是谁」，
+-- 本应用把它映射成一个本地账号，后续一律用本地会话（业务权限仍由本应用负责）。
+--
+-- 为什么以 trim_uid 为键而不是用户名：
+--   用户名可以改、也可能与本地自建账号重名。若按用户名匹配，一个叫 admin 的
+--   飞牛普通用户就会直接对上本应用的本地管理员账号 —— 那是提权漏洞。
+--   飞牛 UID 是稳定的，且本地账号名由我们生成（nas:<uid>），结构上不可能撞车。
+CREATE TABLE IF NOT EXISTS sys_gateway_identity (
+  trim_uid      TEXT    PRIMARY KEY,
+  user_id       INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
+  trim_username TEXT    NOT NULL DEFAULT '',
+  is_admin      INTEGER NOT NULL DEFAULT 0,
+  last_seen_at  TEXT,
+  created_at    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gw_identity_user ON sys_gateway_identity(user_id);
+
 CREATE TABLE IF NOT EXISTS app_setting (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL DEFAULT ''

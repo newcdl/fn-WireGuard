@@ -89,6 +89,12 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 	if username == "" {
 		return nil, errors.New("用户名不能为空")
 	}
+	// 冒号保留给外部身份映射自动生成的账号名（如 nas:1000）。
+	// 不允许自建账号使用，否则「外部身份」与「本地账号」会共用同一个命名空间，
+	// 迟早撞在同一个用户名上。
+	if strings.Contains(username, ":") {
+		return nil, errors.New("用户名不能包含冒号（保留给飞牛账号映射使用）")
+	}
 	switch role {
 	case model.RoleAdmin, model.RoleOperator, model.RoleViewer:
 	default:

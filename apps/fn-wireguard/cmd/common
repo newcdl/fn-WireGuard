@@ -63,6 +63,27 @@ fnwg_prepare_dirs() {
     chmod 770 "$TRIM_PKGVAR/log" "$TRIM_PKGVAR/share" "$TRIM_PKGVAR/backup" 2>/dev/null || true
     # setgid 保证新建文件继承 fnwg 属组，两个进程才能共享数据库
     chmod g+s "$TRIM_PKGVAR" "$TRIM_PKGETC" 2>/dev/null || true
+
+    fnwg_prepare_gateway_socket
+}
+
+# fnwg_prepare_gateway_socket：为飞牛统一网关准备 socket 落点。
+#
+# 官方要求 gatewaySocket 只是文件名、且必须落在应用 target 目录（${TRIM_APPDEST}），
+# 因此 socket 只能建在那里；而 Web 进程以 fnwg 用户运行，target 目录默认属于 root，
+# 必须让它同组可写，否则 Web 进程连 socket 都建不出来（表现为「网关入口不可用」）。
+#
+# 为什么加 sticky 位：目录可写意味着可以**增删改名**其中的文件，
+# 而 target 里放着 fnwg-web / fnwg-agent 这些可执行文件（agent 还是 root 身份运行）。
+# sticky 位让 fnwg 只能创建/删除自己的 socket，动不了 root 拥有的二进制 ——
+# 少这一位，一个被攻陷的 Web 进程就能替换掉下次以 root 启动的 agent。
+fnwg_prepare_gateway_socket() {
+    [ -n "${TRIM_APPDEST:-}" ] || return 0
+    [ -d "$TRIM_APPDEST" ] || return 0
+    chgrp "$FNWG_GROUP" "$TRIM_APPDEST" 2>/dev/null || true
+    chmod g+w,+t "$TRIM_APPDEST" 2>/dev/null || true
+    # 上一次运行留下的 socket 文件会让进程启动时 bind 失败，先清掉
+    rm -f "$TRIM_APPDEST/app.sock" 2>/dev/null || true
 }
 
 # fnwg_fix_db_perms：修正数据库与主密钥属组，确保 Web 进程可读写。
@@ -132,7 +153,7 @@ RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=${TRIM_PKGVAR} ${TRIM_PKGETC} ${TRIM_PKGHOME}
+ReadWritePaths=${TRIM_PKGVAR} ${TRIM_PKGETC} ${TRIM_PKGHOME} ${TRIM_APPDEST}
 LimitNOFILE=65536
 SyslogIdentifier=fnwg-web
 

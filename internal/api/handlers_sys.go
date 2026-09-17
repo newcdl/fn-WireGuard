@@ -20,7 +20,15 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	out := map[string]any{"initialized": initialized, "authenticated": false, "user": nil}
+	out := map[string]any{
+		"initialized":   initialized,
+		"authenticated": false,
+		"user":          nil,
+		// 登录方式与网关入口信息要在「登录之前」就告诉前端，
+		// 否则登录页无法判断该显示账号密码表单还是「一键免密登录」。
+		"login_mode": s.svc.LoginMode(r.Context()),
+		"gateway":    s.gatewayState(r),
+	}
 	if !initialized {
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -129,6 +137,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 管理员若关闭了端口上的账号密码登录（仅保留飞牛账号免密），
+	// 这里必须挡住：界面上的隐藏只是体验，服务端拒绝才是规则。
+	if s.svc.LoginMode(r.Context()) == service.LoginModeGatewayOnly {
+		writeErr(w, http.StatusForbidden,
+			"管理员已关闭端口登录，请从飞牛桌面打开本应用（飞牛账号免密登录）；"+
+				"若进不去，可用登录页的「安全码应急登录」")
 		return
 	}
 	key := clientIP(r) + "|" + in.Username

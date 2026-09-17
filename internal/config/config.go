@@ -98,6 +98,23 @@ func (c *Config) NetStatePath() string { return filepath.Join(c.VarDir, "netstat
 // LogDir 返回日志目录。
 func (c *Config) LogDir() string { return filepath.Join(c.VarDir, "log") }
 
+// AppSockFile 是飞牛统一网关约定的 socket 文件名。
+//
+// 官方要求 gatewaySocket 只填文件名（不能带路径），且文件必须落在应用的
+// target 目录下，因此这里只暴露文件名，路径由 AppSockPath 拼出来。
+const AppSockFile = "app.sock"
+
+// AppSockPath 返回飞牛统一网关使用的 Unix Socket 路径。
+//
+// 固定为 <TRIM_APPDEST>/app.sock：这个位置不是我们的选择，而是网关的约定 ——
+// 写成别处网关就找不到，统一网关入口会直接不可用。
+func (c *Config) AppSockPath() string {
+	if c.AppDest == "" {
+		return ""
+	}
+	return filepath.Join(c.AppDest, AppSockFile)
+}
+
 // ShareDir 返回面向用户的共享导出目录（fnOS data-share）。
 // 优先使用 fnOS 依据 config/resource 创建的共享目录，其次回退到 var/share。
 func (c *Config) ShareDir() string {
