@@ -9,7 +9,13 @@
       popper-class="fnwg-help-popper"
     >
       <template #reference>
-        <el-icon class="fnwg-field-help-icon" :title="`查看「${meta.label}」说明`">
+        <!--
+          @click.prevent 是必须的：el-form-item 会把标签渲染成 <label for="控件 id">，
+          而问号就在标签里。不拦下默认行为的话，点问号会被浏览器当成「点击它关联的控件」——
+          对于开关/勾选框就是被连带切换（看说明却把开关打开了）。
+          只 preventDefault、不 stopPropagation：气泡自身的打开与点击外部关闭都依赖事件冒泡。
+        -->
+        <el-icon class="fnwg-field-help-icon" :title="`查看「${meta.label}」说明`" @click.prevent>
           <QuestionFilled />
         </el-icon>
       </template>

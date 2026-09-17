@@ -223,7 +223,7 @@
           <template #title>
             让连进来的设备用「主机名」访问家里设备（例如手机浏览器输入 nas.lan），不用去记 IP。
             开启后，下发给设备的 DNS 会指向本连接的隧道地址，由本应用代为解析：登记的域名由本应用应答，
-            其余上网域名原样转发到你在连接里配置的 DNS。注意：修改后设备要重新扫码才会用上新的 DNS。
+            其余上网域名原样转发到你在连接里配置的 DNS。
           </template>
         </el-alert>
 
@@ -232,12 +232,32 @@
           <el-switch
             v-model="dnsEnabled"
             :disabled="!session.isAdmin"
+            :before-change="confirmDNSChange"
             active-text="开启内网域名解析"
             @change="saveDNSEnabled"
           />
           <FieldTips :meta="S.dns_resolve" />
           <div v-if="!session.isAdmin" class="fnwg-hint">仅管理员可以修改这项开关。</div>
         </el-form-item>
+
+        <!--
+          这条提示必须醒目：改动开关会波及**所有已接入设备**。
+          用户最容易误解的就是「改完就生效了」—— 实际上设备用的是它自己那份配置，
+          服务端改不到，必须让用户事先知道要重新扫码，并知道为什么。
+        -->
+        <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 12px">
+          <template #title>注意：改动这个开关后，所有已接入的设备都需要重新扫码</template>
+          <div class="fnwg-dns-warn">
+            <p>
+              <strong>为什么：</strong>DNS 是写在「设备自己那份配置」里的。手机、电脑连上后用的是它当初扫码导入的那份配置，
+              NAS 这边改不到设备里的东西，所以服务端换了 DNS，设备并不会自动知道。
+            </p>
+            <p>
+              <strong>怎么做：</strong>改动后，设备列表里这些设备会被标出「<strong>需重新扫码</strong>」，
+              点一下重新生成二维码、用设备再扫一次即可。<strong>不需要删除设备</strong>，设备上的其它设置也不会变。
+            </p>
+          </div>
+        </el-alert>
 
         <!-- 运行状态：只说「开关是开着的」不够，用户要知道它到底有没有在工作 -->
         <el-alert
@@ -547,14 +567,35 @@ async function loadDNS() {
   }
 }
 
+/** 改动开关会波及所有已接入设备，先让用户确认（返回 false 表示不改）。 */
+function confirmDNSChange(): Promise<boolean> {
+  const turningOn = !dnsEnabled.value
+  return ElMessageBox.confirm(
+    `${turningOn ? '开启' : '关闭'}后，下发给设备的 DNS 会${
+      turningOn ? '改成本连接的隧道地址' : '恢复成你在连接里配置的 DNS'
+    }。\n\n` +
+      'DNS 写在设备自己那份配置里，服务端改不到它，所以：\n' +
+      '所有已接入的设备都需要重新扫码导入一次才会生效。\n\n' +
+      '设备列表会标出「需重新扫码」，点一下重新生成二维码即可，不需要删除设备。',
+    turningOn ? '确认开启内网域名解析？' : '确认关闭内网域名解析？',
+    { type: 'warning', confirmButtonText: turningOn ? '确认开启' : '确认关闭', cancelButtonText: '先不改' },
+  )
+    .then(() => true)
+    .catch(() => false)
+}
+
 async function saveDNSEnabled() {
   const v = dnsEnabled.value ? '1' : ''
   try {
     await api.put('/settings', { dns_resolve_enabled: v })
-    ElMessage.success(v ? '已开启内网域名解析（设备需重新扫码才会用上新的 DNS）' : '已关闭内网域名解析')
+    ElMessage.success(
+      v
+        ? '已开启：请到设备列表，对标记「需重新扫码」的设备重新生成二维码'
+        : '已关闭：设备同样需要重新扫码才会恢复原来的 DNS',
+    )
     await refreshSystemHealth()
   } catch (e) {
-    dnsEnabled.value = !dnsEnabled.value // 保存失败要回滚，否则界面显示的状态是假的
+    dnsEnabled.value = !dnsEnabled.value // 保存失败要回滚，否则界面显示的开关状态是假的
     ElMessage.error((e as Error).message)
   }
 }
@@ -836,6 +877,16 @@ onMounted(async () => {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   line-height: 1.6;
+}
+
+/* 内网域名解析的影响提示：正文分「为什么 / 怎么做」两段，行距放松一点便于扫读 */
+.fnwg-dns-warn {
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.fnwg-dns-warn p {
+  margin: 4px 0 0;
 }
 
 .fnwg-about-text {
