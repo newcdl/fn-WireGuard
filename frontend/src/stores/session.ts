@@ -83,12 +83,44 @@ export const useSession = defineStore('session', {
       this.authenticated = true
       await this.loadMe()
     },
-    async setup(username: string, password: string) {
-      const u = await api.post<User>('/auth/setup', { username, password })
-      this.user = u
+    /**
+     * 初始化管理员。
+     *
+     * 返回一次性下发的应急安全码（明文只在这一刻存在）；生成失败时 securityCodeError 非空。
+     */
+    async setup(username: string, password: string): Promise<{
+      securityCode: string
+      securityCodeError: string
+    }> {
+      const res = await api.post<{
+        user: User
+        security_code?: string
+        security_code_error?: string
+      }>('/auth/setup', { username, password })
+      this.user = res.user
       this.authenticated = true
       this.initialized = true
       await this.loadMe()
+      return {
+        securityCode: res.security_code || '',
+        securityCodeError: res.security_code_error || '',
+      }
+    },
+
+    /**
+     * 应急登录：用安全码进入。
+     *
+     * 成功后服务端会下发新的一枚安全码（旧码已被消耗），必须展示给用户保存。
+     */
+    async emergencyLogin(code: string, newPassword: string): Promise<string> {
+      const res = await api.post<{ user: User; new_code: string }>('/auth/emergency', {
+        code,
+        new_password: newPassword,
+      })
+      this.user = res.user
+      this.authenticated = true
+      await this.loadMe()
+      return res.new_code || ''
     },
     async logout() {
       await api.post('/auth/logout')

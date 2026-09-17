@@ -443,6 +443,44 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) error {
 	return err
 }
 
+// ---------------------------------------------------------------- 应急安全码
+
+// SetSecurityCode 写入新的安全码哈希。
+//
+// 会先清空旧记录——一是保证「同时只有一枚有效安全码」，二是让「应急登录用掉旧码」
+// 与「管理员重新生成」这两件事共用同一条路径，不会出现两枚码同时有效的窗口。
+func (s *Store) SetSecurityCode(ctx context.Context, codeHash string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sys_security_code`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sys_security_code(code_hash,created_at) VALUES(?,?)`,
+		codeHash, ts(time.Now())); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// GetSecurityCode 返回当前安全码的哈希；未设置时返回 ErrNotFound。
+func (s *Store) GetSecurityCode(ctx context.Context) (string, error) {
+	var h string
+	err := s.db.QueryRowContext(ctx, `SELECT code_hash FROM sys_security_code ORDER BY id DESC LIMIT 1`).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return h, err
+}
+
+// ClearSecurityCode 清空安全码（没有任何有效安全码时，应急登录不可用）。
+func (s *Store) ClearSecurityCode(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_security_code`)
+	return err
+}
+
 // ---------------------------------------------------------------- 审计
 
 // AddAudit 追加一条审计记录，并串接哈希链。

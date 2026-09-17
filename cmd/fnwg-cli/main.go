@@ -4,14 +4,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"fnwg/internal/agentapi"
 	"fnwg/internal/config"
+	"fnwg/internal/model"
 	"fnwg/internal/secretbox"
 	"fnwg/internal/service"
 	"fnwg/internal/store"
@@ -55,6 +58,10 @@ func main() {
 		runCleanupForeign(cfg, name)
 	case "netcheck":
 		runNetCheck(cfg)
+	case "user":
+		runUser(cfg, os.Args[2:])
+	case "security-code":
+		runSecurityCode(cfg, os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -75,6 +82,18 @@ func usage() {
   fnwg-cli reconcile              立即把数据库期望态下发到内核
   fnwg-cli export --all --out DIR 导出全部接口的 wg-quick 配置
   fnwg-cli version                输出版本
+
+账号与安全码（界面进不去时的后手，需 root / sudo）:
+  fnwg-cli user list
+      列出全部账号，含是否开启二次验证。
+  fnwg-cli user reset-password <账号> [--password <新密码>]
+      重置指定账号的密码；不指定新密码时随机生成并显示一次。
+      同时作废该账号的受信任设备与全部在线会话。
+  fnwg-cli user reset-2fa <账号>
+      关闭指定账号的二次验证（清空动态口令、恢复码与受信任设备）。
+      适用于用户手机丢失且恢复码也遗失的情况。
+  fnwg-cli security-code
+      重新生成应急「安全码」（旧码立即作废）。
 
 环境变量与 fnOS 一致（TRIM_PKGVAR / TRIM_PKGETC 等），也可用 --var / --socket 覆盖。
 
@@ -203,6 +222,198 @@ func openStore(cfg *config.Config) (*store.Store, error) {
 		return nil, err
 	}
 	return store.Open(cfg.DBPath(), box)
+}
+
+// ---------------------------------------------------------------- 账号与安全码
+//
+// 这组命令是「后手」的一部分：当界面已经进不去（管理员忘密码、手机丢了、恢复码也没了），
+// 只要能 SSH 上来，就能靠它们把控制权收回来。
+// 所有操作都会写入审计日志（操作人记为 fnwg-cli），保证后手操作同样可追溯。
+
+// passwordAlphabet 去掉了 0/O、1/l/I 这类易混字符，方便用户照着屏幕手输。
+const passwordAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+
+// randomPassword 生成 20 位随机密码（约 116 位熵），用于重置密码时不想自己想的场景。
+func randomPassword() (string, error) {
+	buf := make([]byte, 20)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	out := make([]byte, len(buf))
+	for i, b := range buf {
+		out[i] = passwordAlphabet[int(b)%len(passwordAlphabet)]
+	}
+	return string(out), nil
+}
+
+// cliAudit 记录一条来自命令行的操作。
+func cliAudit(ctx context.Context, st *store.Store, action, targetID, detail string) {
+	_ = st.AddAudit(ctx, &model.AuditEntry{
+		Ts:         time.Now(),
+		Username:   "fnwg-cli",
+		SrcIP:      "local",
+		Action:     action,
+		TargetType: "user",
+		TargetID:   targetID,
+		Result:     "ok",
+		Message:    detail,
+	})
+}
+
+func runUser(cfg *config.Config, args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "用法: fnwg-cli user <list|reset-password|reset-2fa>")
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "打开数据库失败:", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	switch sub {
+	case "list":
+		users, err := st.ListUsers(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "读取账号失败:", err)
+			os.Exit(1)
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\t账号\t角色\t状态\t二次验证\t最近登录")
+		for _, u := range users {
+			status, totp := "启用", "未开启"
+			if u.Status != 1 {
+				status = "停用"
+			}
+			if u.TOTPEnabled {
+				totp = "已开启"
+			}
+			last := "-"
+			if u.LastLoginAt != nil {
+				last = u.LastLoginAt.Local().Format("2006-01-02 15:04")
+			}
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", u.ID, u.Username, u.Role, status, totp, last)
+		}
+		w.Flush()
+
+	case "reset-password":
+		name, newPw := "", ""
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case "--password", "-p":
+				if i+1 < len(rest) {
+					newPw = rest[i+1]
+					i++
+				}
+			default:
+				if name == "" {
+					name = rest[i]
+				}
+			}
+		}
+		if name == "" {
+			fmt.Fprintln(os.Stderr, "用法: fnwg-cli user reset-password <账号> [--password <新密码>]")
+			os.Exit(2)
+		}
+		u, err := st.GetUserByUsername(ctx, name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "账号不存在: %s\n", name)
+			os.Exit(1)
+		}
+		generated := false
+		if newPw == "" {
+			if newPw, err = randomPassword(); err != nil {
+				fmt.Fprintln(os.Stderr, "生成随机密码失败:", err)
+				os.Exit(1)
+			}
+			generated = true
+		}
+		h, err := service.HashPassword(newPw)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "密码不符合要求:", err)
+			os.Exit(1)
+		}
+		u.PasswordHash = h
+		if err := st.UpdateUser(ctx, u); err != nil {
+			fmt.Fprintln(os.Stderr, "写入失败:", err)
+			os.Exit(1)
+		}
+		// 与界面上「改密码」保持同一条安全约束：作废受信任设备、清掉全部在线会话。
+		_ = st.DeleteAllTrustedDevices(ctx, u.ID)
+		_ = st.DeleteUserSessions(ctx, u.ID)
+		cliAudit(ctx, st, "user.reset_password", u.Username, "通过命令行重置口令")
+		if generated {
+			fmt.Printf("已将「%s」的密码重置为：%s\n", u.Username, newPw)
+			fmt.Println("（此密码只显示这一次，请立即登录并修改）")
+		} else {
+			fmt.Printf("已重置「%s」的密码。\n", u.Username)
+		}
+		fmt.Println("该账号的受信任设备与全部在线会话已一并作废。")
+
+	case "reset-2fa":
+		if len(rest) == 0 || rest[0] == "" {
+			fmt.Fprintln(os.Stderr, "用法: fnwg-cli user reset-2fa <账号>")
+			os.Exit(2)
+		}
+		u, err := st.GetUserByUsername(ctx, rest[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "账号不存在: %s\n", rest[0])
+			os.Exit(1)
+		}
+		if !u.TOTPEnabled {
+			fmt.Printf("「%s」未开启二次验证，无需重置。\n", u.Username)
+			return
+		}
+		if err := st.ClearUserTOTP(ctx, u.ID); err != nil {
+			fmt.Fprintln(os.Stderr, "重置失败:", err)
+			os.Exit(1)
+		}
+		_ = st.DeleteUserSessions(ctx, u.ID)
+		cliAudit(ctx, st, "totp.admin_reset", u.Username, "通过命令行重置二次验证")
+		fmt.Printf("已重置「%s」的二次验证：动态口令、恢复码与受信任设备均已清空。\n", u.Username)
+		fmt.Println("该账号现在仅凭密码即可登录，请尽快重新绑定。")
+
+	default:
+		fmt.Fprintf(os.Stderr, "未知子命令: user %s\n", sub)
+		os.Exit(2)
+	}
+}
+
+func runSecurityCode(cfg *config.Config, _ []string) {
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "打开数据库失败:", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	code, err := service.GenerateSecurityCode()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "生成安全码失败:", err)
+		os.Exit(1)
+	}
+	h, err := service.HashPassword(code)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "生成安全码失败:", err)
+		os.Exit(1)
+	}
+	if err := st.SetSecurityCode(ctx, h); err != nil {
+		fmt.Fprintln(os.Stderr, "写入失败:", err)
+		os.Exit(1)
+	}
+	cliAudit(ctx, st, "security.code_issue", "", "通过命令行重新生成安全码")
+
+	fmt.Println("已生成新的安全码（旧的立即作废）：")
+	fmt.Println()
+	fmt.Println("  " + service.GroupSecurityCode(code))
+	fmt.Println()
+	fmt.Println("请离线保存（密码管理器或纸质）。它用于「所有登录方式都进不去」时的应急登录，")
+	fmt.Println("只能使用一次；用过之后系统会立即下发新的一码，界面也会强提示你保存。")
 }
 
 func runStatus(cfg *config.Config) {

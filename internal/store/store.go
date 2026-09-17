@@ -168,6 +168,16 @@ CREATE TABLE IF NOT EXISTS sys_trusted_device (
 );
 CREATE INDEX IF NOT EXISTS idx_trusted_user ON sys_trusted_device(user_id);
 
+-- 应急「安全码」：所有常规登录途径都失效时（飞牛网关异常、管理员忘密码、2FA 手机丢失）
+-- 的最后一道入口。它不属于任何账号，是实例级凭据，因此单独成表而不放进 app_setting
+-- —— 放进设置表会被全量备份带走，等于把万能钥匙抄进备份文件里。
+-- 只存 argon2id 哈希，明文仅在生成时展示一次；用一次即作废。
+CREATE TABLE IF NOT EXISTS sys_security_code (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  code_hash  TEXT    NOT NULL,
+  created_at TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts          TEXT    NOT NULL,

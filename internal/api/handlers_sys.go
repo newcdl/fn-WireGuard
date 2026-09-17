@@ -62,7 +62,64 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, step.Token)
-	writeJSON(w, http.StatusOK, u)
+	// 初始化时同时下发一枚安全码：它是所有登录途径都失效时的最后入口，
+	// 必须在这一刻交给用户保存，否则将来无处可取。
+	out := map[string]any{"user": u}
+	if code, codeErr := s.svc.IssueSecurityCode(r.Context(), service.Actor{Username: in.Username}); codeErr != nil {
+		// 生成失败不该阻断初始化（账号已经建好了），但必须如实告知，
+		// 不能让用户以为自己已经拿到了后手。稍后可在「账号管理」里重新生成。
+		out["security_code_error"] = "安全码生成失败，请稍后到「账号管理」重新生成：" + codeErr.Error()
+	} else {
+		out["security_code"] = code
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleEmergencyLogin 用安全码应急登录（无需登录态，因为此时通常已经登不进来了）。
+func (s *Server) handleEmergencyLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Code        string `json:"code"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 与常规登录共用一套失败限流：安全码虽然强度极高，但没理由让它可以被无限次尝试。
+	key := "emergency|" + clientIP(r)
+	if s.loginBlocked(key) {
+		writeErr(w, http.StatusTooManyRequests, "尝试次数过多，请 5 分钟后再试")
+		return
+	}
+	res, err := s.svc.EmergencyLogin(r.Context(), in.Code, in.NewPassword, r.UserAgent(), clientIP(r), actorOf(r))
+	if err != nil {
+		s.recordLoginFail(key)
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	s.clearLoginFail(key)
+	s.setSessionCookie(w, res.Token)
+	writeJSON(w, http.StatusOK, map[string]any{"user": res.User, "new_code": res.NewCode})
+}
+
+// handleSecurityCodeState 返回是否已设置安全码（不返回安全码本身，它无法取回）。
+func (s *Server) handleSecurityCodeState(w http.ResponseWriter, r *http.Request) {
+	configured, err := s.svc.SecurityCodeConfigured(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"configured": configured})
+}
+
+// handleIssueSecurityCode 重新生成安全码（旧码立即作废），返回新码明文。
+func (s *Server) handleIssueSecurityCode(w http.ResponseWriter, r *http.Request) {
+	code, err := s.svc.IssueSecurityCode(r.Context(), actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"code": code})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {

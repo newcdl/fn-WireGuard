@@ -30,6 +30,8 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 		r.Post("/auth/login", s.handleLogin)
 		// 二次验证登录的第二步：凭登录挑战提交动态口令（同样无需登录，因为此时还没有会话）
 		r.Post("/auth/login/totp", s.handleLoginTOTP)
+		// 应急登录：用安全码进入，所有常规途径都失效时的最后入口
+		r.Post("/auth/emergency", s.handleEmergencyLogin)
 
 		// 需要登录
 		r.Group(func(r chi.Router) {
@@ -47,6 +49,9 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 			r.Get("/auth/trusted-devices", s.handleListTrustedDevices)
 			r.Delete("/auth/trusted-devices", s.handleRevokeAllTrustedDevices)
 			r.Delete("/auth/trusted-devices/{id}", s.handleRevokeTrustedDevice)
+			// 应急安全码：属于实例级凭据，只有管理员能查看状态与重新生成
+			r.With(requirePerm(model.PermUserManage)).Get("/auth/security-code", s.handleSecurityCodeState)
+			r.With(requirePerm(model.PermUserManage)).Post("/auth/security-code", s.handleIssueSecurityCode)
 
 			r.Get("/overview", s.handleOverview)
 			r.Get("/health", s.handleHealth)

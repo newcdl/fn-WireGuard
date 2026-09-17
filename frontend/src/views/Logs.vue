@@ -246,6 +246,9 @@ const ACTION_LABELS: Record<string, string> = {
   'totp.trust_device': '信任了一台设备',
   'totp.revoke_device': '撤销了受信任设备',
   'totp.admin_reset': '重置了账号的二次验证',
+  'security.code_issue': '生成了新的安全码',
+  'security.emergency_login': '用安全码应急登录',
+  'user.reset_password': '重置了账号密码',
 }
 
 const TARGET_LABELS: Record<string, string> = {

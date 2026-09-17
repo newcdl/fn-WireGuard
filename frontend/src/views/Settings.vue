@@ -157,6 +157,26 @@
           </template>
         </el-alert>
 
+        <!-- 应急安全码：不是账号，是实例级的最后入口，因此单独一张卡说明 -->
+        <div class="fnwg-card" style="margin-bottom: 12px">
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+            <div style="flex: 1; min-width: 240px">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px">
+                <strong>应急安全码</strong>
+                <el-tag size="small" :type="securityCodeConfigured ? 'success' : 'danger'" effect="plain">
+                  {{ securityCodeConfigured ? '已设置' : '未设置' }}
+                </el-tag>
+              </div>
+              <div class="fnwg-hint">
+                当管理员忘记密码、手机丢失且恢复码也遗失、或飞牛网关异常导致界面进不去时，
+                在登录页点「应急登录」输入它即可进入并重置密码或关闭二次验证。
+                它只能使用一次，用过立即作废并下发新的一码；系统只存哈希，无法再次查看，请离线保存。
+              </div>
+            </div>
+            <el-button @click="regenerateSecurityCode">重新生成</el-button>
+          </div>
+        </div>
+
         <div class="fnwg-toolbar">
           <el-button type="primary" :icon="Plus" @click="openUserDialog">新建账号</el-button>
         </div>
@@ -453,6 +473,30 @@
       </el-tab-pane>
     </el-tabs>
 
+    <!-- 新安全码：只此一次，必须由用户主动确认看过 -->
+    <el-dialog
+      v-model="securityCodeDialog"
+      title="新的应急安全码"
+      :width="dialogWidth || '520px'"
+      :close-on-click-modal="false"
+    >
+      <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 12px">
+        <template #title>
+          旧的安全码已立即作废。请保存下面这枚新码——它只显示这一次，系统不留明文，我们也无法帮你找回。
+        </template>
+      </el-alert>
+      <SecurityCodeBlock :code="newSecurityCode" />
+      <div class="fnwg-hint" style="margin-top: 10px">
+        它只能使用一次，用过之后系统会再下发新的一码。
+      </div>
+      <el-checkbox v-model="savedSecurityCode" style="margin-top: 6px">我已妥善保存这枚安全码</el-checkbox>
+      <template #footer>
+        <el-button type="primary" :disabled="!savedSecurityCode" @click="securityCodeDialog = false">
+          我已保存，关闭
+        </el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="userDialog" title="新建账号" :width="dialogWidth || '440px'">
       <el-form :model="newUser" class="fnwg-form" :label-position="isMobile ? 'top' : 'right'" label-width="100px">
         <el-form-item>
@@ -490,6 +534,7 @@ import { Plus, Upload, Reading, Refresh } from '@element-plus/icons-vue'
 import { api, download, postRaw } from '@/api/client'
 import type { BackupRecord, DNSRecord, Health, NotifyResult, NotifyStatus, User } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import SecurityCodeBlock from '@/components/SecurityCodeBlock.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
@@ -680,6 +725,43 @@ async function loadHealth() {
   }
 }
 
+/** 应急安全码的状态与重新生成（只有管理员能看，因此接口本身也挂 user.manage 权限）。 */
+const securityCodeConfigured = ref(false)
+const securityCodeDialog = ref(false)
+const newSecurityCode = ref('')
+const savedSecurityCode = ref(false)
+
+async function loadSecurityCode() {
+  if (!session.isAdmin) return
+  try {
+    const res = await api.get<{ configured: boolean }>('/auth/security-code')
+    securityCodeConfigured.value = res.configured
+  } catch {
+    /* 忽略 */
+  }
+}
+
+async function regenerateSecurityCode() {
+  try {
+    await ElMessageBox.confirm(
+      '将生成一枚新的应急安全码，旧码立即作废（已保存的旧码将无法再使用）。确认继续？',
+      '重新生成安全码',
+      { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  try {
+    const res = await api.post<{ code: string }>('/auth/security-code')
+    newSecurityCode.value = res.code
+    savedSecurityCode.value = false
+    securityCodeDialog.value = true
+    securityCodeConfigured.value = true
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 async function loadUsers() {
   try {
     const data = await api.get<{ items: User[] }>('/users')
@@ -687,6 +769,7 @@ async function loadUsers() {
   } catch {
     /* 忽略 */
   }
+  await loadSecurityCode()
 }
 
 async function loadBackups() {
