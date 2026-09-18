@@ -373,7 +373,7 @@ cd frontend && npx vue-tsc --noEmit && npm run build
 
 ## License
 
-[GPL-3.0-only](LICENSE) © [newcdl](https://github.com/newcdl) &lt;newcdl@163.com&gt;
+[GPL-3.0-only](LICENSE) © 小柿子 &lt;newxsz@163.com&gt; · 源码：[github.com/newcdl/fn-WireGuard](https://github.com/newcdl/fn-WireGuard)
 
 本程序是自由软件：你可以按自由软件基金会发布的 GNU 通用公共许可证第 3 版
 （且仅限该版本）的条款重新分发和/或修改它。本程序按「现状」分发，不提供任何担保。

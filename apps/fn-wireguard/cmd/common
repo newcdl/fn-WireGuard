@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-only
-# Copyright (C) 2026 newcdl <newcdl@163.com>
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 # fn-WireGuard 生命周期脚本公共函数库，由 install_init / install_callback / main 等脚本 source。
 #

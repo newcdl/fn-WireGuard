@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-only
-# Copyright (C) 2026 newcdl <newcdl@163.com>
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 # 安装前置检查：架构、内核模块、端口占用、已有配置探测。
 # 注意：内核态 WireGuard 不依赖 /dev/net/tun，因此缺少 TUN 只提示不阻断。

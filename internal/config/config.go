@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 newcdl <newcdl@163.com>
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 // Package config 负责加载 fn-WireGuard 的运行期配置。
 // 配置来源优先级：命令行参数 > TRIM_* 环境变量（fnOS 注入）> 默认值。

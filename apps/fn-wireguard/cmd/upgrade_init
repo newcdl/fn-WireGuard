@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-only
-# Copyright (C) 2026 newcdl <newcdl@163.com>
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 # 升级前置：停服并备份数据库，保证升级失败可回滚。
 set -e

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 newcdl <newcdl@163.com>
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 // Package service 承载业务编排：参数校验、审计留痕、触发特权代理收敛。
 package service

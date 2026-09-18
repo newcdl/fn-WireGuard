@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 newcdl <newcdl@163.com>
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 // Package fnwg 提供模块级的许可证文本，供「系统设置 → 关于 → 开源许可」展示。
 //

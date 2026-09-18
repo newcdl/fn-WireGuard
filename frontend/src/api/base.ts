@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 newcdl <newcdl@163.com>
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 /**
  * 飞牛统一网关分配给本应用的公开前缀。

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# Copyright (C) 2026 newcdl <newcdl@163.com>
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 # fn-WireGuard 常用任务入口（实际逻辑在 scripts/ 下）
 

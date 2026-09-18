@@ -1,5 +1,5 @@
 fn-WireGuard
-Copyright (C) 2026 newcdl <newcdl@163.com>
+Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -21,4 +21,4 @@ Why GPL-3.0-only rather than GPL-2.0: this project links Apache-2.0
 components (nftables, netlink, echarts). Apache-2.0 is incompatible with
 GPL-2.0 but compatible with GPL-3.0.
 
-fn-WireGuard 版权所有 (C) 2026 newcdl <newcdl@163.com>，以 GPL-3.0-only 发布。
+fn-WireGuard 版权所有 (C) 2026 小柿子 <newxsz@163.com>，以 GPL-3.0-only 发布。

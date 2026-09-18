@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
-<!-- Copyright (C) 2026 newcdl <newcdl@163.com> -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
 
 <template>
   <div>
@@ -580,7 +580,7 @@
               任何信息都不会上传到外部服务器。
             </el-descriptions-item>
             <el-descriptions-item label="开源许可">
-              <strong>GPL-3.0-only</strong>（GNU 通用公共许可证第 3 版）· 版权归 newcdl &lt;newcdl@163.com&gt; ·
+              <strong>GPL-3.0-only</strong>（GNU 通用公共许可证第 3 版）· 版权归 小柿子 &lt;newxsz@163.com&gt; ·
               不提供任何担保。第三方组件及其许可证可点下方「开源许可」逐条查看。
             </el-descriptions-item>
             <el-descriptions-item label="项目源码">
@@ -619,7 +619,7 @@
          不联网、也不需要用户去翻安装目录。 -->
     <el-dialog v-model="licenseDialog" title="开源许可" :width="dialogWidth || '900px'">
       <div class="fnwg-hint" style="margin-bottom: 8px">
-        本应用以 <strong>GPL-3.0-only</strong> 发布，版权归 newcdl &lt;newcdl@163.com&gt;，
+        本应用以 <strong>GPL-3.0-only</strong> 发布，版权归 小柿子 &lt;newxsz@163.com&gt;，
         不提供任何担保。分发时须以同一许可开放源代码。第三方组件及其许可证见第二页。
       </div>
       <el-tabs v-model="licenseTab">

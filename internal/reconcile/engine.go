@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 newcdl <newcdl@163.com>
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 // Package reconcile 是配置收敛引擎：以数据库中的期望态为唯一事实来源，
 // 周期性（或按需）把期望态下发到内核，并把内核的实时状态采集回内存缓存。

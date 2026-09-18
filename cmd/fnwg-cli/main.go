@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 newcdl <newcdl@163.com>
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 // Command fnwg-cli 提供命令行运维能力（状态查询、手动收敛、配置导出）。
 // 由 config/resource 的 usr-local-linker 暴露到 /usr/local/bin，便于脚本化运维。

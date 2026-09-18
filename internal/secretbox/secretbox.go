@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright (C) 2026 newcdl <newcdl@163.com>
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
 
 // Package secretbox 提供基于 AES-256-GCM 的静态数据加密。
 // 用于把 WireGuard 私钥 / PSK 以密文形式落库，避免数据库或备份文件泄露时直接暴露私钥。
