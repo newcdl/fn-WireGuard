@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Command fnwg-agent 是特权代理进程：以 root 运行，负责把数据库中的期望态
 // 收敛到内核（netlink / wgctrl），并通过 Unix Domain Socket 对外提供最小化的能力集。
 //

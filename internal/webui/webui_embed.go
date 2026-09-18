@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 //go:build embedui
 
 // Package webui 通过 go:embed 内嵌前端构建产物，由 Go 直接托管，

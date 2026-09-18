@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 newcdl <newcdl@163.com>
+
 # 安装回调：创建运行用户、准备数据目录、启动服务、导入向导配置。
 set -e
 

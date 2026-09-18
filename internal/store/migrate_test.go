@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 package store_test
 
 import (
@@ -158,5 +161,3 @@ func TestNetworkSafetyMigration(t *testing.T) {
 		t.Fatal("安全迁移应记录一条日志，便于用户了解配置被调整过")
 	}
 }
-
-

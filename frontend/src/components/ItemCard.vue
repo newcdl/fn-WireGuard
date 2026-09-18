@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 newcdl <newcdl@163.com> -->
+
 <template>
   <div class="fnwg-item-card" :class="{ selectable, selected }">
     <div v-if="selectable" class="fnwg-item-check" @click.stop="emit('toggle')">

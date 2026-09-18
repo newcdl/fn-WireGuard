@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Package dnsserver 实现「内网域名解析」：一个只绑定隧道地址的极简 DNS 应答器。
 //
 // 为什么自己实现而不用通用 DNS 库：这里只需要「A 记录应答 + 其余转发」两件事，

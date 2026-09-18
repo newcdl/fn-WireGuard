@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 newcdl <newcdl@163.com> -->
+
 <template>
   <div class="fnwg-layout">
     <!-- 桌面端侧边导航 -->

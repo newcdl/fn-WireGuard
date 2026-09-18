@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 newcdl <newcdl@163.com> -->
+
 <template>
   <div>
     <el-tabs v-model="tab">
@@ -541,6 +544,10 @@
               本机数据目录内（含配置与密钥）。密钥加密保存，即使文件被拿走也无法直接读出；
               任何信息都不会上传到外部服务器。
             </el-descriptions-item>
+            <el-descriptions-item label="开源许可">
+              <strong>GPL-3.0-only</strong>（GNU 通用公共许可证第 3 版）· 版权归 newcdl &lt;newcdl@163.com&gt; ·
+              不提供任何担保。第三方组件及其许可证可点下方「开源许可」逐条查看。
+            </el-descriptions-item>
           </el-descriptions>
 
           <el-alert type="info" :closable="false" show-icon style="margin-top: 12px">
@@ -549,10 +556,34 @@
               这里只管「改配置」；查看系统状态、做体检与修复请到左侧「系统维护」。
             </template>
           </el-alert>
-          <el-button style="margin-top: 12px" :icon="Reading" @click="helpVisible = true">打开配置说明大全</el-button>
+          <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap">
+            <el-button :icon="Reading" @click="helpVisible = true">打开配置说明大全</el-button>
+            <el-button :icon="Document" @click="openLicenses">开源许可</el-button>
+          </div>
         </div>
       </el-tab-pane>
     </el-tabs>
+
+    <!-- 开源许可：GPL 全文与第三方组件清单都取自服务端内嵌的文本，
+         不联网、也不需要用户去翻安装目录。 -->
+    <el-dialog v-model="licenseDialog" title="开源许可" :width="dialogWidth || '900px'">
+      <div class="fnwg-hint" style="margin-bottom: 8px">
+        本应用以 <strong>GPL-3.0-only</strong> 发布，版权归 newcdl &lt;newcdl@163.com&gt;，
+        不提供任何担保。分发时须以同一许可开放源代码。第三方组件及其许可证见第二页。
+      </div>
+      <el-tabs v-model="licenseTab">
+        <el-tab-pane label="GPL-3.0 全文" name="gpl">
+          <pre class="fnwg-license-text">{{ licenses.license || (licenseLoading ? '正在读取…' : '未能读取') }}</pre>
+        </el-tab-pane>
+        <el-tab-pane label="第三方组件" name="third">
+          <pre class="fnwg-license-text">{{ licenses.third_party || (licenseLoading ? '正在读取…' : '未能读取') }}</pre>
+        </el-tab-pane>
+      </el-tabs>
+      <template #footer>
+        <el-button @click="downloadLicenses">下载当前页为文本</el-button>
+        <el-button type="primary" @click="licenseDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 新安全码：只此一次，必须由用户主动确认看过 -->
     <el-dialog
@@ -696,7 +727,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Upload, Reading, Refresh } from '@element-plus/icons-vue'
+import { Plus, Upload, Reading, Refresh, Document } from '@element-plus/icons-vue'
 import { api, download, postRaw } from '@/api/client'
 import type {
   BackupRecord,
@@ -1306,6 +1337,52 @@ async function onImportFile(e: Event) {
   }
 }
 
+/**
+ * 开源许可的文本。
+ *
+ * 只在第一次打开时取一次：第三方清单里带着几十个组件的许可全文，分量不小，
+ * 而它是一份不会变的内容 —— 每次开弹窗都拉一遍没有意义。
+ */
+const licenseDialog = ref(false)
+const licenseTab = ref('gpl')
+const licenseLoading = ref(false)
+const licenses = reactive({ license: '', third_party: '' })
+
+async function openLicenses() {
+  licenseDialog.value = true
+  if (licenses.license || licenseLoading.value) return
+  licenseLoading.value = true
+  try {
+    const d = await api.get<{ license: string; third_party: string }>('/about/licenses')
+    licenses.license = d.license || ''
+    licenses.third_party = d.third_party || ''
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    licenseLoading.value = false
+  }
+}
+
+/** 下载当前这一页为文本：许可全文常被要求随分发物一起留存，只给屏幕不让带走并不方便。 */
+function downloadLicenses() {
+  const isGpl = licenseTab.value === 'gpl'
+  const text = isGpl ? licenses.license : licenses.third_party
+  if (!text) {
+    ElMessage.warning('内容还没读取出来')
+    return
+  }
+  const name = isGpl ? 'GPL-3.0-only.txt' : 'THIRD_PARTY_LICENSES.md'
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
 onMounted(async () => {
   await loadAll()
 })
@@ -1377,6 +1454,23 @@ onMounted(async () => {
   color: var(--el-text-color-secondary);
   font-size: 12px;
   padding-left: 2px;
+}
+
+/* 许可全文：逐字展示，必须原样保留换行与缩进（pre-wrap 而不是 pre，
+   免得第三方清单里的长行把弹窗顶出横向滚动条）。 */
+.fnwg-license-text {
+  margin: 0;
+  max-height: 52vh;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--fnwg-border);
+  border-radius: 8px;
+  background: var(--el-fill-color-light);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 </style>

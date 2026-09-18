@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Command fnwg-web 是面向用户的服务进程：以普通用户运行，提供 Web 界面与 REST API。
 // 所有需要内核能力的操作都通过 Unix Domain Socket 委派给 fnwg-agent，
 // 从而把 root 权限收敛在一个不监听 TCP 的进程里。

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 package api
 
 import (
@@ -63,6 +66,9 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.Use(s.requireAuth)
 
 		r.Get("/auth/me", s.handleMe)
+		// 开源许可：GPL 全文与第三方组件清单。内容取自二进制内嵌的文本，
+		// 不读磁盘、不依赖网络；登录后即可查看，不需要额外权限。
+		r.Get("/about/licenses", s.handleLicenses)
 		r.Post("/auth/logout", s.handleLogout)
 		r.Post("/auth/password", s.handleChangePassword)
 		// 二次验证：管理「自己的」账号，因此只要求登录、不额外要求 user.manage

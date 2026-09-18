@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Package wgconf 负责 wg-quick 配置文件的解析与渲染，实现与官方工具的互操作。
 package wgconf
 

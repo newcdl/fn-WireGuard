@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 package api
 
 import (
@@ -8,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"fnwg"
 	"fnwg/internal/model"
 	"fnwg/internal/service"
 )
@@ -844,4 +848,18 @@ func atoiDefault(v string, def int) int {
 		return def
 	}
 	return n
+}
+
+// ---------------------------------------------------------------- 开源许可
+
+// handleLicenses 返回本应用的许可信息：「关于」页的「开源许可」据此展示。
+//
+// 文本取自二进制内嵌的内容（见根目录 licenses.go），不读磁盘也不依赖网络：
+// 安装包里只有 apps 侧的 COPYING，而界面要同时给出 GPL 全文与第三方清单，
+// 内嵌是唯一不会出现「装了什么、显示什么」对不上的做法。
+func (s *Server) handleLicenses(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"license":     fnwg.GPLText,
+		"third_party": fnwg.ThirdPartyLicenses,
+	})
 }

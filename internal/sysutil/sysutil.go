@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Package sysutil 提供与操作系统权限相关的小工具。
 //
 // 背景：fnfg-agent 以 root 运行、fnwg-web 以普通用户 fnwg 运行，两者共享同一份

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 newcdl <newcdl@163.com>
+
 # 升级回调：修正权限并启动（数据库 schema 迁移由进程启动时自动完成）。
 set -e
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 newcdl <newcdl@163.com>
+
 # 卸载回调：移除服务单元与系统集成，并按用户在卸载向导里的选择处理数据。
 #
 # 数据处理只有两种结果，且必须与用户的选择一致：

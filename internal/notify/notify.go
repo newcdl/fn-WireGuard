@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Package notify 把关键事件异步推送到用户配置的 Webhook 地址。
 //
 // 三条硬约束（来自 docs/ROADMAP.md R3），实现时不能让步：

@@ -5,7 +5,7 @@
 **飞牛 NAS 原生的 WireGuard 可视化管理工具**（包名 `fn-wireguard`）
 
 [![version](https://img.shields.io/github/v/release/newcdl/fn-WireGuard?label=version&color=blue)](https://github.com/newcdl/fn-WireGuard/releases)
-[![license](https://img.shields.io/badge/license-MIT-green)](#license)
+[![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)](#license)
 [![platform](https://img.shields.io/badge/platform-fnOS-blue)](https://www.fnnas.com)
 
 不需要记任何命令，在界面上点几下，就能让手机、电脑在外网安全地连回家，或把两处网络连成一张网。
@@ -264,4 +264,14 @@ cd frontend && npx vue-tsc --noEmit && npm run build
 
 ## License
 
-[MIT](LICENSE) © [newcdl](https://github.com/newcdl)
+[GPL-3.0-only](LICENSE) © [newcdl](https://github.com/newcdl) &lt;newcdl@163.com&gt;
+
+本程序是自由软件：你可以按自由软件基金会发布的 GNU 通用公共许可证第 3 版
+（且仅限该版本）的条款重新分发和/或修改它。本程序按「现状」分发，不提供任何担保。
+
+- 许可全文：[LICENSE](LICENSE)（安装包内为 `apps/fn-wireguard/COPYING`，界面「系统设置 → 关于 → 开源许可」也可查看）
+- 版权与许可声明：[NOTICE](NOTICE)
+- 第三方组件与各组件许可全文：[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
+
+为什么是 GPL-3.0 而不是 GPL-2.0：依赖中包含 Apache-2.0 组件（nftables、netlink、echarts），
+该许可证与 GPL-2.0 不兼容，但与 GPL-3.0 兼容。

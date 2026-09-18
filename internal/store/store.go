@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Package store 是 SQLite 数据访问层，fnwg-web 与 fnwg-agent 共享同一数据库（WAL 模式）。
 package store
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 newcdl <newcdl@163.com>
+
 # 配置变更回调：更新服务端对外地址与默认 DNS 并重启服务。
 set -e
 

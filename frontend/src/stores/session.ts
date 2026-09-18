@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 import { defineStore } from 'pinia'
 import { api } from '@/api/client'
 import type { AuthState, LoginChallenge, User } from '@/api/types'

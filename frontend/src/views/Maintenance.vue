@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 newcdl <newcdl@163.com> -->
+
 <template>
   <div>
     <!-- 总体状态：任意页面看到的红/黄/绿与这里完全同源（useSystemHealth） -->

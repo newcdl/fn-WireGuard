@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 import { API_BASE } from './base'
 
 // 接口根地址随入口变化（独立端口 / 飞牛统一网关子路径），见 base.ts。

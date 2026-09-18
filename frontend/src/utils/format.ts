@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 export function formatBytes(n?: number): string {
   if (!n || n <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']

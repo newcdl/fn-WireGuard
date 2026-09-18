@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 newcdl <newcdl@163.com>
+
 # fn-WireGuard 生命周期脚本公共函数库，由 install_init / install_callback / main 等脚本 source。
 #
 # 运行模式：优先使用 systemd（可自动重启、随系统启动）；当 /etc/systemd/system 不可写

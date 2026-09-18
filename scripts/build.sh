@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 newcdl <newcdl@163.com>
+
 # fn-WireGuard 构建脚本
 #
 # 用法:
@@ -203,6 +206,13 @@ verify_fpk() {
     grep -q '"gatewaySocket"[[:space:]]*:[[:space:]]*"app.sock"' "$tmp/ui/config" \
         || die "桌面入口 ui/config 缺少 gatewaySocket=app.sock（从飞牛桌面打开会显示 502）"
 
+    # GPL 全文必须在包里。这是许可合规的验收项，不是可选项：
+    # fnpack 只保留它认识的条目，我们放在包根的 COPYING 会被静默丢弃（实测如此），
+    # 因此正文走载荷 app.tgz 进包 —— 这条断言防的就是「某次改动之后它又悄悄没了」。
+    [ -f "$tmp/COPYING" ] || die "$fpk 内缺少 COPYING（GPL 全文未随包分发）"
+    grep -q "GNU GENERAL PUBLIC LICENSE" "$tmp/COPYING" \
+        || die "$fpk 内的 COPYING 不是 GPL 全文"
+
     rm -rf "$tmp"
     log "已验收 ${fpk}：版本 ${VERSION} / 平台 ${platform} / 载荷架构 ${arch}"
 }
@@ -224,6 +234,17 @@ package_fpk() {
     mkdir -p "$stage"
     # 只拷贝包所需内容，排除构建产物缓存
     (cd "$APP_DIR" && tar cf - --exclude='*.fpk' .) | (cd "$stage" && tar xf -)
+
+    # GPL 全文随载荷进包。
+    #
+    # 为什么不直接放在包根（apps/fn-wireguard/COPYING 就放在那儿）：fnpack 打包时
+    # 只保留 manifest / LICENSE / cmd / config / wizard / ICON / app.tgz，包根的 COPYING
+    # 会被**静默丢弃**（实测确认），于是「仓库里有全文、装到设备上却没有」。
+    # 放进 app/ 则不同：app.tgz 里的文件会原样解到应用运行目录，设备上直接可见。
+    #
+    # 源头仍只有一份（apps/fn-wireguard/COPYING），这里只是搬运 ——
+    # 不复制出第二份需要人肉同步的副本。
+    cp "${APP_DIR}/COPYING" "$stage/app/COPYING" || die "缺少 ${APP_DIR}/COPYING（GPL 全文）"
 
     # 按目标架构改写 manifest（platform: x86 / arm），并写入真实包体积
     local payload_mb

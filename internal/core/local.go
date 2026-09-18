@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 newcdl <newcdl@163.com>
+
 // Package core 提供 Core 接口的本地实现，用于开发模式（不启动独立代理进程）。
 package core
 
