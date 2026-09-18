@@ -78,12 +78,12 @@ func usage() {
 	fmt.Print(`WireGuard 管理工具 命令行工具
 
 用法:
-  fnwg-cli status                 查看接口与节点实时状态
-  fnwg-cli netcheck               检查 NAS 系统上网路线是否被本应用影响
+  fnwg-cli status                 查看连接与设备实时状态
+  fnwg-cli netcheck               系统上网路线 + 内网访问链路逐层自检 + 疑似残留网卡
   fnwg-cli cleanup                删除本应用创建的全部网络对象（停用/卸载使用）
   fnwg-cli cleanup-foreign <名称> 清理不是本应用创建的 WireGuard 网卡（疑似残留）
-  fnwg-cli reconcile              立即把数据库期望态下发到内核
-  fnwg-cli export --all --out DIR 导出全部接口的 wg-quick 配置
+  fnwg-cli reconcile              立即把当前配置下发到内核
+  fnwg-cli export --all --out DIR 导出全部连接的 wg-quick 配置
   fnwg-cli version                输出版本
 
 账号与安全码（界面进不去时的后手，需 root / sudo）:
@@ -163,7 +163,7 @@ func runNetCheck(cfg *config.Config) {
 			if fi.ListenPort > 0 {
 				port = fmt.Sprintf("占用 UDP 端口 %d", fi.ListenPort)
 			}
-			fmt.Printf("  · %s（%s，%s，%d 个节点，地址 %v）\n", fi.Name, state, port, fi.PeerCount, fi.Addresses)
+			fmt.Printf("  · %s（%s，%s，%d 台设备，地址 %v）\n", fi.Name, state, port, fi.PeerCount, fi.Addresses)
 		}
 		fmt.Println("  它们可能是早期版本卸载时没清理干净的残留，也可能是其它工具（如手工 wg-quick）在用。")
 		fmt.Println("  确认无用后可用：fnwg-cli cleanup-foreign <名称>  清理")
@@ -436,11 +436,11 @@ func runStatus(cfg *config.Config) {
 		os.Exit(1)
 	}
 	if len(st.Interfaces) == 0 {
-		fmt.Println("当前没有任何 WireGuard 接口")
+		fmt.Println("当前没有任何连接")
 		return
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "接口\t状态\t监听端口\t节点数\t接收\t发送")
+	fmt.Fprintln(w, "连接\t状态\t监听端口\t设备数\t接收\t发送")
 	for _, it := range st.Interfaces {
 		up := "down"
 		if it.Up {
@@ -500,7 +500,7 @@ func runExport(cfg *config.Config, args []string) {
 		os.Exit(1)
 	}
 	if !all && len(ifaces) > 1 {
-		fmt.Fprintln(os.Stderr, "存在多个接口，请显式指定 --all 以确认导出全部")
+		fmt.Fprintln(os.Stderr, "存在多个连接，请显式指定 --all 以确认导出全部")
 		os.Exit(1)
 	}
 	if err := os.MkdirAll(outDir, 0o770); err != nil {
