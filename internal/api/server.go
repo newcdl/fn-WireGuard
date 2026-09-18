@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -226,13 +227,22 @@ func (s *Server) SetGatewaySocket(path string) {
 	s.gatewaySockPath.Store(&path)
 }
 
-// gatewaySocketReady 表示本进程确实在监听统一网关入口。
+// gatewaySocketReady 表示统一网关入口此刻确实可用。
 //
-// 以进程自报为准而不是看 socket 文件：进程已经退出、文件却还留在目录里时，
-// 看文件会把「入口其实已经没了」误判成已就绪。
+// 判定落在**文件事实**上，而不是「本进程启动时绑过一次」这个记忆。原因见 0.8.22
+// 修的那次 502：socket 文件被外部删掉（当时的元凶是授权脚本里跟着的一句 rm）之后，
+// 进程照常运行、端口照常工作、自报也照常「已就绪」，而飞牛桌面点图标只能是 502 ——
+// 唯一的线索就是这个不存在的文件。
+//
+// 这个字段是安装/升级/启动脚本判断入口能不能用的依据，因此必须能反映上述状态，
+// 否则「自动修一次再判」的兜底永远不会触发。
 func (s *Server) gatewaySocketReady() bool {
 	p := s.gatewaySockPath.Load()
-	return p != nil && *p != ""
+	if p == nil || *p == "" {
+		return false
+	}
+	fi, err := os.Stat(*p)
+	return err == nil && fi.Mode()&os.ModeSocket != 0
 }
 
 func requirePerm(perm string) func(http.Handler) http.Handler {

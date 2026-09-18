@@ -100,7 +100,7 @@ fnwg_appdest() {
     return 1
 }
 
-# fnwg_socket_fix_cmd <目录>：输出「让 fnwg 属组能在该目录里创建 socket」的命令串。
+# fnwg_socket_grant_cmd <目录>：输出「让 fnwg 属组能在该目录里创建 socket」的命令串。
 #
 # 只有这一份实现：安装/升级脚本与 systemd 的 ExecStartPre 都从这里取，
 # 免得两处各自演化。之所以在意这件事 —— 两处一旦不一致，症状恰好是最难查的那种：
@@ -120,17 +120,43 @@ fnwg_appdest() {
 #
 # chmod 与 chmod +t 分开写：合起来的 `chmod g+w,+t` 没有 who 前缀，
 # 语义受 umask 影响、各实现不统一，拆成两条各自明确的写法更稳。
-fnwg_socket_fix_cmd() {
+#
+# ⚠️ 本函数**只做授权，绝不删除 app.sock**。这一条是被真机故障教出来的，必须写清楚：
+# 早先这里末尾还跟着一句 `rm -f app.sock`，而它的上游是 fnwg_prepare_dirs ——
+# 也就是「应用中心点启动」走到 cmd/main start 的第一步。于是当应用**已经在运行**时再点启动：
+#   删掉 socket → `systemctl start fnwg-web`（对已运行的单元是空操作，不跑 ExecStartPre、
+#   也不重启进程）→ `fnwg_wait_health` 只查端口、通过 → 报告启动成功。
+# 结果：进程活得好好的、端口一切正常、socket 却没了，从飞牛桌面点图标只能 502，
+# 而日志里只有一次启动记录、状态全「正常」—— 502 的全部线索就是一个不存在的文件。
+#
+# 残留 socket 的清理不该在授权路径上做，也不需要：Web 进程自己在 bind 之前会先 unlink
+# （见 internal/api/listener.go 的 ListenGateway），那是唯一确知「我马上要 bind」的地方。
+# 确实需要提前清理时用下面的 prestart 版本，且只能用在紧接着就会启动进程的地方。
+fnwg_socket_grant_cmd() {
     local d="$1"
     [ -n "$d" ] || return 1
-    printf '%s' "chgrp ${FNWG_GROUP} \"${d}\" 2>/dev/null; chmod g+w \"${d}\" 2>/dev/null; if command -v setfacl >/dev/null 2>&1; then setfacl -m u:${FNWG_GROUP}:rwx \"${d}\" 2>/dev/null; setfacl -m g:${FNWG_GROUP}:rwx \"${d}\" 2>/dev/null; setfacl -m m::rwx \"${d}\" 2>/dev/null; fi; chmod +t \"${d}\" 2>/dev/null; rm -f \"${d}/app.sock\""
+    printf '%s' "chgrp ${FNWG_GROUP} \"${d}\" 2>/dev/null; chmod g+w \"${d}\" 2>/dev/null; if command -v setfacl >/dev/null 2>&1; then setfacl -m u:${FNWG_GROUP}:rwx \"${d}\" 2>/dev/null; setfacl -m g:${FNWG_GROUP}:rwx \"${d}\" 2>/dev/null; setfacl -m m::rwx \"${d}\" 2>/dev/null; fi; chmod +t \"${d}\" 2>/dev/null"
+}
+
+# fnwg_socket_prestart_cmd <目录>：授权 + 清掉上一次留下的 socket。
+#
+# **只允许用在「马上就要拉起 Web 进程」的地方**（systemd 单元的 ExecStartPre）：
+# 那里旧进程已经退出，删文件是安全的，紧接着就会被 bind 重建；
+# 顺带解决「上次被 kill -9、socket 文件残留导致 bind: address already in use」。
+# 任何**不伴随启动**的调用都会造出一个没有人监听的入口空洞，别处不要用。
+fnwg_socket_prestart_cmd() {
+    local d="$1"
+    [ -n "$d" ] || return 1
+    printf '%s; rm -f "%s/app.sock"' "$(fnwg_socket_grant_cmd "$d")" "$d"
 }
 
 # fnwg_grant_socket_dir <目录>：立刻执行一次授权（安装/升级脚本里用）。
+#
+# 只授权、不删 socket：这条路径可能在应用运行期间被调到（cmd/main start 就是）。
 fnwg_grant_socket_dir() {
     local d="${1:-}"
     [ -n "$d" ] && [ -d "$d" ] || return 1
-    sh -c "$(fnwg_socket_fix_cmd "$d")" >/dev/null 2>&1 || true
+    sh -c "$(fnwg_socket_grant_cmd "$d")" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -151,10 +177,11 @@ fnwg_prepare_gateway_socket() {
     return 0
 }
 
-# fnwg_gateway_socket_ready：统一网关入口是否真的在监听。
+# fnwg_gateway_socket_ready：统一网关入口的 socket 文件是否在。
 #
-# 判定用「文件存在且是 socket」：fnwg_prepare_gateway_socket 在启动前刚删过它，
-# 之后只有 Web 进程重新 bind 成功才会再出现，所以它出现即代表监听已建立。
+# 这是没有 curl 时的退化判定，只看「文件存在且是 socket」这一条事实：
+# 它回答不了「进程还在不在听」（socket 文件可能在进程退出后残留）。
+# 有 curl 时一律以 Web 进程自报的 /auth/state socket_ready 为准。
 fnwg_gateway_socket_ready() {
     local dir
     dir="$(fnwg_appdest)" || return 1
@@ -265,8 +292,12 @@ Group=${FNWG_GROUP}
 # 重建 target 目录并把权限恢复成 root:root 755，之后 Restart=always 的自动重启
 # 不会再去走安装脚本，结果就是 Web 进程突然建不出 socket（网关入口整个不可用），
 # 而飞牛桌面只会显示 502，日志里也仅有一行容易被忽略的警告。
-# 命令串与安装脚本共用 fnwg_socket_fix_cmd 一份实现。
-ExecStartPre=+/bin/sh -c '$(fnwg_socket_fix_cmd "$appdest")'
+#
+# 这里用的是 prestart 版本（授权 + 清掉残留 socket）：ExecStartPre 是**唯一**能在
+# 删除 socket 之后保证紧接着就 bind 的地方 —— 删与建在同一个启动动作里，中间没有空档。
+# 授权路径用的 grant 版本不删任何东西，因为那条路可能在应用运行期间被调到
+# （应用已在运行时点「启动」就是），删了就再也没人重建它。
+ExecStartPre=+/bin/sh -c '$(fnwg_socket_prestart_cmd "$appdest")'
 ExecStart=${appdest}/fnwg-web --bind 0.0.0.0 --port $(fnwg_service_port) --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock --appdest ${appdest}
 Restart=always
 RestartSec=3

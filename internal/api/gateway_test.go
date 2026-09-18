@@ -319,6 +319,17 @@ func TestGatewaySocketReadyTracksListener(t *testing.T) {
 	if !strings.Contains(body(), `"socket_ready":true`) {
 		t.Fatal("监听网关入口后 socket_ready 应为 true")
 	}
+
+	// 真机 502 的回归点：socket 文件被外部删掉后，进程还在、端口还在、日志也正常，
+	// 但入口已经没有人监听了。这时必须如实变成 false —— 否则脚本的入口自查会被
+	// 「进程启动时绑过一次」这个记忆骗过，它那套「自动修一次再判」的兜底永远不会触发，
+	// 而用户从飞牛桌面点图标只能看到 502。
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body(), `"socket_ready":true`) {
+		t.Fatal("socket 文件已被删除，socket_ready 不能仍报 true")
+	}
 }
 
 // TestGatewayLoginEndpointGone 免密登录接口必须彻底消失，

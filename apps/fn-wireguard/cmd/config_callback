@@ -22,8 +22,10 @@ if ! fnwg_start; then
 fi
 fnwg_fix_runtime_perms
 
-if ! fnwg_wait_health 15; then
-    fnwg_fail "应用配置后 Web 控制台未能在 15 秒内就绪"
+# 同样要连网关入口一起确认：这条路径也会重启服务，只查端口的话，
+# 「Web 起来了、但 socket 没建起来」会被当成配置成功，用户从飞牛桌面点图标才发现 502。
+if ! fnwg_ensure_gateway_ready 15; then
+    fnwg_fail "应用配置后 Web 控制台或飞牛统一网关入口未能在 15 秒内就绪（从飞牛桌面打开会显示 502）"
 fi
 
 fnwg_log "配置已更新"
