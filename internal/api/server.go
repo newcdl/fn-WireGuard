@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -221,16 +220,18 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 
 // ---------------------------------------------------------------- 网关入口自检
 
-// SetGatewaySocket 由启动方告知「网关 socket 是否真的监听上了」。
-// path 非空表示就绪。
+// SetGatewaySocket 记录网关入口 socket 的落点（由启动方给出）。
+//
+// 注意它**不表示「已就绪」**：就绪与否一律以现场探测为准（见 probeGatewaySocket），
+// 因为文件可能在运行期消失，而「记下过路径」不会随之改变。
 func (s *Server) SetGatewaySocket(path string) {
 	s.gatewaySockPath.Store(&path)
 }
 
 // gatewaySocketReady 表示统一网关入口此刻确实可用。
 //
-// 判定落在**文件事实**上，而不是「本进程启动时绑过一次」这个记忆。原因见 0.8.22
-// 修的那次 502：socket 文件被外部删掉（当时的元凶是授权脚本里跟着的一句 rm）之后，
+// 判定落在**现场事实**上（文件在、是 socket、且真能连上），而不是「本进程启动时
+// 绑过一次」这个记忆。原因见 0.8.22 修的那次 502：socket 文件被外部删掉之后，
 // 进程照常运行、端口照常工作、自报也照常「已就绪」，而飞牛桌面点图标只能是 502 ——
 // 唯一的线索就是这个不存在的文件。
 //
@@ -238,11 +239,7 @@ func (s *Server) SetGatewaySocket(path string) {
 // 否则「自动修一次再判」的兜底永远不会触发。
 func (s *Server) gatewaySocketReady() bool {
 	p := s.gatewaySockPath.Load()
-	if p == nil || *p == "" {
-		return false
-	}
-	fi, err := os.Stat(*p)
-	return err == nil && fi.Mode()&os.ModeSocket != 0
+	return p != nil && probeGatewaySocket(*p) == gatewaySocketOK
 }
 
 func requirePerm(perm string) func(http.Handler) http.Handler {

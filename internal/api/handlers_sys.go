@@ -489,6 +489,9 @@ func (s *Server) handleNetworkCheck(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 网关入口属于本进程的事实（socket 落在哪、现在还在不在），自检结果里补上这一段：
+	// 「端口一切正常、只有飞牛桌面点图标 502」时，这是唯一能说清原因的地方。
+	res.Gateway = s.gatewayEntryStatus()
 	writeJSON(w, http.StatusOK, res)
 }
 

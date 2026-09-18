@@ -140,6 +140,22 @@ const issues = computed<HealthIssue[]>(() => {
     })
   }
 
+  // ③′ 飞牛桌面入口（从桌面点图标那条通道）失效：端口能打开、进程也在跑、日志里
+  //    只有一次启动记录，唯独点图标是 502 —— 这类故障在端口侧的任何检查里都看不出来。
+  //    level 取 error 而不是 warning：这条通道一断，桌面图标是**确定**打不开的，
+  //    不是「待确认」。判定用后端真去连一次 socket 的结果，前端不自己猜。
+  const gw = n?.gateway
+  if (gw?.configured && !gw.ready) {
+    out.push({
+      key: 'gateway',
+      level: 'error',
+      title: '从飞牛桌面点图标打不开本应用（会显示 502）',
+      detail: gw.detail || '飞牛统一网关入口没有就绪，而从飞牛桌面打开走的正是这条通道。',
+      fix: gw.fix || '应用每 15 秒会自动重建一次；若长期如此，请到应用中心重启本应用。',
+      to: 'maintenance',
+    })
+  }
+
   // ④ 已启用但没真正工作的连接 —— 「启用了功能，运行状态不符合预期」的典型
   const notUp = (o?.interfaces || []).filter((i) => i.enabled && !i.up)
   if (notUp.length) {

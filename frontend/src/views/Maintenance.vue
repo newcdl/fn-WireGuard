@@ -98,6 +98,51 @@
       </el-descriptions>
     </div>
 
+    <!-- 分组一之二：飞牛桌面入口
+         「端口能打开、从飞牛桌面点图标却 502」时，差别只有这个 socket 文件，
+         而端口侧的任何检查都看不出这件事。这一组就是为了让那种故障有地方说话。 -->
+    <div class="fnwg-card">
+      <div class="fnwg-card-head">
+        <div>
+          <strong>飞牛桌面入口</strong>
+          <span class="fnwg-card-desc">
+            从飞牛桌面点本应用的图标，走的是应用目录下的一个 socket 文件。它没建立起来时，
+            桌面图标会显示 502，而 IP:端口 仍然完全正常 —— 只看端口是查不出这件事的。
+          </span>
+        </div>
+        <el-tag
+          v-if="net?.gateway"
+          size="small"
+          :type="net.gateway.ready ? 'success' : net.gateway.configured ? 'danger' : 'info'"
+          effect="plain"
+        >
+          {{ net.gateway.ready ? '正常' : net.gateway.configured ? '未就绪' : '未配置' }}
+        </el-tag>
+      </div>
+
+      <div v-if="!net" class="fnwg-hint">暂无数据，点击上方「立即体检」。</div>
+      <template v-else>
+        <div class="fnwg-hint">
+          socket 路径：<span class="fnwg-mono">{{ net.gateway?.path || '未知' }}</span>
+        </div>
+        <div v-if="net.gateway?.ready" class="fnwg-hint">
+          入口正常：从飞牛桌面点图标可以打开本应用（进去后照常要用本应用账号登录）。
+        </div>
+        <div v-else class="fnwg-nat-check">
+          <el-tag size="small" :type="net.gateway?.configured ? 'danger' : 'info'" effect="plain">
+            {{ net.gateway?.configured ? '未就绪' : '未配置' }}
+          </el-tag>
+          <div class="fnwg-nat-check-body">
+            <strong>
+              {{ net.gateway?.configured ? '从飞牛桌面点图标会显示 502' : '本机未建立飞牛桌面入口' }}
+            </strong>
+            <div class="fnwg-nat-check-detail">{{ net.gateway?.detail }}</div>
+            <div v-if="net.gateway?.fix" class="fnwg-issue-fix">处理建议：{{ net.gateway.fix }}</div>
+          </div>
+        </div>
+      </template>
+    </div>
+
     <!-- 分组二：内网访问链路逐层诊断 -->
     <div class="fnwg-card">
       <div class="fnwg-card-head">

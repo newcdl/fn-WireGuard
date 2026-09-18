@@ -117,26 +117,20 @@ func main() {
 
 	// 飞牛统一网关通道（飞牛桌面点图标走的就是这里）：由 fnOS 校验飞牛账号会话后
 	// 经 Unix Socket 转发过来，进入本应用仍需自己登录。
-	// socket 起不来不该阻断端口服务，但必须留下足够明确的日志：这条通道一断，
-	// 从飞牛桌面点图标就是 Bad Gateway，而只看端口侧完全看不出成因。
+	//
+	// 交给守护者而不是在这里一次性绑定：入口是一个文件，可能在运行期被外部删掉，
+	// 而启动时的自查不会再看第二眼 —— 那正是「进程一切正常、只有桌面图标 502」
+	// 这类故障能长期存在的原因。守护者会定期确认入口还在，不在就地重建。
 	if sockPath := cfg.AppSockPath(); sockPath != "" {
-		gw, err := srv.ListenGateway(sockPath, srv.Router(assets))
-		if err != nil {
-			srv.SetGatewaySocket("")
-			logger.Warn("飞牛统一网关入口不可用：从飞牛桌面点图标将报 Bad Gateway（端口入口不受影响）",
-				"path", sockPath, "err", err)
-		} else {
-			// 记下「入口确实监听着」，让安装/升级脚本能从 /auth/state 读到，
-			// 从而在收尾时就发现这条通道没起来，而不是等用户点图标看到 502。
-			srv.SetGatewaySocket(gw.Path)
-			go func() {
-				logger.Info("飞牛统一网关入口已就绪", "socket", gw.Path)
-				if err := gw.Serve(ctx); err != nil {
-					logger.Error("飞牛统一网关入口异常退出", "err", err)
-				}
-			}()
-			defer func() { _ = gw.Close() }()
-		}
+		// 先记下落点：/auth/state 的 socket_ready 与自检页都从这里取路径，
+		// 而就绪与否一律由现场探测决定（文件可能在运行期消失）。
+		srv.SetGatewaySocket(sockPath)
+		keeper := srv.NewGatewayKeeper(sockPath, srv.Router(assets))
+		go func() {
+			if err := keeper.Run(ctx); err != nil {
+				logger.Error("飞牛统一网关入口守护异常退出", "err", err)
+			}
+		}()
 	} else {
 		// 正常启动路径不会走到这里：AppSockPath 会兜底到可执行文件所在目录。
 		srv.SetGatewaySocket("")

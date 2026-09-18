@@ -359,6 +359,25 @@ export interface AccessIssue {
   to?: string
 }
 
+/**
+ * 飞牛统一网关入口（从飞牛桌面点图标那条通道）的状态。
+ *
+ * 单独成一项的理由：这类故障最容易被误判 —— 端口能打开、进程在跑、日志也正常，
+ * 唯独点桌面图标是 502，差别只在这个 socket 文件上。
+ */
+export interface GatewayEntry {
+  /** 本机确实配置了入口（能定位到应用目录并落点） */
+  configured: boolean
+  /** 入口 socket 的路径 */
+  path: string
+  /** socket 文件在、且确实有人在监听（后端真去连了一次） */
+  ready: boolean
+  /** 不可用时的事实说明 */
+  detail?: string
+  /** 不可用时的处置办法 */
+  fix?: string
+}
+
 export interface NetworkCheckResult {
   healthy: boolean
   route_info_readable: boolean
@@ -374,6 +393,8 @@ export interface NetworkCheckResult {
   access_issues: AccessIssue[]
   /** 内网域名解析的运行状态 */
   dns: DNSStatus
+  /** 飞牛桌面入口（从桌面点图标那条通道）的状态 */
+  gateway: GatewayEntry
   messages: string[]
 }
 

@@ -58,6 +58,11 @@ type NetworkCheckResult struct {
 	HomeSubnets []string `json:"home_subnets"`
 	// AccessIssues 是「设备通行范围 / 内网访问 / 设备隔离」之间互相矛盾的结论。
 	AccessIssues []AccessIssue `json:"access_issues"`
+	// Gateway 是飞牛统一网关入口（从飞牛桌面点图标那条通道）的状态。
+	//
+	// 由 api 层填充：socket 落在哪、现在还在不在，只有持有它的进程知道，
+	// 内核与网络层看不见这件事。
+	Gateway model.GatewayEntry `json:"gateway"`
 	// Messages 面向用户的结论说明。
 	Messages []string `json:"messages"`
 }

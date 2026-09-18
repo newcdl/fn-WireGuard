@@ -361,3 +361,124 @@ func TestGatewayLoginEndpointGone(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayKeeperRebindsAfterSocketRemoved 是那道真机 502 的加固回归。
+//
+// 现场是这样的：socket 文件被外部删掉，而进程一直在跑、端口一切正常、
+// 日志里只有一次启动记录 —— 在安装/升级/重启发生之前，用户点一次图标就是一次 502。
+// 守护者必须自己发现并就地重建，而不是等下一次启动。
+func TestGatewayKeeperRebindsAfterSocketRemoved(t *testing.T) {
+	srv := newGatewayTestServer(t)
+	// 用短路径：socket 路径有长度上限（macOS 约 104 字节），t.TempDir() 会带上很长的用例名
+	dir, err := os.MkdirTemp("", "gw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "app.sock")
+	srv.SetGatewaySocket(sock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	keeper := srv.NewGatewayKeeper(sock, srv.Router(nil))
+	done := make(chan error, 1)
+	go func() { done <- keeper.Run(ctx) }()
+
+	// 首次绑定
+	if !waitFor(3*time.Second, func() bool { return probeGatewaySocket(sock) == gatewaySocketOK }) {
+		t.Fatal("入口未能在 3 秒内建立")
+	}
+	if code := getViaGatewaySocket(t, sock, GatewayPrefix+"/api/v1/auth/state"); code != http.StatusOK {
+		t.Fatalf("入口建立后应能正常服务，实际 HTTP %d", code)
+	}
+	if !srv.gatewaySocketReady() {
+		t.Fatal("入口已建立，socket_ready 应为 true")
+	}
+
+	// 外部把 socket 文件删掉 —— 真机上就是这一步让桌面图标开始报 502。
+	// 注意此时进程还活着、端口还通，因此这个状态必须能被探测出来。
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
+	}
+	if srv.gatewaySocketReady() {
+		t.Fatal("socket 文件已被删除，socket_ready 不能仍为 true")
+	}
+
+	// 一次巡检就应当就地重建（不必真等 15 秒的巡检周期）
+	keeper.patrol(ctx)
+	if st := probeGatewaySocket(sock); st != gatewaySocketOK {
+		t.Fatalf("巡检后入口应被重建，实际状态=%d", st)
+	}
+	if code := getViaGatewaySocket(t, sock, GatewayPrefix+"/api/v1/auth/state"); code != http.StatusOK {
+		t.Fatalf("重建后应能正常服务，实际 HTTP %d", code)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("守护者应正常退出: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ctx 结束后守护者应退出")
+	}
+}
+
+// TestGatewayEntryStatusReportsMissingSocket 自检项必须说清「哪条通道、为什么」，
+// 而不是把「端口能打开」当成一切正常 —— 那正是 502 被误判的根源。
+func TestGatewayEntryStatusReportsMissingSocket(t *testing.T) {
+	srv := newGatewayTestServer(t)
+	// 未配置落点：不作断言（这台机器可能根本不走这条通道）
+	if st := srv.gatewayEntryStatus(); st.Configured || st.Ready {
+		t.Fatalf("未配置入口时不应断言：%+v", st)
+	}
+
+	dir, err := os.MkdirTemp("", "gw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "app.sock")
+	srv.SetGatewaySocket(sock)
+
+	// 配置了落点但文件不在：必须明确报「不可用」并给出处置办法
+	st := srv.gatewayEntryStatus()
+	if !st.Configured || st.Ready {
+		t.Fatalf("文件不存在时应报不可用：%+v", st)
+	}
+	if !strings.Contains(st.Detail, "502") || st.Fix == "" {
+		t.Fatalf("必须说清后果与处置办法：%+v", st)
+	}
+}
+
+// waitFor 轮询等待条件成立，用于等异步的监听建立。
+func waitFor(d time.Duration, ok func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return ok()
+}
+
+// getViaGatewaySocket 像飞牛网关那样，经 Unix Socket 发一个真实请求。
+func getViaGatewaySocket(t *testing.T, sock, path string) int {
+	t.Helper()
+	cl := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sock)
+			},
+		},
+	}
+	res, err := cl.Get("http://localhost" + path)
+	if err != nil {
+		t.Fatalf("经网关 socket 请求失败: %v", err)
+	}
+	defer res.Body.Close()
+	return res.StatusCode
+}
