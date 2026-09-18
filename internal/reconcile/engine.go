@@ -611,72 +611,172 @@ func (e *Engine) EnrichInterfaces(ifaces []model.Interface) {
 	}
 }
 
-// enforceQuota 执行流量配额与到期检查，必要时自动禁用节点。
-func (e *Engine) enforceQuota(ctx context.Context) {
-	snap := e.Status()
+// EnforceQuota 执行流量配额与到期检查：该停用的停用，条件解除的自动恢复。
+//
+// 额度按**自然月**计算，依据是落盘的流量聚合（见 internal/traffic）。早先的口径是
+// 「从设备创建起累计」，而用户填 50GB 时想的是「每月 50GB」；更要紧的是内核的累计计数
+// 会在接口重建（重启、重新下发配置）后归零，于是额度会在重启之后悄悄失效 ——
+// 用户以为它已经被挡住了，实际上又能继续用。
+//
+// 「月初自动恢复」是这套口径的另一半：只停用不恢复，用户每个月都要手工点一次启用。
+// 而恢复的前提是分辨得出「当初是谁停用的」，所以自动停用会写下原因（DisabledReason）——
+// 管理员手工停用的设备（原因为空）永远不会被自动放开。
+func (e *Engine) EnforceQuota(ctx context.Context) {
 	peers, err := e.store.ListPeers(ctx, 0)
 	if err != nil {
 		return
 	}
 	now := time.Now()
-	for _, iface := range snap.Interfaces {
-		for _, st := range iface.Peers {
-			for _, p := range peers {
-				if p.InterfaceName != iface.Name || p.PublicKey != st.PublicKey || !p.Enabled {
-					continue
-				}
-				reason := ""
-				if p.ExpireAt != nil && now.After(*p.ExpireAt) {
-					reason = "已到期"
-				} else if p.QuotaRx > 0 && st.RxBytes >= p.QuotaRx {
-					reason = fmt.Sprintf("接收流量超过配额 %d 字节", p.QuotaRx)
-				} else if p.QuotaTx > 0 && st.TxBytes >= p.QuotaTx {
-					reason = fmt.Sprintf("发送流量超过配额 %d 字节", p.QuotaTx)
-				}
-				if reason == "" {
-					continue
-				}
-				p.Enabled = false
-				if err := e.store.UpdatePeer(ctx, &p); err != nil {
-					continue
-				}
-				msg := fmt.Sprintf("节点 %s 已自动禁用：%s", p.Name, reason)
-				e.log.Warn(msg)
-				_ = e.store.AddLog(ctx, "warn", "quota", msg, "")
-				_ = e.store.AddAudit(ctx, &model.AuditEntry{
-					Action:     "peer.auto_disable",
-					TargetType: "peer",
-					TargetID:   fmt.Sprint(p.ID),
-					Username:   "system",
-					Result:     "ok",
-					Message:    msg,
-				})
+	// 本自然月的起点（本地时区）：额度问的就是「这个月用超了没有」。
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	used, err := e.store.TrafficTotalsSince(ctx, monthStart)
+	if err != nil {
+		// 读不到用量时什么都不做：停用设备是破坏性动作，不能基于「没有数据」下判断。
+		return
+	}
 
-				// 到期与流量用尽必须主动通知：设备被自动停用后，界面上看到的只是「离线」，
-				// 不通知的话用户会去检查自己的网络，而真正的原因在配额与期限设置里。
-				name := p.Name
-				if name == "" {
-					name = "未命名设备"
-				}
-				kind, title, hint := notify.KindQuota,
-					fmt.Sprintf("设备「%s」流量用尽，已自动停用", name),
-					"如需继续使用，请在设备设置里提高流量配额后重新启用。"
-				if p.ExpireAt != nil && now.After(*p.ExpireAt) {
-					kind = notify.KindExpired
-					title = fmt.Sprintf("设备「%s」已到期，已自动停用", name)
-					hint = "如需继续使用，请在设备设置里延长到期时间后重新启用。"
-				}
-				e.notifier.Notify(ctx, notify.Event{
-					Kind:  kind,
-					Title: title,
-					Body:  fmt.Sprintf("自动停用原因：%s。%s", reason, hint),
-					Peer:  name,
-					Iface: iface.Name,
-					At:    now,
-				})
+	for i := range peers {
+		p := peers[i]
+		dec, reason, detail := DecideQuota(p, used[p.ID], now)
+		switch dec {
+		case QuotaDisable:
+			p.Enabled, p.DisabledReason = false, reason
+			if err := e.store.UpdatePeer(ctx, &p); err != nil {
+				continue
 			}
+			e.peerAutoDisabled(ctx, p, reason, detail, now)
+		case QuotaRestore:
+			p.Enabled, p.DisabledReason = true, ""
+			if err := e.store.UpdatePeer(ctx, &p); err != nil {
+				continue
+			}
+			e.peerAutoRestored(ctx, p)
 		}
 	}
+}
+
+// QuotaDecision 是额度/期限检查的结论。
+type QuotaDecision int
+
+const (
+	// QuotaKeep 保持现状。
+	QuotaKeep QuotaDecision = iota
+	// QuotaDisable 需要自动停用。
+	QuotaDisable
+	// QuotaRestore 停用条件已解除，需要自动恢复。
+	QuotaRestore
+)
+
+// DecideQuota 判定某台设备当前该怎么处理，是纯函数：不读库、不改状态、不依赖当前时间以外的东西。
+//
+// 之所以独立出来：这段判定会**改动用户的设备状态**（停用一台设备等于把它踢下线），
+// 而分支不少 —— 到期、收/发两个方向的额度、自动停用后的恢复、以及「管理员手工停用的绝不能自动放开」。
+// 纯函数才能把这些分支逐条穷举，而不是等到真机上某台设备莫名其妙被放开了才发现。
+//
+// usage 传的是该设备**本自然月**的累计用量；停用的具体原因写进 DisabledReason，
+// 因为那个原因决定了条件解除后能不能自动恢复。
+func DecideQuota(p model.Peer, usage store.TrafficTotal, now time.Time) (QuotaDecision, string, string) {
+	reason, detail := "", ""
+	switch {
+	case p.ExpireAt != nil && now.After(*p.ExpireAt):
+		reason = model.PeerDisabledExpired
+		detail = "已到期 " + p.ExpireAt.Local().Format("2006-01-02 15:04")
+	case p.QuotaTx > 0 && usage.TxBytes >= p.QuotaTx:
+		reason = model.PeerDisabledQuota
+		detail = fmt.Sprintf("本月发送 %s，已达上限 %s", humanBytes(usage.TxBytes), humanBytes(p.QuotaTx))
+	case p.QuotaRx > 0 && usage.RxBytes >= p.QuotaRx:
+		reason = model.PeerDisabledQuota
+		detail = fmt.Sprintf("本月接收 %s，已达上限 %s", humanBytes(usage.RxBytes), humanBytes(p.QuotaRx))
+	}
+
+	switch {
+	case p.Enabled && reason != "":
+		return QuotaDisable, reason, detail
+	case !p.Enabled && p.DisabledReason != "" && reason == "":
+		// 条件已解除：到了新的一月，或管理员提高了额度、延长了期限。
+		// 只恢复「当初是自动停用」的设备 —— 管理员手工停用的 DisabledReason 为空，绝不自动放开。
+		return QuotaRestore, "", ""
+	}
+	return QuotaKeep, "", ""
+}
+
+// peerAutoDisabled 记录并通知一次自动停用。
+//
+// 到期与流量用尽必须主动通知：设备被停用后，界面上看到的只是「离线」，
+// 不通知的话用户会去检查自己的网络，而真正的原因在配额与期限设置里。
+func (e *Engine) peerAutoDisabled(ctx context.Context, p model.Peer, reason, detail string, now time.Time) {
+	name := p.Name
+	if name == "" {
+		name = "未命名设备"
+	}
+	msg := fmt.Sprintf("设备 %s 已自动停用：%s", name, detail)
+	e.log.Warn(msg)
+	_ = e.store.AddLog(ctx, "warn", "quota", msg, "")
+	_ = e.store.AddAudit(ctx, &model.AuditEntry{
+		Action:     "peer.auto_disable",
+		TargetType: "peer",
+		TargetID:   fmt.Sprint(p.ID),
+		Username:   "system",
+		Result:     "ok",
+		Message:    msg,
+	})
+
+	kind, title, hint := notify.KindQuota,
+		fmt.Sprintf("设备「%s」本月流量用尽，已自动停用", name),
+		"下个自然月会按当月用量自动恢复；如需立刻继续使用，可在设备设置里提高流量额度后重新启用。"
+	if reason == model.PeerDisabledExpired {
+		kind, title, hint = notify.KindExpired,
+			fmt.Sprintf("设备「%s」已到期，已自动停用", name),
+			"如需继续使用，请在设备设置里延长到期时间后重新启用。"
+	}
+	e.notifier.Notify(ctx, notify.Event{
+		Kind:  kind,
+		Title: title,
+		Body:  fmt.Sprintf("自动停用原因：%s。%s", detail, hint),
+		Peer:  name,
+		Iface: p.InterfaceName,
+		At:    now,
+	})
+}
+
+// peerAutoRestored 记录一次自动恢复。
+//
+// 刻意不发通知：设备恢复后会照常握手上线，那时既有的「设备上线」事件本身就会通知用户；
+// 再加一条「已恢复」只会在群里多刷一条重复消息。
+func (e *Engine) peerAutoRestored(ctx context.Context, p model.Peer) {
+	name := p.Name
+	if name == "" {
+		name = "未命名设备"
+	}
+	msg := fmt.Sprintf("设备 %s 的停用条件已解除，已自动恢复启用", name)
+	e.log.Info(msg)
+	_ = e.store.AddLog(ctx, "info", "quota", msg, "")
+	_ = e.store.AddAudit(ctx, &model.AuditEntry{
+		Action:     "peer.auto_enable",
+		TargetType: "peer",
+		TargetID:   fmt.Sprint(p.ID),
+		Username:   "system",
+		Result:     "ok",
+		Message:    msg,
+	})
+}
+
+// humanBytes 把字节数写成日志与通知里能一眼看懂的形式。
+//
+// 只用在给用户看的文字里（日志、Webhook 正文）；接口返回的仍是原始字节数，
+// 由前端按自己的习惯格式化 —— 服务端不该替界面决定显示成 MB 还是 GiB。
+func humanBytes(n int64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	v := float64(n)
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d %s", n, units[0])
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
 // Run 启动采样与收敛循环，阻塞直到 ctx 结束。
@@ -720,7 +820,7 @@ func (e *Engine) Run(ctx context.Context) {
 				e.log.Warn("触发收敛失败", "err", err)
 			}
 		case <-quota.C:
-			e.enforceQuota(ctx)
+			e.EnforceQuota(ctx)
 		case <-cleanup.C:
 			_ = e.store.PruneLogs(ctx, time.Now().AddDate(0, 0, -14))
 			_ = e.store.CleanExpiredSessions(ctx)

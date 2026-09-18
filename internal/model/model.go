@@ -33,6 +33,14 @@ const (
 	RouteTableOff = "off"
 	// RouteTableClient 仅当本机作为客户端时才为对端网段添加路由。
 	RouteTableClient = "client"
+
+	// PeerDisabledQuota / PeerDisabledExpired 是设备被**自动**停用的原因（Peer.DisabledReason 的取值）。
+	//
+	// 只记「为什么停用」，不记具体数值或期限：那些会随管理员调整而变，
+	// 而能不能自动恢复取决于原因 —— 条件解除时（到了新的一月、额度提高、期限延长）
+	// 只有这两个原因会被自动放开，管理员手工停用的（原因为空）绝不自动恢复。
+	PeerDisabledQuota   = "quota"
+	PeerDisabledExpired = "expire"
 )
 
 // 权限点，用于 RBAC 粗粒度校验。
@@ -146,8 +154,15 @@ type Peer struct {
 	QuotaTx      int64      `json:"quota_tx"`
 	ExpireAt     *time.Time `json:"expire_at,omitempty"`
 	Enabled      bool       `json:"enabled"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// DisabledReason 是「被自动停用的原因」：quota（流量用尽）或 expire（已到期），
+	// 空表示不是自动停用（在用的、或管理员手工停用的）。
+	//
+	// 必须落库：月度额度要到月初自动恢复，而恢复的前提正是知道当初为什么停用 ——
+	// 光看 enabled=false 分不清「管理员手工停的」与「流量用尽自动停的」，
+	// 分不清就会把前者也一并放开。
+	DisabledReason string    `json:"disabled_reason,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 	// ConfigFingerprint 是这台设备**上次拿到配置时**的客户端配置指纹
 	// （由 wgconf.ClientFingerprint 计算，不含任何密钥）。空表示从未生成过配置。
 	//

@@ -281,7 +281,13 @@ func (s *Service) UpdatePeer(ctx context.Context, id int64, in PeerInput, a Acto
 	p.ExpireAt = in.ExpireAt
 	// 只有显式给出才改动（理由见 PeerInput.Enabled 的说明）。
 	if in.Enabled != nil {
+		// 用户显式启停时清掉「自动停用原因」。
+		//
+		// 两个方向都必要：手工停用的设备必须与「因额度停用」区分开，否则月初的自动恢复
+		// 会把它悄悄放开；手工启用的设备也不该留着一个已经不成立的原因。
+		// 真因额度用尽被停用时，引擎会重新把原因写上。
 		p.Enabled = *in.Enabled
+		p.DisabledReason = ""
 	}
 	if in.GenerateKeys {
 		priv, pub, err := wgkey.Generate()

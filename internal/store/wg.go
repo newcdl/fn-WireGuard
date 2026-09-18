@@ -199,7 +199,7 @@ func (s *Store) InterfaceNames(ctx context.Context) (map[string]bool, error) {
 const peerCols = `p.id,p.interface_id,IFNULL(i.name,''),p.name,p.public_key,p.preshared_key,p.client_priv,
 	IFNULL(p.route_mode,'lan'),IFNULL(p.client_ips,'[]'),p.endpoint_host,
 	p.endpoint_port,p.allowed_ips,p.keepalive,p.group_tag,p.remark,p.quota_rx,p.quota_tx,p.expire_at,p.enabled,
-	p.created_at,p.updated_at,IFNULL(p.config_fp,'')`
+	p.created_at,p.updated_at,IFNULL(p.config_fp,''),IFNULL(p.disabled_reason,'')`
 
 const peerFrom = ` FROM wg_peer p LEFT JOIN wg_interface i ON i.id = p.interface_id`
 
@@ -218,7 +218,7 @@ func (s *Store) scanPeer(sc interface{ Scan(...any) error }) (*model.Peer, error
 	err := sc.Scan(&p.ID, &p.InterfaceID, &p.InterfaceName, &p.Name, &p.PublicKey, &psk, &clientKey,
 		&p.RouteMode, &clientIPs, &p.EndpointHost,
 		&p.EndpointPort, &allowed, &p.Keepalive, &p.GroupTag, &p.Remark, &p.QuotaRx, &p.QuotaTx, &expireAt,
-		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint)
+		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint, &p.DisabledReason)
 	if err != nil {
 		return nil, err
 	}
@@ -297,12 +297,12 @@ func (s *Store) CreatePeer(ctx context.Context, p *model.Peer) error {
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO wg_peer(interface_id,name,public_key,preshared_key,client_priv,route_mode,client_ips,
 		 endpoint_host,endpoint_port,allowed_ips,
-		 keepalive,group_tag,remark,quota_rx,quota_tx,expire_at,enabled,config_fp,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 keepalive,group_tag,remark,quota_rx,quota_tx,expire_at,enabled,disabled_reason,config_fp,created_at,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
 		p.EndpointHost, p.EndpointPort, mustJSON(p.AllowedIPs),
 		p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx, expireArg(p.ExpireAt), b2i(p.Enabled),
-		p.ConfigFingerprint, ts(now), ts(now))
+		p.DisabledReason, p.ConfigFingerprint, ts(now), ts(now))
 	if err != nil {
 		return err
 	}
@@ -339,13 +339,13 @@ func (s *Store) UpdatePeer(ctx context.Context, p *model.Peer) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE wg_peer SET interface_id=?,name=?,public_key=?,preshared_key=?,client_priv=?,route_mode=?,client_ips=?,
 		 endpoint_host=?,endpoint_port=?,
-		 allowed_ips=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,
+		 allowed_ips=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,disabled_reason=?,
 		 config_fp=?,updated_at=?
 		 WHERE id=?`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
 		p.EndpointHost, p.EndpointPort,
 		mustJSON(p.AllowedIPs), p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx,
-		expireArg(p.ExpireAt), b2i(p.Enabled), p.ConfigFingerprint, ts(now), p.ID)
+		expireArg(p.ExpireAt), b2i(p.Enabled), p.DisabledReason, p.ConfigFingerprint, ts(now), p.ID)
 	if err != nil {
 		return err
 	}
@@ -380,7 +380,9 @@ func (s *Store) BatchSetPeerEnabled(ctx context.Context, ids []int64, enabled bo
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	q := `UPDATE wg_peer SET enabled=?, updated_at=? WHERE id IN (` + placeholders(len(ids)) + `)`
+	// 用户显式启停时一并清掉「自动停用原因」：手工停用的设备不能被月初的自动恢复误放开，
+	// 手工启用的设备也不该留着一个已不成立的原因。
+	q := `UPDATE wg_peer SET enabled=?, disabled_reason='', updated_at=? WHERE id IN (` + placeholders(len(ids)) + `)`
 	args := []any{b2i(enabled), ts(time.Now())}
 	for _, id := range ids {
 		args = append(args, id)
