@@ -66,8 +66,15 @@ type CreateInterfaceInput struct {
 	RouteTable string   `json:"route_table"`
 	PostUp     string   `json:"post_up"`
 	PostDown   string   `json:"post_down"`
-	Enabled    bool     `json:"enabled"`
-	Autostart  bool     `json:"autostart"`
+	// Enabled / Autostart 用指针表达「有没有指定」：新建时为 nil 表示按默认（不启用、不随系统启动，
+	// 与这两个字段用非指针时的行为一致），编辑时为 nil 表示保持原值。
+	//
+	// 它们原先是非指针布尔，于是「部分更新」在语义上根本不成立 —— 只传 {"allow_lan": true}
+	// 会把 enabled 与 autostart 一并置为 false，一条正在运行的连接就这么被顺手停用了。
+	// 界面编辑抽屉总是提交完整对象，所以用户碰不到；但脚本与自动化一定会踩，而且故障现象
+	// （连接被停用）与那一步操作（改了个无关开关）完全对不上，排查代价很高。
+	Enabled   *bool `json:"enabled"`
+	Autostart *bool `json:"autostart"`
 	// AllowLAN 控制「允许设备访问家里内网」。
 	// 新建连接时为 nil 表示采用默认值（开启）；编辑时为 nil 表示保持原值。
 	AllowLAN *bool `json:"allow_lan"`
@@ -118,8 +125,8 @@ func (s *Service) CreateInterface(ctx context.Context, in CreateInterfaceInput, 
 		RouteTable: in.RouteTable,
 		PostUp:     in.PostUp,
 		PostDown:   in.PostDown,
-		Enabled:    in.Enabled,
-		Autostart:  in.Autostart,
+		Enabled:    in.Enabled != nil && *in.Enabled,
+		Autostart:  in.Autostart != nil && *in.Autostart,
 		// 新建连接默认开启内网访问：设备连回家就是为了访问 NAS 与家里其它设备，
 		// 不开的话表现是「能连上 NAS，但访问不了家里的机器」。
 		AllowLAN: in.AllowLAN == nil || *in.AllowLAN,
@@ -164,8 +171,13 @@ func (s *Service) UpdateInterface(ctx context.Context, id int64, in CreateInterf
 	it.RouteTable = in.RouteTable
 	it.PostUp = in.PostUp
 	it.PostDown = in.PostDown
-	it.Enabled = in.Enabled
-	it.Autostart = in.Autostart
+	// 只有显式给出才改动这两个开关（理由见 CreateInterfaceInput 里它们的说明）。
+	if in.Enabled != nil {
+		it.Enabled = *in.Enabled
+	}
+	if in.Autostart != nil {
+		it.Autostart = *in.Autostart
+	}
 	if in.AllowLAN != nil {
 		it.AllowLAN = *in.AllowLAN
 	}

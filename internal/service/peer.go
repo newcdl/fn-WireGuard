@@ -65,7 +65,9 @@ type PeerInput struct {
 	QuotaRx          int64      `json:"quota_rx"`
 	QuotaTx          int64      `json:"quota_tx"`
 	ExpireAt         *time.Time `json:"expire_at"`
-	Enabled          bool       `json:"enabled"`
+	// Enabled 用指针表达「有没有指定」：新建时为 nil 表示按默认（不启用），编辑时为 nil 表示保持原值。
+	// 与连接的入参同理：非指针布尔会让部分更新静默把设备停用。
+	Enabled *bool `json:"enabled"`
 	// GenerateKeys 为 true 时自动生成密钥对并托管私钥。
 	GenerateKeys bool `json:"generate_keys"`
 	// GeneratePSK 为 true 时生成预共享密钥。
@@ -118,7 +120,7 @@ func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model
 		QuotaRx:          in.QuotaRx,
 		QuotaTx:          in.QuotaTx,
 		ExpireAt:         in.ExpireAt,
-		Enabled:          in.Enabled,
+		Enabled:          in.Enabled != nil && *in.Enabled,
 	}
 
 	if in.GenerateKeys || p.PublicKey == "" {
@@ -225,7 +227,7 @@ func (s *Service) ImportPeers(ctx context.Context, ifaceID int64, rows []PeerImp
 			Remark:      strings.TrimSpace(r.Remark),
 			GroupTag:    strings.TrimSpace(r.GroupTag),
 			Keepalive:   25,
-			Enabled:     true,
+			Enabled:     boolPtr(true),
 			AutoAddress: true,
 			// 没给识别码的就自动生成密钥对（等同于在界面点「自动生成」）
 			GenerateKeys: pub == "",
@@ -277,7 +279,10 @@ func (s *Service) UpdatePeer(ctx context.Context, id int64, in PeerInput, a Acto
 	p.Remark = in.Remark
 	p.QuotaRx, p.QuotaTx = in.QuotaRx, in.QuotaTx
 	p.ExpireAt = in.ExpireAt
-	p.Enabled = in.Enabled
+	// 只有显式给出才改动（理由见 PeerInput.Enabled 的说明）。
+	if in.Enabled != nil {
+		p.Enabled = *in.Enabled
+	}
 	if in.GenerateKeys {
 		priv, pub, err := wgkey.Generate()
 		if err != nil {
