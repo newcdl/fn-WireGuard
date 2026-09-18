@@ -68,8 +68,9 @@
 
 ## 界面预览
 
-> 以下截图取自 `dev` 分支，实际界面以你安装的版本为准。
-> 图片文件与文件名清单见 [`docs/screenshots/README.md`](docs/screenshots/README.md)。
+> 以下截图取自 `dev` 分支的**内置演示模式**（内存后端，界面顶栏带「演示模式」标记），其中的连接与设备都是示例数据。
+> 真实 NAS 上界面相同，只是演示模式无法读取系统的真实上网路线。图片文件与更新方式见
+> [`docs/screenshots/README.md`](docs/screenshots/README.md)。
 
 | 总览：连接与设备状态、实时流量 | 我的连接：地址端口、内网访问与设备隔离 |
 |---|---|
