@@ -38,7 +38,7 @@ if command -v ss >/dev/null 2>&1; then
 fi
 
 if [ -d /etc/wireguard ] && ls /etc/wireguard/*.conf >/dev/null 2>&1; then
-    fnwg_log "检测到已有的 /etc/wireguard 配置，安装完成后可在「接口管理 → 导入配置」中一键导入"
+    fnwg_log "检测到已有的 /etc/wireguard 配置，安装完成后可在「我的连接 → 导入配置」中一键导入"
 fi
 
 fnwg_log "环境检查通过（进程管理方式：$(fnwg_mode)）"

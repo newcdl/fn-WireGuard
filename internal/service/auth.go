@@ -320,11 +320,10 @@ func (s *Service) Logout(ctx context.Context, token string) error {
 
 // Authenticate 校验令牌并返回账号。
 //
-// 返回前必须补上来源与展示名：这是会话账号通往界面的**另一条出口**
-// （/auth/me 与 /auth/state 都走它，且 requireAuth 中间件每次请求都要过一遍）。
-// 只补 issueSession 那一处是不够的 —— 前端拿到登录响应后会立刻调 /auth/me 刷新，
-// 于是飞牛账号名会在刷新的一瞬间退回内部的 nas:<uid>，用户看到的正是这个现象。
-// 两处都补，登录那一刻与之后的每次刷新才是同一个名字。
+// 会话账号通往界面的两条出口（登录响应、以及这里的 /auth/me 与 /auth/state）
+// 现在都直接读库，因此两处拿到的必然是同一份数据。早先这里还要补一层「来源与展示名」
+// 的派生，是为了让飞牛账号显示成用户认得出来的名字 —— 那套派生已随免密登录一并移除，
+// 现在没有任何字段需要在多处补齐，也就不会再出现「登录那一刻与刷新之后名字不一样」。
 func (s *Service) Authenticate(ctx context.Context, token string) (*model.User, error) {
 	if token == "" {
 		return nil, errors.New("未登录")

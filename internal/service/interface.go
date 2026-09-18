@@ -537,10 +537,10 @@ func (s *Service) validateInterface(ctx context.Context, it *model.Interface, se
 			case fi.Name == it.Name:
 				return fmt.Errorf("系统上已存在名为 %s 的 WireGuard 网卡，但它不是本应用创建的"+
 					"（可能是历史残留，也可能是其它工具在用）。请改用其他名称，"+
-					"或先到「系统设置 → 运行状态 → 疑似残留网卡」中确认并清理它", fi.Name)
+					"或先到「系统维护 → 疑似残留网卡」中确认并清理它", fi.Name)
 			case it.ListenPort > 0 && fi.ListenPort == it.ListenPort:
 				return fmt.Errorf("服务端口 %d 已被系统上不是本应用创建的网卡 %s 占用，请更换端口"+
-					"（该网卡可能是历史残留，可在「系统设置 → 运行状态 → 疑似残留网卡」中清理）",
+					"（该网卡可能是历史残留，可在「系统维护 → 疑似残留网卡」中清理）",
 					it.ListenPort, fi.Name)
 			}
 		}

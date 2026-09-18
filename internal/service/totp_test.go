@@ -257,8 +257,8 @@ func TestTOTPDisableRestoresPlainLogin(t *testing.T) {
 }
 
 // TestAdminTOTPSetupOnBehalf 覆盖「管理员在账号管理里代为开启二次验证」：
-// 本地账号可以（不需要知道对方密码），飞牛账号必须被拒——
-// 飞牛账号免密进入、不经过本应用的口令校验，给它开二次验证是个永远不起作用的假开关。
+// 与自助路径只差一处 —— 不校验本人密码（操作者本来就不是账号主人，密码自然也不知道），
+// 权限由调用方要求的 user.manage 保证。
 func TestAdminTOTPSetupOnBehalf(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()

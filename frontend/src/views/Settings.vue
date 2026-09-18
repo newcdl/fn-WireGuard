@@ -537,6 +537,41 @@
             这是一个运行在飞牛 NAS 上的 WireGuard 管理工具。你不需要记住任何命令，只要在界面上点几下，
             就能让手机、笔记本在外网安全地连回家里，或把两处网络连成一张网。
           </p>
+
+          <!-- 功能概览：应用内没有别的地方能一眼说清「这个工具到底能做什么」，
+               而装完之后用户最先打开的就是这一页。折叠起来是为了不把关于页撑长。 -->
+          <el-collapse style="margin-bottom: 12px">
+            <el-collapse-item title="它能做什么（功能概览）" name="features">
+              <ul class="fnwg-about-list">
+                <li>
+                  <strong>连接与设备</strong>：多条连接互不干扰；设备扫码即接入，也可批量导入或按「选用途 → 填信息 → 扫码」
+                  分步新建；支持到期时间与流量额度。
+                </li>
+                <li>
+                  <strong>访问控制</strong>：按设备指定能访问的网段（家里网段可直接点选）；可允许设备访问家里内网，
+                  也可开启设备间隔离，防止别人的设备碰到你的电脑与摄像头。
+                </li>
+                <li>
+                  <strong>内网域名</strong>：设备用主机名（如 <code>nas.lan</code>）访问家里设备，不必记 IP。
+                </li>
+                <li>
+                  <strong>安全</strong>：本应用账号体系（口令以 argon2id 存储）、登录二次验证（动态口令 + 一次性恢复码 +
+                  可信任设备 30 天）、应急安全码，以及 <code>fnwg-cli</code> 命令行后手工具。
+                </li>
+                <li>
+                  <strong>可靠与可回溯</strong>：改完配置自动下发、系统重启自动恢复；改动前自动留配置快照，
+                  可看清差异再一键回滚；支持备份导出与导入。
+                </li>
+                <li>
+                  <strong>看得见的状态</strong>：顶栏状态点与异常横幅即时报出问题；一键体检能查出上网路线、
+                  内网访问、内网域名与飞牛桌面入口各自的毛病。
+                </li>
+                <li>
+                  <strong>事件通知</strong>：设备上下线、连接中断、额度用尽等推送到钉钉 / 企业微信 / 自定义 Webhook。
+                </li>
+              </ul>
+            </el-collapse-item>
+          </el-collapse>
           <el-descriptions :column="1" border size="small">
             <el-descriptions-item label="版本">{{ session.version || '-' }}</el-descriptions-item>
             <el-descriptions-item label="工作模式">{{ backendLabel }}</el-descriptions-item>
@@ -547,6 +582,11 @@
             <el-descriptions-item label="开源许可">
               <strong>GPL-3.0-only</strong>（GNU 通用公共许可证第 3 版）· 版权归 newcdl &lt;newcdl@163.com&gt; ·
               不提供任何担保。第三方组件及其许可证可点下方「开源许可」逐条查看。
+            </el-descriptions-item>
+            <el-descriptions-item label="项目源码">
+              <el-link type="primary" :underline="false" @click="openRepo">
+                github.com/newcdl/fn-WireGuard
+              </el-link>
             </el-descriptions-item>
           </el-descriptions>
 
@@ -559,6 +599,17 @@
           <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap">
             <el-button :icon="Reading" @click="helpVisible = true">打开配置说明大全</el-button>
             <el-button :icon="Document" @click="openLicenses">开源许可</el-button>
+            <!-- 图标内联 SVG：Element Plus 的图标集里没有品牌图标，
+                 而 npm 上再引一个仅为此用的包不值得。路径是 GitHub 官方标记的形状。 -->
+            <el-button @click="openRepo">
+              <svg class="fnwg-github-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+                />
+              </svg>
+              GitHub 源码
+            </el-button>
           </div>
         </div>
       </el-tab-pane>
@@ -1383,6 +1434,14 @@ function downloadLicenses() {
   URL.revokeObjectURL(url)
 }
 
+/** 项目源码地址。 */
+const REPO_URL = 'https://github.com/newcdl/fn-WireGuard'
+
+/** 打开项目源码。显式带 noopener：新开的页面拿不到本页的引用，避免被反向操作。 */
+function openRepo() {
+  window.open(REPO_URL, '_blank', 'noopener,noreferrer')
+}
+
 onMounted(async () => {
   await loadAll()
 })
@@ -1471,6 +1530,27 @@ onMounted(async () => {
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.fnwg-github-icon {
+  margin-right: 6px;
+  vertical-align: -2px;
+}
+
+/* 关于页的功能概览：逐条列出来比一大段话好扫，用户找的是「有没有我要的能力」。 */
+.fnwg-about-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.9;
+}
+
+.fnwg-about-list code {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--el-fill-color);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
 }
 
 </style>
