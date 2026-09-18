@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 # fn-WireGuard 常用任务入口（实际逻辑在 scripts/ 下）
 
 .PHONY: help version bump release build amd64 arm64 all dev dev-frontend test vet fmt tidy clean

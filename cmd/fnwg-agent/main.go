@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Command fnwg-agent 是特权代理进程：以 root 运行，负责把数据库中的期望态
 // 收敛到内核（netlink / wgctrl），并通过 Unix Domain Socket 对外提供最小化的能力集。
 //
@@ -150,7 +153,7 @@ func fixSharedPerms(cfg *config.Config, gid int) {
 }
 
 func newLogger(cfg *config.Config) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
 	f, err := os.OpenFile(cfg.LogDir()+"/agent.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
 	if err != nil {
 		return slog.New(slog.NewTextHandler(os.Stderr, opts))

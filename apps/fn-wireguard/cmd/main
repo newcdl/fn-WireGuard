@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 # 应用运行控制。
 # 约定：start 成功返回 0 / 失败返回 1；status 运行中返回 0 / 未运行返回 3。
 
@@ -13,8 +16,13 @@ start)
     if ! fnwg_start; then
         fnwg_fail "启动失败（方式: $(fnwg_mode)）。systemd 方式请执行 journalctl -u ${FNWG_UNIT_AGENT} -u ${FNWG_UNIT_WEB}；PID 方式请查看 ${TRIM_PKGVAR}/log/"
     fi
-    if ! fnwg_wait_health 15; then
-        fnwg_fail "Web 服务在 15 秒内未就绪，请检查 ${TRIM_PKGVAR}/log/web.log"
+    # 端口与网关入口都要确认。只等端口是不够的：应用已在运行（或 systemd 已经把
+    # 单元拉起来）时，`systemctl start` 是空操作，Web 进程不会重启，socket 也不会重建 ——
+    # 这时若只查端口就会报告「启动成功」，而飞牛桌面点图标仍然是 502。
+    # fnwg_ensure_gateway_ready 会同时确认两者，并在入口没起来时自动修一次再判。
+    if ! fnwg_ensure_gateway_ready 15; then
+        fnwg_fail "Web 服务或飞牛统一网关入口在 15 秒内未就绪（从飞牛桌面打开会显示 502）。
+       请检查 ${TRIM_PKGVAR}/log/web.log，或执行 journalctl -u ${FNWG_UNIT_WEB} 查看原因"
     fi
     exit 0
     ;;

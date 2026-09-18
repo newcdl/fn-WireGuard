@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <template>
   <div v-if="meta.hint || showExample" class="fnwg-field-tips">
     <div v-if="meta.hint" class="fnwg-field-hint">{{ meta.hint }}</div>

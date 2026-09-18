@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 # 本地开发脚本：在开发机上以内存后端运行，便于调试 UI 与业务流程（不会操作真实网络）。
 #
 # 用法:

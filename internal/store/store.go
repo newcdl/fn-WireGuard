@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Package store 是 SQLite 数据访问层，fnwg-web 与 fnwg-agent 共享同一数据库（WAL 模式）。
 package store
 
@@ -129,6 +132,55 @@ CREATE TABLE IF NOT EXISTS sys_session (
 );
 CREATE INDEX IF NOT EXISTS idx_session_user ON sys_session(user_id);
 
+-- 二次验证（TOTP）的登录挑战：口令校验通过后、动态口令校验通过前，会话尚未建立。
+-- 单独一张表而不是复用 sys_session 加个 pending 标记，是为了从结构上杜绝
+-- 「未通过二次验证的令牌被当成已登录会话」——那种写法一旦漏判一处就是越权。
+CREATE TABLE IF NOT EXISTS sys_totp_challenge (
+  token_hash TEXT    PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
+  expires_at TEXT    NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_totp_challenge_user ON sys_totp_challenge(user_id);
+
+-- 二次验证的恢复码：只存 argon2id 哈希（与登录口令同一套算法，参数也一致），
+-- 明文仅在开启时展示一次、之后无法再取回。used_at 非空表示已用过（一次性）。
+CREATE TABLE IF NOT EXISTS sys_recovery_code (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
+  code_hash  TEXT    NOT NULL,
+  used_at    TEXT,
+  created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_user ON sys_recovery_code(user_id);
+
+-- 受信任设备：勾选「信任本设备」后下发的设备令牌（只存 SHA-256，明文仅签发时返回一次）。
+-- 命中且未过期即可跳过二次验证，这正是飞牛官方 2FA 的「信任本设备」语义。
+-- 注意：它的本质是「用设备上的凭据替代第二个因子」，所以改密码、关闭/重开二次验证、
+-- 管理员重置时都必须立即清空——否则它就成了一条绕过 2FA 的永久后门。
+CREATE TABLE IF NOT EXISTS sys_trusted_device (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id      INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
+  token_hash   TEXT    NOT NULL UNIQUE,
+  name         TEXT    NOT NULL DEFAULT '',
+  src_ip       TEXT    NOT NULL DEFAULT '',
+  created_at   TEXT    NOT NULL,
+  last_used_at TEXT    NOT NULL,
+  expires_at   TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trusted_user ON sys_trusted_device(user_id);
+
+-- 应急「安全码」：所有常规登录途径都失效时（飞牛网关异常、管理员忘密码、2FA 手机丢失）
+-- 的最后一道入口。它不属于任何账号，是实例级凭据，因此单独成表而不放进 app_setting
+-- —— 放进设置表会被全量备份带走，等于把万能钥匙抄进备份文件里。
+-- 只存 argon2id 哈希，明文仅在生成时展示一次；用一次即作废。
+CREATE TABLE IF NOT EXISTS sys_security_code (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  code_hash  TEXT    NOT NULL,
+  created_at TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts          TEXT    NOT NULL,
@@ -208,7 +260,10 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
-	return s.migrateNetworkSafety()
+	if err := s.migrateNetworkSafety(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ensureColumn(table, column, ddl string) error {

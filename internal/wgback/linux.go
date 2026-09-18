@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 //go:build linux
 
 package wgback
@@ -6,15 +9,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/vishvananda/netlink"
-	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"fnwg/internal/model"
@@ -26,75 +28,102 @@ import (
 //  3. 绝不覆盖系统上已存在的任何路由，只做「新增」；
 //  4. 任何一步失败都只记录并跳过，不中断、不回滚系统状态。
 
-type kernelBackend struct {
+type linuxBackend struct {
 	mu     sync.Mutex
-	client *wgctrl.Client
+	driver wireGuardDriver
 	state  *State
 	// endpoints 缓存对端地址的 DNS 解析结果，见 resolveEndpoint。
 	endpoints map[string]endpointEntry
+	// fallback 是「自动回退」的备选驱动：内核模式在运行时被证实不可用时，
+	// 就地切到它并重试一次，避免用户在「模块文件在、但加载被拒」的系统上完全用不了。
+	// 一旦切换即置空，不会在两种实现之间来回横跳。
+	fallback func() wireGuardDriver
+	// kind 记录当前实际生效的后端标识（回退后会由 kernel 变为 userspace）。
+	kind string
+	// driverUsed 记录本轮收敛中当前驱动是否已经真正接管过设备。
+	//
+	// 它决定「运行时回退」还能不能发生：只要当前驱动已经建出/接管了设备，
+	// 再回退就会留下「一部分连接走内核、一部分走用户态」的混合数据面 ——
+	// 那种局面比直接报错更难排查，因此宁可让这一轮失败也不回退。
+	driverUsed bool
 }
 
-// New 创建内核态后端。statePath 用于记录受管对象与系统路由基线。
+// New 创建 Linux 数据面后端。statePath 用于记录受管对象与系统路由基线。
 func New(statePath string) Backend {
-	return &kernelBackend{state: LoadState(statePath), endpoints: map[string]endpointEntry{}}
+	return newLinuxBackend(LoadState(statePath))
 }
 
-func (b *kernelBackend) Kind() string { return "kernel" }
-
-func (b *kernelBackend) Caps() Capabilities {
-	caps := Capabilities{Backend: "kernel"}
-	if _, err := os.Stat("/sys/module/wireguard"); err == nil {
-		caps.KernelModule = true
-	} else if probeWireGuard() {
-		caps.KernelModule = true
+// newLinuxBackend 选择数据面驱动。
+//
+// 选择顺序：
+//  1. 环境变量 FNWG_BACKEND 显式指定 kernel / userspace 时，直接照办 —— 这是运维
+//     在自动判断出错时的逃生舱，因此绝不在其之上再自动切换；
+//  2. 自动模式：内核具备能力就用内核（标准模式）；内核明显缺失但系统提供
+//     /dev/net/tun 时直接使用用户态实现，不必先撞一次失败；
+//  3. 内核「看起来可用」（模块文件在）但真正创建接口时才被拒的系统，
+//     由 Apply 在运行时回退 —— 见 switchToFallback。
+func newLinuxBackend(state *State) *linuxBackend {
+	b := &linuxBackend{state: state, endpoints: map[string]endpointEntry{}}
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv(envBackendMode)))
+	if mode == "" {
+		mode = modeAuto
 	}
-	if _, err := os.Stat("/dev/net/tun"); err == nil {
-		caps.TunDevice = true
+	switch mode {
+	case modeKernel:
+		b.driver = newKernelDriver()
+	case modeUserspace:
+		b.driver = newUserspaceDriver()
+	default: // modeAuto 或无法识别的取值：一律按自动处理，绝不让一个拼错的值把应用变成不可用
+		switch {
+		case kernelModuleAvailable():
+			b.driver = newKernelDriver()
+			if tunDeviceAvailable() {
+				b.fallback = func() wireGuardDriver { return newUserspaceDriver() }
+			}
+		case tunDeviceAvailable():
+			b.driver = newUserspaceDriver()
+		default:
+			// 两条路都没有：仍用内核驱动，让 Ready 报出「如何完成上电准备」的提示，
+			// 比抛一句「无可用后端」更能让用户知道下一步该做什么。
+			b.driver = newKernelDriver()
+		}
 	}
-	return caps
+	b.kind = b.driver.Kind()
+	return b
 }
+
+func (b *linuxBackend) Kind() string { return b.kind }
+
+func (b *linuxBackend) Caps() Capabilities { return b.driver.Caps() }
 
 // ManagedInterfaces 返回本应用创建过的接口名。
-func (b *kernelBackend) ManagedInterfaces() []string { return b.state.ManagedCopy() }
+func (b *linuxBackend) ManagedInterfaces() []string { return b.state.ManagedCopy() }
 
-// probeWireGuard 建立一次性 netlink 连接探测 WireGuard 内核支持是否可用。
-func probeWireGuard() bool {
-	c, err := wgctrl.New()
-	if err != nil {
-		return false
+// switchToFallback 切换到备选驱动，只在内核被证实不可用时调用。
+//
+// 安全性依据：内核是在「创建接口」这一步才被证实不可用的，此时本进程还没有
+// 按内核模式建出任何网卡，因此不存在「一半内核、一半用户态」的混合状态。
+func (b *linuxBackend) switchToFallback(cause error) {
+	fb := b.fallback
+	if fb == nil {
+		return
 	}
-	defer c.Close()
-	_, err = c.Devices()
-	return err == nil
-}
-
-func (b *kernelBackend) conn() (*wgctrl.Client, error) {
-	if b.client != nil {
-		return b.client, nil
-	}
-	c, err := wgctrl.New()
-	if err != nil {
-		return nil, fmt.Errorf("连接 WireGuard 内核接口失败（请确认内核模块已加载且进程拥有 CAP_NET_ADMIN）: %w", err)
-	}
-	b.client = c
-	return c, nil
-}
-
-func (b *kernelBackend) reset() {
-	if b.client != nil {
-		_ = b.client.Close()
-		b.client = nil
-	}
+	b.fallback = nil
+	b.driver.Reset()
+	b.driver = fb()
+	b.kind = b.driver.Kind()
+	slog.Warn("内核 WireGuard 不可用，已切换为兼容模式（用户态实现）",
+		"原因", cause, "说明", "吞吐略低于标准模式，功能不受影响")
 }
 
 // Apply 执行期望态收敛。
-func (b *kernelBackend) Apply(specs []model.InterfaceSpec, opts ApplyOptions) (Diff, error) {
+func (b *linuxBackend) Apply(specs []model.InterfaceSpec, opts ApplyOptions) (Diff, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	var diff Diff
-	client, err := b.conn()
-	if err != nil {
+	b.driverUsed = false
+	if err := b.driver.Ready(); err != nil {
 		return diff, err
 	}
 
@@ -110,11 +139,19 @@ func (b *kernelBackend) Apply(specs []model.InterfaceSpec, opts ApplyOptions) (D
 	var failures []string
 	for _, spec := range specs {
 		managed[spec.Name] = true
-		if err := b.ensureOne(client, spec, opts, &diff); err != nil {
+		err := b.ensureOne(spec, opts, &diff)
+		// 内核在「创建接口」这一步才暴露「不支持」：此时就地回退并重试一次，
+		// 而不是把用户卡在一条他自己无法修复的错误上。
+		// 前提是本驱动还没接管过任何设备，否则会形成混合数据面（见 driverUsed）。
+		if err != nil && b.fallback != nil && !b.driverUsed && errors.Is(err, errBackendUnsupported) {
+			b.switchToFallback(err)
+			err = b.ensureOne(spec, opts, &diff)
+		}
+		if err != nil {
 			// 单条连接失败不阻断其余连接：否则系统里一个历史残留网卡
 			// （例如上一版卸载时没清干净的 wg0）就能让所有连接都无法下发。
 			failures = append(failures, fmt.Sprintf("%s：%v", spec.Name, err))
-			b.reset()
+			b.driver.Reset()
 			continue
 		}
 	}
@@ -142,7 +179,7 @@ func (b *kernelBackend) Apply(specs []model.InterfaceSpec, opts ApplyOptions) (D
 	return diff, nil
 }
 
-func (b *kernelBackend) ensureOne(client *wgctrl.Client, spec model.InterfaceSpec, opts ApplyOptions, diff *Diff) error {
+func (b *linuxBackend) ensureOne(spec model.InterfaceSpec, opts ApplyOptions, diff *Diff) error {
 	link, err := netlink.LinkByName(spec.Name)
 	if err != nil {
 		var notFound netlink.LinkNotFoundError
@@ -158,19 +195,46 @@ func (b *kernelBackend) ensureOne(client *wgctrl.Client, spec model.InterfaceSpe
 			"为安全起见本应用不会接管它（可能是系统功能或其他应用正在使用），请改用其他名称（例如 wg7）", spec.Name)
 	}
 
+	if link != nil {
+		// 当前驱动已经在本进程里接管过这张网卡 —— 有它在，就说明本驱动是可用的，
+		// 后续偶发失败不该触发回退（否则会把新连接甩到另一种实现上，形成混合数据面）。
+		if b.state.InterfaceBackend(spec.Name) == b.kind {
+			b.driverUsed = true
+		}
+		// 数据面实现变了（系统升级后内核模块可用、或反过来）：
+		// 旧网卡是另一种实现创建的，当前驱动既读不到配置也配不上去。
+		// 它是本应用自己的对象，删掉重建是唯一能让连接恢复工作的做法，且只影响自己。
+		if prev := b.state.InterfaceBackend(spec.Name); prev != "" && prev != b.kind {
+			diff.Append("重建 %s（数据面由%s切换为%s）", spec.Name, backendLabel(prev), backendLabel(b.kind))
+			if opts.DryRun {
+				return nil
+			}
+			b.clearPolicyRoutesLocked(spec.Name)
+			if err := b.driver.Delete(spec.Name); err != nil {
+				return fmt.Errorf("切换数据面时删除旧网卡 %s 失败: %w", spec.Name, err)
+			}
+			link = nil
+		}
+	}
+
 	if link == nil {
 		diff.Append("创建 WireGuard 接口 %s", spec.Name)
 		if opts.DryRun {
 			return nil
 		}
-		attrs := netlink.LinkAttrs{Name: spec.Name}
-		if spec.MTU > 0 {
-			attrs.MTU = spec.MTU
+		// 设备如何创建由驱动决定：内核模式走 rtnl 创建 wireguard 网卡，
+		// 兼容模式走 TUN + 用户态实现。创建失败时若为「本内核不支持」，
+		// 会以 errBackendUnsupported 上报，由 Apply 决定是否回退。
+		created, err := b.driver.Ensure(spec.Name, spec.MTU)
+		if err != nil {
+			return err
 		}
-		if err := netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: attrs}); err != nil {
-			return fmt.Errorf("创建接口失败: %w", err)
+		b.driverUsed = true
+		if created {
+			b.state.MarkManaged(spec.Name)
 		}
-		b.state.MarkManaged(spec.Name)
+		// 无论是否新建，都记下创建者：新建时是新记录，重建时覆盖旧实现。
+		b.state.SetInterfaceBackend(spec.Name, b.kind)
 		_ = b.state.Save()
 		link, err = netlink.LinkByName(spec.Name)
 		if err != nil {
@@ -191,12 +255,12 @@ func (b *kernelBackend) ensureOne(client *wgctrl.Client, spec model.InterfaceSpe
 	// 设备与节点配置：按增量下发（见 peerdiff.go）。
 	// 绝不再使用 ReplacePeers —— 内核收到它会执行 wg_peer_remove_all()，
 	// 清空重建全部节点，销毁会话密钥与动态学习到的 endpoint。
-	current, err := client.Device(spec.Name)
+	current, err := b.driver.Read(spec.Name)
 	if err != nil {
-		// 刚创建、或用户态后端读不到时，退化为「全部按新增处理」
+		// 刚创建、或后端暂时读不到时，退化为「全部按新增处理」
 		current = nil
 	}
-	if err := b.syncDevice(client, spec, current, opts, diff); err != nil {
+	if err := b.syncDevice(spec, current, opts, diff); err != nil {
 		return err
 	}
 
@@ -239,7 +303,7 @@ func (b *kernelBackend) ensureOne(client *wgctrl.Client, spec model.InterfaceSpe
 // 这是「隧道不抖动」的关键：没有变化的节点与字段完全不进入下发请求，
 // 内核因此不会重置它的会话密钥与动态学习到的 endpoint；
 // 全部一致时连一次 ConfigureDevice 都不会调用。
-func (b *kernelBackend) syncDevice(client *wgctrl.Client, spec model.InterfaceSpec,
+func (b *linuxBackend) syncDevice(spec model.InterfaceSpec,
 	current *wgtypes.Device, opts ApplyOptions, diff *Diff) error {
 
 	cfg := wgtypes.Config{}
@@ -306,8 +370,8 @@ func (b *kernelBackend) syncDevice(client *wgctrl.Client, spec model.InterfaceSp
 		diff.Append("（预演）%s 需要下发：%s", spec.Name, describeChanges(notes, added, updated, removed))
 		return nil
 	}
-	if err := client.ConfigureDevice(spec.Name, cfg); err != nil {
-		return fmt.Errorf("下发配置失败: %w", err)
+	if err := b.driver.Configure(spec.Name, cfg); err != nil {
+		return err
 	}
 	b.rememberPSKFingerprints(spec)
 	diff.Append("已同步 %s（共 %d 个节点：新增 %d、更新 %d、移除 %d%s）",
@@ -316,7 +380,7 @@ func (b *kernelBackend) syncDevice(client *wgctrl.Client, spec model.InterfaceSp
 }
 
 // peerWants 把期望态节点转成可比较形式，并带上解析后的对端地址。
-func (b *kernelBackend) peerWants(spec model.InterfaceSpec, diff *Diff) ([]PeerWant, error) {
+func (b *linuxBackend) peerWants(spec model.InterfaceSpec, diff *Diff) ([]PeerWant, error) {
 	out := make([]PeerWant, 0, len(spec.Peers))
 	for _, p := range spec.Peers {
 		if p.PublicKey == "" {
@@ -368,7 +432,7 @@ func peerHaves(dev *wgtypes.Device) []PeerHave {
 }
 
 // toPeerConfig 把一个变更转换为内核下发结构。
-func (b *kernelBackend) toPeerConfig(spec model.InterfaceSpec, c PeerDiff) (wgtypes.PeerConfig, error) {
+func (b *linuxBackend) toPeerConfig(spec model.InterfaceSpec, c PeerDiff) (wgtypes.PeerConfig, error) {
 	pk, err := wgtypes.ParseKey(c.PublicKey)
 	if err != nil {
 		return wgtypes.PeerConfig{}, fmt.Errorf("节点公钥非法: %w", err)
@@ -434,7 +498,7 @@ func parseIPNets(list []string) ([]net.IPNet, error) {
 // 内核不返回口令明文，只能靠本地指纹判断。两边都有口令且指纹一致时绝不重发，
 // 因为重新下发口令会让内核 wg_noise_expire_current_peer_keypairs()
 // 销毁该节点当前的会话密钥 —— 这正是早期版本「每轮重下发」造成掉线的另一个原因。
-func (b *kernelBackend) pskNeedsPush(spec model.InterfaceSpec) func(string) bool {
+func (b *linuxBackend) pskNeedsPush(spec model.InterfaceSpec) func(string) bool {
 	return func(publicKey string) bool {
 		raw := findPeerPSK(spec, publicKey)
 		if raw == "" {
@@ -445,7 +509,7 @@ func (b *kernelBackend) pskNeedsPush(spec model.InterfaceSpec) func(string) bool
 }
 
 // rememberPSKFingerprints 记录本次成功下发的口令指纹。
-func (b *kernelBackend) rememberPSKFingerprints(spec model.InterfaceSpec) {
+func (b *linuxBackend) rememberPSKFingerprints(spec model.InterfaceSpec) {
 	changed := false
 	for _, p := range spec.Peers {
 		raw := strings.TrimSpace(p.PresharedKey)
@@ -534,7 +598,7 @@ type endpointEntry struct {
 }
 
 // resolveEndpoint 解析对端地址（IP 或域名 + 端口），结果带缓存。
-func (b *kernelBackend) resolveEndpoint(raw string) (string, error) {
+func (b *linuxBackend) resolveEndpoint(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", nil
@@ -574,7 +638,7 @@ func parseAddrs(in []string) (want map[string]*net.IPNet, protected []*net.IPNet
 	return want, protected, nil
 }
 
-func (b *kernelBackend) syncAddrs(link netlink.Link, want map[string]*net.IPNet, opts ApplyOptions, diff *Diff) error {
+func (b *linuxBackend) syncAddrs(link netlink.Link, want map[string]*net.IPNet, opts ApplyOptions, diff *Diff) error {
 	current, err := netlink.AddrList(link, netlink.FAMILY_ALL)
 	if err != nil {
 		return err
@@ -622,7 +686,7 @@ func (b *kernelBackend) syncAddrs(link netlink.Link, want map[string]*net.IPNet,
 // 铁规则 2/3：绝不创建、修改或删除系统主路由表里的任何条目。
 // 需要下发时（异地组网场景）一律写进本应用专用策略表并用 ip rule 限定目标网段，
 // 详见 policyroute.go —— 系统主表在整个生命周期里零改动。
-func (b *kernelBackend) syncRoutes(link netlink.Link, spec model.InterfaceSpec, protected []*net.IPNet,
+func (b *linuxBackend) syncRoutes(link netlink.Link, spec model.InterfaceSpec, protected []*net.IPNet,
 	opts ApplyOptions, diff *Diff) {
 
 	idx := link.Attrs().Index
@@ -663,7 +727,7 @@ func (b *kernelBackend) syncRoutes(link netlink.Link, spec model.InterfaceSpec, 
 
 // applyPolicyRoutesLocked 让某条连接的策略路由与期望态一致：补齐缺失的、清除多余的。
 // 只处理状态文件里记录过的条目，绝不动别人的规则。
-func (b *kernelBackend) applyPolicyRoutesLocked(dev string, want []PolicyRoute, linkIndex int, diff *Diff) {
+func (b *linuxBackend) applyPolicyRoutesLocked(dev string, want []PolicyRoute, linkIndex int, diff *Diff) {
 	keep := make(map[string]bool, len(want))
 	for _, pr := range want {
 		keep[pr.CIDR] = true
@@ -701,7 +765,7 @@ func (b *kernelBackend) applyPolicyRoutesLocked(dev string, want []PolicyRoute, 
 //
 // 顺序很重要：没有规则指向该表时，表里的路由不会被任何流量查到。
 // 先补规则可以保证不会出现「路由已写但规则缺失」的中间态。
-func (b *kernelBackend) addPolicyRoute(pr PolicyRoute, linkIndex int) error {
+func (b *linuxBackend) addPolicyRoute(pr PolicyRoute, linkIndex int) error {
 	_, ipnet, err := net.ParseCIDR(pr.CIDR)
 	if err != nil {
 		return err
@@ -725,7 +789,7 @@ func (b *kernelBackend) addPolicyRoute(pr PolicyRoute, linkIndex int) error {
 }
 
 // ensurePolicyRule 确保存在「目标网段 → 专用表」的规则，已存在则跳过。
-func (b *kernelBackend) ensurePolicyRule(dst *net.IPNet, table, fam int) error {
+func (b *linuxBackend) ensurePolicyRule(dst *net.IPNet, table, fam int) error {
 	if rules, err := netlink.RuleList(fam); err == nil {
 		for i := range rules {
 			if rules[i].Table == table && sameNet(rules[i].Dst, dst) {
@@ -745,7 +809,7 @@ func (b *kernelBackend) ensurePolicyRule(dst *net.IPNet, table, fam int) error {
 }
 
 // removePolicyRoute 撤销一条策略路由：先摘规则，再删表内路由，最后同步状态记录。
-func (b *kernelBackend) removePolicyRoute(pr PolicyRoute) (string, error) {
+func (b *linuxBackend) removePolicyRoute(pr PolicyRoute) (string, error) {
 	_, ipnet, err := net.ParseCIDR(pr.CIDR)
 	if err != nil {
 		b.state.UnmarkPolicyRoute(pr.Dev, pr.CIDR)
@@ -766,7 +830,7 @@ func (b *kernelBackend) removePolicyRoute(pr PolicyRoute) (string, error) {
 }
 
 // removePolicyRule 按内核中的实际条目删除规则（先列举再删除，避免构造不匹配）。
-func (b *kernelBackend) removePolicyRule(dst *net.IPNet, table, fam int) error {
+func (b *linuxBackend) removePolicyRule(dst *net.IPNet, table, fam int) error {
 	rules, err := netlink.RuleList(fam)
 	if err != nil {
 		return err
@@ -785,7 +849,7 @@ func (b *kernelBackend) removePolicyRule(dst *net.IPNet, table, fam int) error {
 
 // clearPolicyRoutesLocked 撤销某条连接（name 为空表示全部）下发的策略路由与 ip rule。
 // 停用、删除连接、卸载以及接口已消失时都会调用，确保不留下影响系统的残留规则。
-func (b *kernelBackend) clearPolicyRoutesLocked(name string) []string {
+func (b *linuxBackend) clearPolicyRoutesLocked(name string) []string {
 	var actions []string
 	for _, pr := range b.state.PolicyRoutesCopy() {
 		if name != "" && pr.Dev != name {
@@ -820,7 +884,7 @@ func netlinkFamily(f int) int {
 }
 
 // hostRouteContext 收集主机上（排除本接口）的网段与既有路由。
-func (b *kernelBackend) hostRouteContext(excludeIdx int) ([]string, []HostRoute, error) {
+func (b *linuxBackend) hostRouteContext(excludeIdx int) ([]string, []HostRoute, error) {
 	nets := []string{}
 	links, err := netlink.LinkList()
 	if err != nil {
@@ -920,7 +984,7 @@ func familyOf(ip net.IP) int {
 }
 
 // captureBaselineLocked 记录系统默认路由基线（仅首次，避免被污染后的状态覆盖）。
-func (b *kernelBackend) captureBaselineLocked() {
+func (b *linuxBackend) captureBaselineLocked() {
 	if b.state.BaselineTaken {
 		return
 	}
@@ -949,14 +1013,14 @@ func (b *kernelBackend) captureBaselineLocked() {
 
 // Heal 清除指向本应用接口的异常默认路由，并在必要时恢复系统默认路由。
 // 这是「重装/升级也不会再把 NAS 网络弄坏」的关键保障。
-func (b *kernelBackend) Heal(ctx context.Context) ([]string, error) {
+func (b *linuxBackend) Heal(ctx context.Context) ([]string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.captureBaselineLocked()
 	return b.healLocked()
 }
 
-func (b *kernelBackend) healLocked() ([]string, error) {
+func (b *linuxBackend) healLocked() ([]string, error) {
 	var actions []string
 
 	managed := map[int]string{}
@@ -1007,7 +1071,7 @@ func (b *kernelBackend) healLocked() ([]string, error) {
 }
 
 // hasForeignDefault 判断系统是否还有一条由系统自己管理的默认路由。
-func (b *kernelBackend) hasForeignDefault(managed map[int]string) bool {
+func (b *linuxBackend) hasForeignDefault(managed map[int]string) bool {
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
 	if err != nil {
 		return true // 读不到时不做任何恢复动作
@@ -1024,7 +1088,7 @@ func (b *kernelBackend) hasForeignDefault(managed map[int]string) bool {
 }
 
 // restoreBaselineLocked 按基线恢复系统默认路由。
-func (b *kernelBackend) restoreBaselineLocked() []string {
+func (b *linuxBackend) restoreBaselineLocked() []string {
 	var actions []string
 	for _, br := range b.state.Baseline() {
 		if br.Gw == "" || br.Dev == "" {
@@ -1059,16 +1123,20 @@ func (b *kernelBackend) restoreBaselineLocked() []string {
 
 // foreignInterfacesLocked 列出内核里存在、但不属于本应用的 WireGuard 接口。
 // 只读，不做任何修改。
-func (b *kernelBackend) foreignInterfacesLocked(managed map[int]string) []model.ForeignInterface {
+func (b *linuxBackend) foreignInterfacesLocked(managed map[int]string) []model.ForeignInterface {
 	out := []model.ForeignInterface{}
+	// 兼容模式（用户态）的网卡与其它应用的 TUN 在 link 类型上无从区分，
+	// 此时放弃「识别他人残留」这项能力：宁可漏报，也不误删用户别的网卡。
+	if !b.driver.ForeignSupported() {
+		return out
+	}
 	links, err := netlink.LinkList()
 	if err != nil {
 		return out
 	}
-	client, cerr := b.conn()
 	for _, l := range links {
-		// 只看 WireGuard 类型的网卡，绝不把普通网卡当作疑似残留上报
-		if l.Type() != "wireguard" {
+		// 只看本模式能可靠识别的 WireGuard 网卡，绝不把普通网卡当作疑似残留上报
+		if !b.driver.Identify(l) {
 			continue
 		}
 		if _, ours := managed[l.Attrs().Index]; ours {
@@ -1089,11 +1157,9 @@ func (b *kernelBackend) foreignInterfacesLocked(managed map[int]string) []model.
 				}
 			}
 		}
-		if cerr == nil {
-			if dev, err := client.Device(name); err == nil {
-				fi.ListenPort = dev.ListenPort
-				fi.PeerCount = len(dev.Peers)
-			}
+		if dev, err := b.driver.Read(name); err == nil && dev != nil {
+			fi.ListenPort = dev.ListenPort
+			fi.PeerCount = len(dev.Peers)
 		}
 		out = append(out, fi)
 	}
@@ -1106,7 +1172,7 @@ func (b *kernelBackend) foreignInterfacesLocked(managed map[int]string) []model.
 //  1. 必须是 link 类型为 wireguard 的接口 —— 普通网卡、网桥、VLAN 一律拒绝；
 //  2. 已在受管列表里的接口必须走正常删除流程，这里直接拒绝，避免绕过状态记录；
 //  3. 调用方（界面）还要求用户输入接口名二次确认。
-func (b *kernelBackend) DeleteForeignInterface(name string) ([]string, error) {
+func (b *linuxBackend) DeleteForeignInterface(name string) ([]string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -1116,6 +1182,10 @@ func (b *kernelBackend) DeleteForeignInterface(name string) ([]string, error) {
 	}
 	if b.state.IsManaged(name) {
 		return nil, fmt.Errorf("%s 是本应用创建的连接，请到「我的连接」里删除它", name)
+	}
+	if !b.driver.ForeignSupported() {
+		return nil, errors.New("当前为兼容模式，系统里的 TUN 网卡无法与其它应用的网卡安全区分，" +
+			"为避免误删已停用该功能")
 	}
 	link, err := netlink.LinkByName(name)
 	if err != nil {
@@ -1142,31 +1212,23 @@ func (b *kernelBackend) DeleteForeignInterface(name string) ([]string, error) {
 }
 
 // DeleteInterface 删除接口。
-func (b *kernelBackend) DeleteInterface(name string) error {
+func (b *linuxBackend) DeleteInterface(name string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.deleteLocked(name)
 }
 
-func (b *kernelBackend) deleteLocked(name string) error {
+func (b *linuxBackend) deleteLocked(name string) error {
 	if !b.state.IsManaged(name) {
 		// 铁规则 1：不删除不是自己创建的接口。
 		return fmt.Errorf("接口 %s 不是本应用创建的，为避免影响系统功能已拒绝删除", name)
 	}
-	link, err := netlink.LinkByName(name)
-	if err != nil {
-		var notFound netlink.LinkNotFoundError
-		if errors.As(err, &notFound) {
-			b.state.UnmarkManaged(name)
-			_ = b.state.Save()
-			return nil
-		}
-		return err
-	}
 	// 先撤销该连接的策略路由与 ip rule，再删网卡：
 	// 网卡一删，它在专用表里的路由会随之消失，但 ip rule 会留下，必须自己清掉。
 	b.clearPolicyRoutesLocked(name)
-	if err := netlink.LinkDel(link); err != nil {
+	// 删除交给驱动：内核模式等价于删除网卡；兼容模式还要关闭进程内的用户态设备
+	// 并回收它的 TUN —— 只删网卡会在进程里留下仍持有套接字的僵尸设备。
+	if err := b.driver.Delete(name); err != nil {
 		return fmt.Errorf("删除接口 %s 失败: %w", name, err)
 	}
 	b.state.UnmarkManaged(name)
@@ -1176,7 +1238,7 @@ func (b *kernelBackend) deleteLocked(name string) error {
 }
 
 // Cleanup 删除本应用创建的全部接口与残留路由（用于「停用」与「卸载」）。
-func (b *kernelBackend) Cleanup(ctx context.Context) ([]string, error) {
+func (b *linuxBackend) Cleanup(ctx context.Context) ([]string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -1200,22 +1262,18 @@ func (b *kernelBackend) Cleanup(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return actions, err
 	}
-	b.reset()
+	b.driver.Reset()
 	return actions, nil
 }
 
 // Snapshot 采集实时状态。
-func (b *kernelBackend) Snapshot(names []string) ([]model.InterfaceStatus, error) {
+func (b *linuxBackend) Snapshot(names []string) ([]model.InterfaceStatus, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	client, err := b.conn()
+	devs, err := b.driver.List()
 	if err != nil {
-		return nil, err
-	}
-	devs, err := client.Devices()
-	if err != nil {
-		b.reset()
+		b.driver.Reset()
 		return nil, err
 	}
 	filter := map[string]bool{}
@@ -1275,7 +1333,7 @@ func (b *kernelBackend) Snapshot(names []string) ([]model.InterfaceStatus, error
 }
 
 // Inspect 供网络自检使用：返回本应用相关的事实，不做任何修改。
-func (b *kernelBackend) Inspect(ctx context.Context) (model.NetworkReport, error) {
+func (b *linuxBackend) Inspect(ctx context.Context) (model.NetworkReport, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -1313,5 +1371,3 @@ func (b *kernelBackend) Inspect(ctx context.Context) (model.NetworkReport, error
 	})
 	return rep, nil
 }
-
-var _ = strconv.Itoa

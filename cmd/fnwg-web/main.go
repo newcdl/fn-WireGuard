@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Command fnwg-web 是面向用户的服务进程：以普通用户运行，提供 Web 界面与 REST API。
 // 所有需要内核能力的操作都通过 Unix Domain Socket 委派给 fnwg-agent，
 // 从而把 root 权限收敛在一个不监听 TCP 的进程里。
@@ -100,7 +103,8 @@ func main() {
 	srv := api.NewServer(svc, logger, cfg.Version, cfg.ShareDir())
 
 	httpSrv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port),
+		Addr: fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port),
+		// 端口通道与网关通道共用同一份路由与同一套登录要求（见 api.Router）。
 		Handler:           srv.Router(assets),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -113,6 +117,29 @@ func main() {
 			stop()
 		}
 	}()
+
+	// 飞牛统一网关通道（飞牛桌面点图标走的就是这里）：由 fnOS 校验飞牛账号会话后
+	// 经 Unix Socket 转发过来，进入本应用仍需自己登录。
+	//
+	// 交给守护者而不是在这里一次性绑定：入口是一个文件，可能在运行期被外部删掉，
+	// 而启动时的自查不会再看第二眼 —— 那正是「进程一切正常、只有桌面图标 502」
+	// 这类故障能长期存在的原因。守护者会定期确认入口还在，不在就地重建。
+	if sockPath := cfg.AppSockPath(); sockPath != "" {
+		// 先记下落点：/auth/state 的 socket_ready 与自检页都从这里取路径，
+		// 而就绪与否一律由现场探测决定（文件可能在运行期消失）。
+		srv.SetGatewaySocket(sockPath)
+		keeper := srv.NewGatewayKeeper(sockPath, srv.Router(assets))
+		go func() {
+			if err := keeper.Run(ctx); err != nil {
+				logger.Error("飞牛统一网关入口守护异常退出", "err", err)
+			}
+		}()
+	} else {
+		// 正常启动路径不会走到这里：AppSockPath 会兜底到可执行文件所在目录。
+		srv.SetGatewaySocket("")
+		logger.Warn("无法定位应用目录，飞牛统一网关入口不可用：从飞牛桌面点图标将报 Bad Gateway",
+			"appdest", cfg.AppDest)
+	}
 
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -180,10 +207,23 @@ func ensureDevAdmin(ctx context.Context, st *store.Store, logger *slog.Logger) e
 	return nil
 }
 
+// newLogger 同时写 stderr（systemd 下即 journald）与 ${TRIM_PKGVAR}/log/web.log。
+//
+// 日志文件打不开时**必须留下痕迹**：以前这里是静默降级成"只写 stderr"，
+// 于是 web.log 停在某个时间点不再增长，而排障的人只会去读这个文件 ——
+// 「日志里什么都没有」被读成「程序什么都没发生」，方向被彻底带偏。
+// 现在降级依然允许（进程不能因为写不了日志就起不来），但降级本身要在 journal 里说清楚。
+//
+// 创建模式用 0660 而非 0640：安装脚本会对整个数据目录执行 chown -R root:fnwg，
+// 文件属主随之变成 root，只有「属组可写」才能让以 fnwg 运行的 Web 进程继续追加。
 func newLogger(cfg *config.Config) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	f, err := os.OpenFile(cfg.LogDir()+"/web.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
+	path := cfg.LogDir() + "/web.log"
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o660)
 	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"警告：无法写入日志文件 %s（%v）。本次运行的日志只在 journalctl 中可见，"+
+				"该文件将保持旧内容，请勿以它判断服务是否正常（journalctl -u fnwg-web）\n", path, err)
 		return slog.New(slog.NewTextHandler(os.Stderr, opts))
 	}
 	return slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, f), opts))

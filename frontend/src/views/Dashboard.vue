@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <template>
   <div>
     <!--
@@ -275,6 +278,7 @@ import ItemCard from '@/components/ItemCard.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { useSystemHealth } from '@/composables/useSystemHealth'
+import { useTheme } from '@/composables/useTheme'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes, formatRate, timeAgo } from '@/utils/format'
@@ -283,6 +287,7 @@ const router = useRouter()
 const realtime = useRealtime()
 const session = useSession()
 const { isMobile } = useBreakpoint()
+const { isDark } = useTheme()
 
 const overview = ref<Overview | null>(null)
 const helpVisible = ref(false)
@@ -336,20 +341,51 @@ async function load() {
   }
 }
 
+/**
+ * 取当前主题下的图表用色。
+ *
+ * ECharts 的默认配色是按浅色底定的（图例 #333、网格线 #E0E6F1），深色下网格线会亮得刺眼、
+ * 图例几乎看不见。这里从 Element Plus 的 CSS 变量现取，深浅两套自动跟随（见 useTheme）。
+ */
+function chartInk() {
+  const cs = getComputedStyle(document.documentElement)
+  const read = (name: string, fallback: string) => cs.getPropertyValue(name).trim() || fallback
+  return {
+    text: read('--el-text-color-regular', '#606266'),
+    dim: read('--el-text-color-secondary', '#909399'),
+    line: read('--el-border-color-lighter', '#ebeef5'),
+  }
+}
+
 function renderChart() {
   if (!chartEl.value) return
   if (!chart) chart = echarts.init(chartEl.value)
+  const ink = chartInk()
   chart.setOption({
     grid: { left: 46, right: 12, top: 28, bottom: 26 },
     tooltip: {
       trigger: 'axis',
       valueFormatter: (v: number) => formatRate(v),
     },
-    legend: { data: ['下载', '上传'], right: 0, top: 0, itemWidth: 12, itemHeight: 8 },
-    xAxis: { type: 'category', data: series.value.t, boundaryGap: false, axisLabel: { fontSize: 10 } },
+    legend: {
+      data: ['下载', '上传'],
+      right: 0,
+      top: 0,
+      itemWidth: 12,
+      itemHeight: 8,
+      textStyle: { color: ink.text },
+    },
+    xAxis: {
+      type: 'category',
+      data: series.value.t,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: ink.line } },
+      axisLabel: { fontSize: 10, color: ink.dim },
+    },
     yAxis: {
       type: 'value',
-      axisLabel: { formatter: (v: number) => formatBytes(v) + '/s', fontSize: 10 },
+      splitLine: { lineStyle: { color: ink.line } },
+      axisLabel: { formatter: (v: number) => formatBytes(v) + '/s', fontSize: 10, color: ink.dim },
     },
     series: [
       {
@@ -371,6 +407,10 @@ function renderChart() {
     ],
   })
 }
+
+// 切换外观后要重画一次：图表用色是渲染时从 CSS 变量取的，不重画就还留着旧主题的颜色。
+// 等一帧再画，确保 <html> 上的 class 与随之重算的变量都已经生效。
+watch(isDark, () => nextTick(renderChart))
 
 watch(liveRxRate, () => {
   series.value.t.push(new Date().toLocaleTimeString())

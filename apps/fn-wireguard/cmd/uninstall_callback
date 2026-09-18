@@ -1,5 +1,16 @@
 #!/bin/bash
-# 卸载回调：移除服务单元与系统集成。数据目录默认保留，重装后可无损恢复。
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
+
+# 卸载回调：移除服务单元与系统集成，并按用户在卸载向导里的选择处理数据。
+#
+# 数据处理只有两种结果，且必须与用户的选择一致：
+#   保留（默认）：只拆服务、内核痕迹与运行态文件；数据库、主密钥、备份原样留在 NAS 上，
+#                 重新安装后自动恢复。
+#   删除：连同数据目录一起清空，卸载后无法找回。
+#
+# 默认必须是「保留」：卸载向导在部分路径下不会出现（命令行卸载、升级回滚、卸载中途异常），
+# 那时拿不到用户的选择 —— 用户只是想让应用消失，并没有要求丢掉全部连接、设备与账号。
 set -e
 
 [ -n "$TRIM_TEMP_LOGFILE" ] || TRIM_TEMP_LOGFILE=/tmp/fn-wireguard-uninstall.log
@@ -13,6 +24,8 @@ if fnwg_have_systemd; then
     fnwg_systemd_remove
 fi
 rm -f "$TRIM_PKGVAR/agent.pid" "$TRIM_PKGVAR/web.pid" "$TRIM_PKGVAR/agent.sock"
+# 飞牛统一网关注册的 socket：留着会是一个连不上的残骸，一并清掉
+rm -f "$TRIM_APPDEST/app.sock" 2>/dev/null || true
 
 # 再次确认内核对象已清理（uninstall_init 已执行过一次；此处为兜底，且此时 target 可能已删除）
 if [ -x "$TRIM_APPDEST/fnwg-agent" ]; then
@@ -26,8 +39,16 @@ if command -v nft >/dev/null 2>&1; then
     nft delete table inet fn-wireguard >/dev/null 2>&1 || true
 fi
 
-if [ -d "$TRIM_PKGVAR" ]; then
-    fnwg_log "已保留数据目录 ${TRIM_PKGVAR}（数据库与备份），重新安装后自动恢复"
+# 数据：按用户在卸载向导里的选择处理（未弹出向导或取值无法识别时按保留处理）
+if fnwg_uninstall_wants_purge; then
+    fnwg_log "按你的选择删除全部数据（连接、设备、账号、主密钥与历史备份）"
+    if fnwg_purge_user_data; then
+        fnwg_log "数据已清空，卸载后无法找回"
+    else
+        fnwg_log "提示：部分数据目录未能删除，请检查上面列出的路径"
+    fi
+else
+    fnwg_log "已保留数据目录 ${TRIM_PKGVAR}（连接、设备、账号与备份），重新安装后自动恢复"
 fi
 
 fnwg_log "卸载完成"

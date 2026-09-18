@@ -1,10 +1,15 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 # fn-WireGuard 生命周期脚本公共函数库，由 install_init / install_callback / main 等脚本 source。
 #
 # 运行模式：优先使用 systemd（可自动重启、随系统启动）；当 /etc/systemd/system 不可写
 # 或系统未使用 systemd 时，自动回退为 PID 文件方式管理进程，保证在任何 fnOS 环境下都能安装。
 
 FNWG_GROUP="fnwg"
+# 应用名：只用于卸载时的路径归属校验（见 fnwg_purge_user_data），必须与 manifest 的 appname 一致。
+FNWG_APPNAME="fn-wireguard"
 FNWG_UNIT_AGENT="fnwg-agent.service"
 FNWG_UNIT_WEB="fnwg-web.service"
 FNWG_UNIT_DIR="/etc/systemd/system"
@@ -63,6 +68,127 @@ fnwg_prepare_dirs() {
     chmod 770 "$TRIM_PKGVAR/log" "$TRIM_PKGVAR/share" "$TRIM_PKGVAR/backup" 2>/dev/null || true
     # setgid 保证新建文件继承 fnwg 属组，两个进程才能共享数据库
     chmod g+s "$TRIM_PKGVAR" "$TRIM_PKGETC" 2>/dev/null || true
+
+    fnwg_prepare_gateway_socket
+}
+
+# fnwg_appdest：解析应用运行目录（= TRIM_APPDEST，网关 socket 的落点）。
+#
+# 单独抽出来的理由：这个路径被三处用到 —— socket 落点授权、systemd 单元的
+# ExecStart/ExecStartPre、PID 模式的命令行。任何一处算错，外表现都是同一件事：
+# 网关 socket 建不出来，从飞牛桌面打开本应用只有 502，而日志里几乎没有线索。
+fnwg_appdest() {
+    if [ -n "${TRIM_APPDEST:-}" ] && [ -d "$TRIM_APPDEST" ]; then
+        printf '%s\n' "$TRIM_APPDEST"
+        return 0
+    fi
+    # TRIM_APPDEST 只活在「飞牛调用脚本」的那个环境里，手工执行或某些升级路径下
+    # 可能是空的，此时从脚本自身位置反推。
+    #
+    # 包内布局：<pkgroot>/cmd/common 是脚本，<pkgroot>/fnwg-web 等是载荷 ——
+    # 也就是说**载荷与 cmd 同级**（app.tgz 直接解在包根），实际印证来自运行时日志：
+    # 「网关入口已就绪 socket=/vol1/@appcenter/fn-wireguard/app.sock」，
+    # 落点就是包根，而不是包根下某个子目录。所以兜底必须取 cmd 的上一级。
+    local root
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" || root=""
+    if [ -n "$root" ] && [ -x "$root/fnwg-web" ]; then
+        printf '%s\n' "$root"
+        return 0
+    fi
+    # 源码/暂存目录里试跑（载荷还躺在 app/ 下）时的兜底，只为脚本能在本机跑通。
+    if [ -n "$root" ] && [ -d "$root/app" ]; then
+        printf '%s\n' "$root/app"
+        return 0
+    fi
+    return 1
+}
+
+# fnwg_socket_grant_cmd <目录>：输出「让 fnwg 属组能在该目录里创建 socket」的命令串。
+#
+# 只有这一份实现：安装/升级脚本与 systemd 的 ExecStartPre 都从这里取，
+# 免得两处各自演化。之所以在意这件事 —— 两处一旦不一致，症状恰好是最难查的那种：
+# 脚本里执行时是对的、开机或自动重启后是错的（或反过来），
+# 而用户看到的只有「从飞牛桌面打开是 502」。
+#
+# 为什么加 sticky 位：目录可写意味着可以**增删改名**其中的文件，
+# 而应用目录里放着 fnwg-web / fnwg-agent 这些可执行文件（agent 还是 root 身份运行）。
+# sticky 位让 fnwg 只能创建/删除自己的 socket，动不了 root 拥有的二进制 ——
+# 少这一位，一个被攻陷的 Web 进程就能替换掉下次以 root 启动的 agent。
+#
+# 为什么必须带 setfacl：飞牛会给应用目录挂一条 user:<应用名>:rwx 的具名 ACL
+# 条目，而目录一旦存在具名条目，chmod g+w 修改的就是 mask 位、不是 group:: 实体位。
+# 于是 `ls -l` 里那串 "rwx" 其实是 mask，组权限仍是 r-x —— 外表完全正常，
+# fnwg 属组却照旧建不出 socket（bind: permission denied），每次重启都一样。
+# 必须用 setfacl 显式放开具名条目、组实体位和 mask，让真实权限与显示一致。
+#
+# chmod 与 chmod +t 分开写：合起来的 `chmod g+w,+t` 没有 who 前缀，
+# 语义受 umask 影响、各实现不统一，拆成两条各自明确的写法更稳。
+#
+# ⚠️ 本函数**只做授权，绝不删除 app.sock**。这一条是被真机故障教出来的，必须写清楚：
+# 早先这里末尾还跟着一句 `rm -f app.sock`，而它的上游是 fnwg_prepare_dirs ——
+# 也就是「应用中心点启动」走到 cmd/main start 的第一步。于是当应用**已经在运行**时再点启动：
+#   删掉 socket → `systemctl start fnwg-web`（对已运行的单元是空操作，不跑 ExecStartPre、
+#   也不重启进程）→ `fnwg_wait_health` 只查端口、通过 → 报告启动成功。
+# 结果：进程活得好好的、端口一切正常、socket 却没了，从飞牛桌面点图标只能 502，
+# 而日志里只有一次启动记录、状态全「正常」—— 502 的全部线索就是一个不存在的文件。
+#
+# 残留 socket 的清理不该在授权路径上做，也不需要：Web 进程自己在 bind 之前会先 unlink
+# （见 internal/api/listener.go 的 ListenGateway），那是唯一确知「我马上要 bind」的地方。
+# 确实需要提前清理时用下面的 prestart 版本，且只能用在紧接着就会启动进程的地方。
+fnwg_socket_grant_cmd() {
+    local d="$1"
+    [ -n "$d" ] || return 1
+    printf '%s' "chgrp ${FNWG_GROUP} \"${d}\" 2>/dev/null; chmod g+w \"${d}\" 2>/dev/null; if command -v setfacl >/dev/null 2>&1; then setfacl -m u:${FNWG_GROUP}:rwx \"${d}\" 2>/dev/null; setfacl -m g:${FNWG_GROUP}:rwx \"${d}\" 2>/dev/null; setfacl -m m::rwx \"${d}\" 2>/dev/null; fi; chmod +t \"${d}\" 2>/dev/null"
+}
+
+# fnwg_socket_prestart_cmd <目录>：授权 + 清掉上一次留下的 socket。
+#
+# **只允许用在「马上就要拉起 Web 进程」的地方**（systemd 单元的 ExecStartPre）：
+# 那里旧进程已经退出，删文件是安全的，紧接着就会被 bind 重建；
+# 顺带解决「上次被 kill -9、socket 文件残留导致 bind: address already in use」。
+# 任何**不伴随启动**的调用都会造出一个没有人监听的入口空洞，别处不要用。
+fnwg_socket_prestart_cmd() {
+    local d="$1"
+    [ -n "$d" ] || return 1
+    printf '%s; rm -f "%s/app.sock"' "$(fnwg_socket_grant_cmd "$d")" "$d"
+}
+
+# fnwg_grant_socket_dir <目录>：立刻执行一次授权（安装/升级脚本里用）。
+#
+# 只授权、不删 socket：这条路径可能在应用运行期间被调到（cmd/main start 就是）。
+fnwg_grant_socket_dir() {
+    local d="${1:-}"
+    [ -n "$d" ] && [ -d "$d" ] || return 1
+    sh -c "$(fnwg_socket_grant_cmd "$d")" >/dev/null 2>&1 || true
+    return 0
+}
+
+# fnwg_prepare_gateway_socket：为飞牛统一网关准备 socket 落点。
+#
+# 官方要求 gatewaySocket 只是文件名、且必须落在应用运行目录（= TRIM_APPDEST，即包根），
+# 因此 socket 只能建在那里；而 Web 进程以 fnwg 用户运行，该目录默认属于 root，
+# 必须让它同组可写，否则 Web 进程连 socket 都建不出来（表现为「网关入口不可用」）。
+fnwg_prepare_gateway_socket() {
+    local dir
+    if ! dir="$(fnwg_appdest)"; then
+        # 不静默放过：算不出落点时授权一定没有生效，网关入口必然建不起来。
+        # 在这里说清楚，比让用户对着 502 猜要强。
+        fnwg_log "警告：无法确定应用运行目录（TRIM_APPDEST 为空且从脚本位置反推不到载荷目录），跳过网关 socket 授权"
+        return 0
+    fi
+    fnwg_grant_socket_dir "$dir" || return 0
+    return 0
+}
+
+# fnwg_gateway_socket_ready：统一网关入口的 socket 文件是否在。
+#
+# 这是没有 curl 时的退化判定，只看「文件存在且是 socket」这一条事实：
+# 它回答不了「进程还在不在听」（socket 文件可能在进程退出后残留）。
+# 有 curl 时一律以 Web 进程自报的 /auth/state socket_ready 为准。
+fnwg_gateway_socket_ready() {
+    local dir
+    dir="$(fnwg_appdest)" || return 1
+    [ -S "$dir/app.sock" ]
 }
 
 # fnwg_fix_db_perms：修正数据库与主密钥属组，确保 Web 进程可读写。
@@ -79,13 +205,42 @@ fnwg_fix_db_perms() {
     fi
 }
 
+# fnwg_fix_log_perms：修正日志目录与日志文件的属组/权限。
+#
+# 为什么必须单独修：web.log 由 Web 进程以 0640 创建（属主=fnwg，属组只有读权限）。
+# 而安装/升级会对整个数据目录执行 chown -R root:fnwg，属主一旦变成 root，
+# 以 fnwg 身份运行的进程就再也追加不进去 —— 写日志失败后它只往 stderr 留痕，
+# 结果 journalctl 里一切正常、web.log 却永远停在旧内容上。用户读到的正是这份
+# 旧日志，「升级了却毫无变化」于是被反复"确认"，而真实日志其实一直躺在 journal 里。
+fnwg_fix_log_perms() {
+    local dir="$TRIM_PKGVAR/log" f
+    [ -d "$dir" ] || return 0
+    chgrp "$FNWG_GROUP" "$dir" 2>/dev/null || true
+    chmod 770 "$dir" 2>/dev/null || true
+    for f in "$dir"/*.log; do
+        [ -e "$f" ] || continue
+        chgrp "$FNWG_GROUP" "$f" 2>/dev/null || true
+        chmod 660 "$f" 2>/dev/null || true
+    done
+}
+
+# fnwg_fix_runtime_perms：运行期文件权限自愈（数据库 + 日志）。
+# 安装、升级、启动都应走这一条：权限被打回 root 的时机不止一处，
+#「谁在启动前把权限摆正」应该只有这一个答案。
+fnwg_fix_runtime_perms() {
+    fnwg_fix_db_perms
+    fnwg_fix_log_perms
+}
+
 fnwg_service_port() {
     echo "${TRIM_SERVICE_PORT:-34567}"
 }
 
 # ---------------------------------------------------------------- systemd 模式
 
+# fnwg_write_agent_unit <appdest>
 fnwg_write_agent_unit() {
+    local appdest="$1"
     cat > "${FNWG_UNIT_DIR}/${FNWG_UNIT_AGENT}" <<EOF
 [Unit]
 Description=fn-WireGuard privileged agent (netlink reconcile)
@@ -97,7 +252,7 @@ Before=fnwg-web.service
 Type=simple
 User=root
 Group=root
-ExecStart=${TRIM_APPDEST}/fnwg-agent --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock --group ${FNWG_GROUP}
+ExecStart=${appdest}/fnwg-agent --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock --group ${FNWG_GROUP}
 Restart=always
 RestartSec=3
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE
@@ -114,7 +269,16 @@ EOF
     chmod 644 "${FNWG_UNIT_DIR}/${FNWG_UNIT_AGENT}"
 }
 
+# fnwg_write_web_unit <appdest>
 fnwg_write_web_unit() {
+    # appdest 以**实参**传入而不是直接引用 $TRIM_APPDEST：systemd 只继承 ExecStart
+    # 里写死的东西，安装脚本的 TRIM_APPDEST 到不了服务进程里；而一旦它在写单元
+    # 那一刻是空的，单元里就会留下 `/fnwg-web` 这种指向根目录的路径，
+    # 结果是应用整个起不来，且报错离真正的原因（这里）很远。
+    # 由调用方先 fnwg_appdest 解析成绝对路径再传进来，这个坑就不存在了。
+    # --appdest 也必须显式传给 Web 进程：少了它，Web 进程会退化成「相对当前工作目录」
+    # 去找网关 socket（systemd 下即 /），建不出来就等于统一网关入口整个不可用。
+    local appdest="$1"
     cat > "${FNWG_UNIT_DIR}/${FNWG_UNIT_WEB}" <<EOF
 [Unit]
 Description=fn-WireGuard web console (unprivileged)
@@ -126,13 +290,24 @@ PartOf=fnwg-agent.service
 Type=simple
 User=${FNWG_GROUP}
 Group=${FNWG_GROUP}
-ExecStart=${TRIM_APPDEST}/fnwg-web --bind 0.0.0.0 --port $(fnwg_service_port) --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock
+# ExecStartPre 前缀 + 表示「在沙箱外以完整权限执行」。每次拉起 Web 进程都先把
+# socket 落点调成同组可写，而不是只依赖安装脚本那一次 —— 因为飞牛的重新部署会
+# 重建 target 目录并把权限恢复成 root:root 755，之后 Restart=always 的自动重启
+# 不会再去走安装脚本，结果就是 Web 进程突然建不出 socket（网关入口整个不可用），
+# 而飞牛桌面只会显示 502，日志里也仅有一行容易被忽略的警告。
+#
+# 这里用的是 prestart 版本（授权 + 清掉残留 socket）：ExecStartPre 是**唯一**能在
+# 删除 socket 之后保证紧接着就 bind 的地方 —— 删与建在同一个启动动作里，中间没有空档。
+# 授权路径用的 grant 版本不删任何东西，因为那条路可能在应用运行期间被调到
+# （应用已在运行时点「启动」就是），删了就再也没人重建它。
+ExecStartPre=+/bin/sh -c '$(fnwg_socket_prestart_cmd "$appdest")'
+ExecStart=${appdest}/fnwg-web --bind 0.0.0.0 --port $(fnwg_service_port) --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock --appdest ${appdest}
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=${TRIM_PKGVAR} ${TRIM_PKGETC} ${TRIM_PKGHOME}
+ReadWritePaths=${TRIM_PKGVAR} ${TRIM_PKGETC} ${TRIM_PKGHOME} ${appdest}
 LimitNOFILE=65536
 SyslogIdentifier=fnwg-web
 
@@ -143,8 +318,13 @@ EOF
 }
 
 fnwg_systemd_install() {
-    fnwg_write_agent_unit || return 1
-    fnwg_write_web_unit || return 1
+    local appdest
+    if ! appdest="$(fnwg_appdest)"; then
+        fnwg_log "错误：无法确定应用运行目录，拒绝写入指向空路径的 systemd 单元"
+        return 1
+    fi
+    fnwg_write_agent_unit "$appdest" || return 1
+    fnwg_write_web_unit "$appdest" || return 1
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "$FNWG_UNIT_AGENT" >/dev/null 2>&1
     systemctl enable "$FNWG_UNIT_WEB" >/dev/null 2>&1
@@ -188,27 +368,64 @@ fnwg_pid_alive() {
 }
 
 fnwg_pidfile_start() {
-    local logdir="$TRIM_PKGVAR/log"
+    local logdir="$TRIM_PKGVAR/log" appdest
     mkdir -p "$logdir"
+    if ! appdest="$(fnwg_appdest)"; then
+        fnwg_log "错误：无法确定应用运行目录，PID 模式下无法启动"
+        return 1
+    fi
 
     if ! fnwg_pid_alive "$TRIM_PKGVAR/agent.pid"; then
-        nohup "$TRIM_APPDEST/fnwg-agent" \
+        nohup "$appdest/fnwg-agent" \
             --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" \
             --socket "$TRIM_PKGVAR/agent.sock" --group "$FNWG_GROUP" \
             >>"$logdir/agent.log" 2>&1 &
         echo $! > "$TRIM_PKGVAR/agent.pid"
     fi
     sleep 1
-    fnwg_fix_db_perms
+    fnwg_fix_runtime_perms
 
     if ! fnwg_pid_alive "$TRIM_PKGVAR/web.pid"; then
-        nohup fnwg_run_as_user "$TRIM_APPDEST/fnwg-web" \
+        nohup fnwg_run_as_user "$appdest/fnwg-web" \
             --bind 0.0.0.0 --port "$(fnwg_service_port)" \
             --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" \
-            --socket "$TRIM_PKGVAR/agent.sock" \
+            --socket "$TRIM_PKGVAR/agent.sock" --appdest "$appdest" \
             >>"$logdir/web.log" 2>&1 &
         echo $! > "$TRIM_PKGVAR/web.pid"
     fi
+    sleep 1
+    return 0
+}
+
+# fnwg_restart_web：只重启 Web 进程，用于健康检查失败后的自动修复。
+# 不动 agent：内核状态与它无关，重启它反而要多一次网卡重放。
+fnwg_restart_web() {
+    case "$(fnwg_mode)" in
+    systemd)
+        systemctl restart "$FNWG_UNIT_WEB" >/dev/null 2>&1 || true
+        ;;
+    *)
+        local file="$TRIM_PKGVAR/web.pid" pid appdest
+        pid="$(head -n 1 "$file" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null
+            local i=0
+            while kill -0 "$pid" 2>/dev/null && [ $i -lt 10 ]; do
+                sleep 1
+                i=$((i + 1))
+            done
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+        fi
+        rm -f "$file"
+        appdest="$(fnwg_appdest)" || return 1
+        nohup fnwg_run_as_user "$appdest/fnwg-web" \
+            --bind 0.0.0.0 --port "$(fnwg_service_port)" \
+            --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" \
+            --socket "$TRIM_PKGVAR/agent.sock" --appdest "$appdest" \
+            >>"$TRIM_PKGVAR/log/web.log" 2>&1 &
+        echo $! > "$file"
+        ;;
+    esac
     sleep 1
     return 0
 }
@@ -247,7 +464,7 @@ fnwg_start() {
     systemd)
         fnwg_systemd_install || return 1
         systemctl start "$FNWG_UNIT_AGENT" || return 1
-        fnwg_fix_db_perms
+        fnwg_fix_runtime_perms
         systemctl start "$FNWG_UNIT_WEB" || return 1
         ;;
     *)
@@ -262,14 +479,16 @@ fnwg_start() {
 # 停用与卸载都会调用它，保证应用不在运行时不给 NAS 留下任何网络痕迹。
 fnwg_cleanup_kernel() {
     mkdir -p "$TRIM_PKGVAR/log"
-    if [ -x "$TRIM_APPDEST/fnwg-agent" ]; then
-        "$TRIM_APPDEST/fnwg-agent" --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" --cleanup \
+    local appdest
+    appdest="$(fnwg_appdest)" || return 0
+    if [ -x "$appdest/fnwg-agent" ]; then
+        "$appdest/fnwg-agent" --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" --cleanup \
             >>"$TRIM_PKGVAR/log/cleanup.log" 2>&1 \
             || fnwg_log "提示：内核对象清理未完全成功，可稍后执行 fnwg-cli cleanup"
         return 0
     fi
-    if [ -x "$TRIM_APPDEST/fnwg-cli" ]; then
-        "$TRIM_APPDEST/fnwg-cli" cleanup --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" \
+    if [ -x "$appdest/fnwg-cli" ]; then
+        "$appdest/fnwg-cli" cleanup --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" \
             >>"$TRIM_PKGVAR/log/cleanup.log" 2>&1 || true
     fi
     return 0
@@ -303,19 +522,186 @@ fnwg_status() {
 }
 
 # fnwg_wait_health <秒>：等待 Web 端口就绪，用于安装回调的失败快速反馈。
+#
+# 只看端口是**有意**的：这里回答的是「本应用的控制台能不能打开」。
+# 统一网关入口（socket）另有一条更严格的检查 fnwg_gateway_check，
+# 两者分开是因为它们的后果不同 —— 端口不通是「彻底打不开」，
+# 网关入口不通是「飞牛桌面里打开是 502、但端口还能进」。混在一起判，
+# 轻则误报失败，重则像以前那样：socket 没建起来却算安装成功，
+# 用户直到点桌面图标才发现，而升级/安装日志里一个字都没提。
 fnwg_wait_health() {
     local timeout="${1:-15}" port i=0
     port="$(fnwg_service_port)"
+    command -v curl >/dev/null 2>&1 || return 0
     while [ $i -lt "$timeout" ]; do
-        if command -v curl >/dev/null 2>&1; then
-            if curl -sf -m 2 "http://127.0.0.1:${port}/api/v1/auth/state" >/dev/null 2>&1; then
-                return 0
-            fi
-        else
+        if curl -sf -m 2 "http://127.0.0.1:${port}/api/v1/auth/state" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
         i=$((i + 1))
     done
     return 1
+}
+
+# fnwg_gateway_check <秒>：等待统一网关入口（应用目录下的 app.sock）建立起来。
+#
+# 飞牛桌面走的正是这条通道，它没建起来就一定是 502。
+# 单独等一会儿是有必要的：socket 由 Web 进程启动后创建，可能比端口监听稍晚。
+#
+# 判定优先走 Web 进程的自报（/auth/state 里的 socket_ready）：
+# 那是进程自己「有没有监听到」的答案，比看 socket 文件可靠 ——
+# 进程已经退出、socket 文件却还留在目录里时，看文件会误判成已就绪。
+fnwg_gateway_check() {
+    local timeout="${1:-10}" i=0 port
+    if ! command -v curl >/dev/null 2>&1; then
+        while [ $i -lt "$timeout" ]; do
+            fnwg_gateway_socket_ready && return 0
+            sleep 1
+            i=$((i + 1))
+        done
+        return 1
+    fi
+    port="$(fnwg_service_port)"
+    while [ $i -lt "$timeout" ]; do
+        if curl -sf -m 2 "http://127.0.0.1:${port}/api/v1/auth/state" 2>/dev/null \
+            | grep -q '"socket_ready":true'; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# fnwg_ensure_gateway_ready <秒>：安装/升级收尾用 —— 端口与网关入口都要就绪，
+# 网关入口缺失时先自动修一次（重新授权 + 重启 Web）再判失败。
+#
+# 为什么值得这一步：飞牛的重新部署（升级）会重建应用目录，把属组与 ACL 打回
+# root:root。若这恰好发生在 Web 启动之后，socket 就一直建不出来，而 Restart=always
+# 的自动重启不会再走安装脚本 —— 于是升级「成功」，用户打开桌面图标只有 502。
+# 重试一次的成本极低，而失败代价是用户完全无从下手。
+fnwg_ensure_gateway_ready() {
+    local timeout="${1:-20}"
+    if ! fnwg_wait_health "$timeout"; then
+        return 1
+    fi
+    fnwg_gateway_check "$timeout" && return 0
+    fnwg_log "网关入口未就绪，重新授权 socket 落点并重启 Web 后重试"
+    fnwg_prepare_gateway_socket
+    fnwg_restart_web
+    fnwg_gateway_check "$timeout"
+}
+
+# fnwg_payload_version <应用目录>：载荷目录里记录的版本 —— 构建脚本写进 BUILDINFO 的值。
+fnwg_payload_version() {
+    local dir="${1:-}"
+    [ -n "$dir" ] && [ -f "$dir/BUILDINFO" ] || return 1
+    sed -n 's/^version=//p' "$dir/BUILDINFO" | head -n 1
+}
+
+# fnwg_running_version：正在运行的服务**自己报告**的版本（免登录接口 /auth/state）。
+fnwg_running_version() {
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -sf -m 3 "http://127.0.0.1:$(fnwg_service_port)/api/v1/auth/state" 2>/dev/null \
+        | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# fnwg_verify_running_version <应用目录> [期望版本]：确认设备上真正在跑的就是这次要装的版本。
+#
+# 为什么值得单独查一遍：升级时应用文件由平台负责替换，一旦替换没生效、或旧进程
+# 没被换掉，升级会「成功」而设备上仍在跑旧版本 —— 用户看到的现象是
+# 「明明升级了，问题一点没变」，而安装日志里对此一个字都没有，是最难查的一类。
+#
+# 期望版本优先取调用方传进来的 $TRIM_APPVER，而不是载荷里的 BUILDINFO：
+# 若载荷本身没被替换，BUILDINFO 会跟着一起是旧的，拿它比对等于**永远通过** ——
+# 那正是这个校验要抓的场景。TRIM_APPVER 由平台给出「这次装的是哪个版本」，
+# 与载荷是否真的落盘无关，才能照出差异。
+# 版本号是构建时从 manifest 编译进二进制的（见 scripts/build.sh 的 ldflags），
+# 因此运行侧读到的一定是「正在跑的那个」，不存在读旧文件的问题。
+#
+# 只在**两边都读得到且确实不同**时才算失败：读不到（缺 TRIM_APPVER 与 BUILDINFO、
+# 没有 curl 等）只记一条提示，避免把一次正常的安装误判成失败。
+fnwg_verify_running_version() {
+    local dir="${1:-}" expect="${2:-}" want got
+    want="$expect"
+    [ -n "$want" ] || want="$(fnwg_payload_version "$dir" || true)"
+    got="$(fnwg_running_version || true)"
+    if [ -z "$want" ] || [ -z "$got" ]; then
+        fnwg_log "提示：无法比对版本（期望=${want:-未知} 运行=${got:-未知}），跳过校验"
+        return 0
+    fi
+    if [ "$want" != "$got" ]; then
+        fnwg_log "错误：本次安装的版本是 ${want}，但设备上实际运行的是 ${got}"
+        return 1
+    fi
+    fnwg_log "版本校验通过：设备上正在运行 ${got}"
+    return 0
+}
+
+# ---------------------------------------------------------------- 卸载：数据处理
+
+# fnwg_uninstall_wants_purge：用户在卸载向导里是否选择了「删除全部数据」。
+#
+# 判定原则是「只有明确说要删才删」：变量缺失、取值看不懂、向导压根没弹出（命令行卸载、
+# 升级回滚、卸载中途异常）—— 一律按「保留」处理。拿不准时必须保住用户数据，
+# 那些连接、设备与账号是他唯一的一份，删掉就再也找不回来；而多留一份数据几乎没有代价，
+# 重装即可恢复。反过来（拿不准就删）造成的损失是不可逆的。
+fnwg_uninstall_wants_purge() {
+    local mode="${wizard_uninstall_mode:-}"
+    mode="$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$mode" in
+        purge | delete | remove | uninstall | 1 | true | yes) return 0 ;;
+        # 兜底：万一平台把选项的 label 而不是 value 传了过来（下拉项文案里「删除」只出现在
+        # 删除那一项，「保留数据」一项不含该词），也能正确识别。
+        *删除* | *清空*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# fnwg_purge_user_data：删除本应用的全部用户数据目录。
+#
+# 这是整个应用里唯一一处 rm -rf，删的又是用户唯一一份数据，因此防呆按最高等级写：
+# 逐个目录先过「绝对路径、不含上跳、末段确实是本应用名、不是符号链接」四道检查，
+# 任何一道不过就跳过并如实报告，绝不用「差不多就删」的方式处理。
+# 这一层挡的是真实发生过的失效形态：变量为空（变成 rm -rf 空参数）、
+# 变量被写成 / 或 /vol1（变成删系统或删整个存储卷），两者在别处都是灾难。
+#
+# 返回值：全部存在的目标目录都删成功才返回 0。
+fnwg_purge_user_data() {
+    local dir failed=0
+    for dir in "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGHOME"; do
+        [ -n "$dir" ] || continue
+        case "$dir" in
+            /*) ;;
+            *)
+                fnwg_log "跳过非绝对路径：${dir}"
+                continue
+                ;;
+        esac
+        case "$dir" in
+            / | *..*)
+                fnwg_log "跳过含上跳或根路径的写法：${dir}"
+                continue
+                ;;
+        esac
+        case "$dir" in
+            */"$FNWG_APPNAME") ;;
+            *)
+                fnwg_log "跳过不属于本应用的路径：${dir}"
+                continue
+                ;;
+        esac
+        if [ -L "$dir" ]; then
+            fnwg_log "跳过符号链接：${dir}"
+            continue
+        fi
+        [ -d "$dir" ] || continue
+        fnwg_log "删除 ${dir}"
+        rm -rf -- "$dir" 2>/dev/null || true
+        if [ -e "$dir" ]; then
+            fnwg_log "删除失败：${dir}"
+            failed=1
+        fi
+    done
+    return "$failed"
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Package agentapi 定义无特权 Web 进程与特权代理之间的通信协议。
 //
 // 通信载体为 Unix Domain Socket 上的「一行一个 JSON」请求/响应，

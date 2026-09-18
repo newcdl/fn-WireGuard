@@ -1,10 +1,34 @@
 <!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <title>WireGuard 管理工具 · 飞牛 NAS</title>
+    <script>
+      // 在样式生效前就把用户选定的外观贴到 <html> 上。
+      //
+      // 逻辑与 composables/useTheme.ts 一致，但必须内联、必须在挂载之前：
+      // 主模块是异步加载的，等它跑起来时首帧已经按浅色画完了，深色偏好的用户
+      // 每次打开都会看到一次白闪（在飞牛桌面里点图标进来的那一下尤其明显）。
+      // 这里只做这一件事，出错也不影响后续 —— 模块加载后 useTheme 会再校正一次。
+      ;(function () {
+        try {
+          var saved = localStorage.getItem('fnwg-theme')
+          var dark =
+            saved === 'dark' ||
+            ((saved === 'system' || !saved) &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) document.documentElement.classList.add('dark')
+          document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+        } catch (e) {
+          /* localStorage 不可用时按浅色首帧渲染，随后由 useTheme 校正 */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

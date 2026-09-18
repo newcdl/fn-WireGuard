@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <template>
   <div>
     <el-tabs v-model="tab">
@@ -153,8 +156,29 @@
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
           <template #title>
             管理谁能登录这个界面。可以给家人或同事开通「只读」查看权限，避免误改配置。
+            二次验证可由本人在右上角开启，也可由管理员在这里代为开启。
           </template>
         </el-alert>
+
+        <!-- 应急安全码：不是账号，是实例级的最后入口，因此单独一张卡说明 -->
+        <div class="fnwg-card" style="margin-bottom: 12px">
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+            <div style="flex: 1; min-width: 240px">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px">
+                <strong>应急安全码</strong>
+                <el-tag size="small" :type="securityCodeConfigured ? 'success' : 'danger'" effect="plain">
+                  {{ securityCodeConfigured ? '已设置' : '未设置' }}
+                </el-tag>
+              </div>
+              <div class="fnwg-hint">
+                当管理员忘记密码、手机丢失且恢复码也遗失、或界面根本打不开时，
+                在登录页点「应急登录」输入它即可进入并重置密码或关闭二次验证。
+                它只能使用一次，用过立即作废并下发新的一码；系统只存哈希，无法再次查看，请离线保存。
+              </div>
+            </div>
+            <el-button @click="regenerateSecurityCode">重新生成</el-button>
+          </div>
+        </div>
 
         <div class="fnwg-toolbar">
           <el-button type="primary" :icon="Plus" @click="openUserDialog">新建账号</el-button>
@@ -162,7 +186,11 @@
 
         <div v-if="!isMobile" class="fnwg-card">
           <el-table :data="users" size="small" empty-text="暂无账号">
-            <el-table-column prop="username" label="登录账号" min-width="140" />
+            <el-table-column label="登录账号" min-width="200">
+              <template #default="{ row }">
+                <span>{{ row.username }}</span>
+              </template>
+            </el-table-column>
             <el-table-column label="权限" width="120">
               <template #default="{ row }">
                 <el-tag size="small" effect="plain">{{ roleLabel(row.role) }}</el-tag>
@@ -175,15 +203,28 @@
                 </el-tag>
               </template>
             </el-table-column>
+            <el-table-column label="二次验证" width="130">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.totp_enabled ? 'success' : 'info'" effect="plain">
+                  {{ row.totp_enabled ? '已开启' : '未开启' }}
+                </el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="最近登录" width="180">
               <template #default="{ row }">{{ formatTime(row.last_login_at) }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="220">
+            <el-table-column label="操作" width="340">
               <template #default="{ row }">
                 <el-button link type="primary" @click="toggleUser(row)">
                   {{ row.status === 1 ? '停用' : '启用' }}
                 </el-button>
                 <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
+                <el-button v-if="!row.totp_enabled" link type="primary" @click="openAdminTOTP(row)">
+                  开启二次验证
+                </el-button>
+                <el-button v-else link type="warning" @click="resetUserTOTP(row)">
+                  重置二次验证
+                </el-button>
                 <el-button link type="danger" @click="removeUser(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -205,12 +246,20 @@
               <span class="fnwg-kv-val">{{ row.status === 1 ? '可登录' : '已停用' }}</span>
             </div>
             <div class="fnwg-kv">
+              <span class="fnwg-kv-key">二次验证</span>
+              <span class="fnwg-kv-val">{{ row.totp_enabled ? '已开启' : '未开启' }}</span>
+            </div>
+            <div class="fnwg-kv">
               <span class="fnwg-kv-key">最近登录</span>
               <span class="fnwg-kv-val">{{ formatTime(row.last_login_at) }}</span>
             </div>
             <template #actions>
               <el-button size="small" @click="toggleUser(row)">{{ row.status === 1 ? '停用' : '启用' }}</el-button>
               <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
+              <el-button v-if="!row.totp_enabled" size="small" @click="openAdminTOTP(row)">
+                开启二次验证
+              </el-button>
+              <el-button v-else size="small" @click="resetUserTOTP(row)">重置二次验证</el-button>
               <el-button size="small" @click="removeUser(row)">删除</el-button>
             </template>
           </ItemCard>
@@ -402,6 +451,84 @@
         </div>
       </el-tab-pane>
 
+      <!-- 配置快照与一键回滚 -->
+      <el-tab-pane label="配置快照" name="snapshot">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+          <template #title>
+            每次改动连接、设备、内网域名或系统设置前，系统会先自动留一份配置快照（不含账号密码）。
+            改坏了可以在这里看清「会撤销什么」，再一键回滚到那一刻。默认只保留最近
+            {{ snapshotKeep }} 份，超出的会从最旧的开始自动清理。
+          </template>
+        </el-alert>
+
+        <div class="fnwg-toolbar">
+          <el-button
+            v-if="session.can('backup.restore')"
+            type="primary"
+            :icon="Plus"
+            :loading="snapshotCreating"
+            @click="createSnapshot"
+          >
+            手动留档
+          </el-button>
+          <el-button :icon="Refresh" @click="loadSnapshots">刷新</el-button>
+          <div style="flex: 1"></div>
+          <span class="fnwg-hint">共 {{ snapshots.length }} 份 · 保留上限 {{ snapshotKeep }} 份</span>
+        </div>
+
+        <div v-if="!isMobile" class="fnwg-card">
+          <el-table :data="snapshots" size="small" empty-text="还没有配置快照，改动一次配置就会自动生成">
+            <el-table-column prop="filename" label="快照文件" min-width="240" />
+            <el-table-column label="大小" width="100">
+              <template #default="{ row }">{{ formatBytes(row.size) }}</template>
+            </el-table-column>
+            <el-table-column label="留档时间" width="180">
+              <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column prop="note" label="说明" min-width="200" />
+            <el-table-column label="操作" width="210">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="openDiff(row)">查看差异</el-button>
+                <el-button v-if="session.can('backup.restore')" link type="warning" @click="openDiff(row)">
+                  回滚
+                </el-button>
+                <el-button v-if="session.can('backup.restore')" link type="danger" @click="removeSnapshot(row)">
+                  删除
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-else>
+          <ItemCard v-for="row in snapshots" :key="row.id" :title="row.filename">
+            <template #extra>
+              <el-tag size="small" type="info" effect="plain">配置快照</el-tag>
+            </template>
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">留档时间</span>
+              <span class="fnwg-kv-val">{{ formatTime(row.created_at) }}</span>
+            </div>
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">大小</span>
+              <span class="fnwg-kv-val">{{ formatBytes(row.size) }}</span>
+            </div>
+            <div v-if="row.note" class="fnwg-kv">
+              <span class="fnwg-kv-key">说明</span>
+              <span class="fnwg-kv-val">{{ row.note }}</span>
+            </div>
+            <template #actions>
+              <el-button size="small" type="primary" @click="openDiff(row)">查看差异</el-button>
+              <el-button v-if="session.can('backup.restore')" size="small" @click="openDiff(row)">回滚</el-button>
+              <el-button v-if="session.can('backup.restore')" size="small" @click="removeSnapshot(row)">
+                删除
+              </el-button>
+            </template>
+          </ItemCard>
+          <div v-if="!snapshots.length" class="fnwg-empty">还没有配置快照</div>
+        </div>
+      </el-tab-pane>
+
       <!-- 关于 -->
       <el-tab-pane label="关于" name="about">
         <div class="fnwg-card" style="max-width: 760px">
@@ -410,12 +537,56 @@
             这是一个运行在飞牛 NAS 上的 WireGuard 管理工具。你不需要记住任何命令，只要在界面上点几下，
             就能让手机、笔记本在外网安全地连回家里，或把两处网络连成一张网。
           </p>
+
+          <!-- 功能概览：应用内没有别的地方能一眼说清「这个工具到底能做什么」，
+               而装完之后用户最先打开的就是这一页。折叠起来是为了不把关于页撑长。 -->
+          <el-collapse style="margin-bottom: 12px">
+            <el-collapse-item title="它能做什么（功能概览）" name="features">
+              <ul class="fnwg-about-list">
+                <li>
+                  <strong>连接与设备</strong>：多条连接互不干扰；设备扫码即接入，也可批量导入或按「选用途 → 填信息 → 扫码」
+                  分步新建；支持到期时间与流量额度。
+                </li>
+                <li>
+                  <strong>访问控制</strong>：按设备指定能访问的网段（家里网段可直接点选）；可允许设备访问家里内网，
+                  也可开启设备间隔离，防止别人的设备碰到你的电脑与摄像头。
+                </li>
+                <li>
+                  <strong>内网域名</strong>：设备用主机名（如 <code>nas.lan</code>）访问家里设备，不必记 IP。
+                </li>
+                <li>
+                  <strong>安全</strong>：本应用账号体系（口令以 argon2id 存储）、登录二次验证（动态口令 + 一次性恢复码 +
+                  可信任设备 30 天）、应急安全码，以及 <code>fnwg-cli</code> 命令行后手工具。
+                </li>
+                <li>
+                  <strong>可靠与可回溯</strong>：改完配置自动下发、系统重启自动恢复；改动前自动留配置快照，
+                  可看清差异再一键回滚；支持备份导出与导入。
+                </li>
+                <li>
+                  <strong>看得见的状态</strong>：顶栏状态点与异常横幅即时报出问题；一键体检能查出上网路线、
+                  内网访问、内网域名与飞牛桌面入口各自的毛病。
+                </li>
+                <li>
+                  <strong>事件通知</strong>：设备上下线、连接中断、额度用尽等推送到钉钉 / 企业微信 / 自定义 Webhook。
+                </li>
+              </ul>
+            </el-collapse-item>
+          </el-collapse>
           <el-descriptions :column="1" border size="small">
             <el-descriptions-item label="版本">{{ session.version || '-' }}</el-descriptions-item>
             <el-descriptions-item label="工作模式">{{ backendLabel }}</el-descriptions-item>
             <el-descriptions-item label="数据保存在">
               本机数据目录内（含配置与密钥）。密钥加密保存，即使文件被拿走也无法直接读出；
               任何信息都不会上传到外部服务器。
+            </el-descriptions-item>
+            <el-descriptions-item label="开源许可">
+              <strong>GPL-3.0-only</strong>（GNU 通用公共许可证第 3 版）· 版权归 小柿子 &lt;newxsz@163.com&gt; ·
+              不提供任何担保。第三方组件及其许可证可点下方「开源许可」逐条查看。
+            </el-descriptions-item>
+            <el-descriptions-item label="项目源码">
+              <el-link type="primary" :underline="false" @click="openRepo">
+                github.com/newcdl/fn-WireGuard
+              </el-link>
             </el-descriptions-item>
           </el-descriptions>
 
@@ -425,10 +596,69 @@
               这里只管「改配置」；查看系统状态、做体检与修复请到左侧「系统维护」。
             </template>
           </el-alert>
-          <el-button style="margin-top: 12px" :icon="Reading" @click="helpVisible = true">打开配置说明大全</el-button>
+          <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap">
+            <el-button :icon="Reading" @click="helpVisible = true">打开配置说明大全</el-button>
+            <el-button :icon="Document" @click="openLicenses">开源许可</el-button>
+            <!-- 图标内联 SVG：Element Plus 的图标集里没有品牌图标，
+                 而 npm 上再引一个仅为此用的包不值得。路径是 GitHub 官方标记的形状。 -->
+            <el-button @click="openRepo">
+              <svg class="fnwg-github-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+                />
+              </svg>
+              GitHub 源码
+            </el-button>
+          </div>
         </div>
       </el-tab-pane>
     </el-tabs>
+
+    <!-- 开源许可：GPL 全文与第三方组件清单都取自服务端内嵌的文本，
+         不联网、也不需要用户去翻安装目录。 -->
+    <el-dialog v-model="licenseDialog" title="开源许可" :width="dialogWidth || '900px'">
+      <div class="fnwg-hint" style="margin-bottom: 8px">
+        本应用以 <strong>GPL-3.0-only</strong> 发布，版权归 小柿子 &lt;newxsz@163.com&gt;，
+        不提供任何担保。分发时须以同一许可开放源代码。第三方组件及其许可证见第二页。
+      </div>
+      <el-tabs v-model="licenseTab">
+        <el-tab-pane label="GPL-3.0 全文" name="gpl">
+          <pre class="fnwg-license-text">{{ licenses.license || (licenseLoading ? '正在读取…' : '未能读取') }}</pre>
+        </el-tab-pane>
+        <el-tab-pane label="第三方组件" name="third">
+          <pre class="fnwg-license-text">{{ licenses.third_party || (licenseLoading ? '正在读取…' : '未能读取') }}</pre>
+        </el-tab-pane>
+      </el-tabs>
+      <template #footer>
+        <el-button @click="downloadLicenses">下载当前页为文本</el-button>
+        <el-button type="primary" @click="licenseDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 新安全码：只此一次，必须由用户主动确认看过 -->
+    <el-dialog
+      v-model="securityCodeDialog"
+      title="新的应急安全码"
+      :width="dialogWidth || '520px'"
+      :close-on-click-modal="false"
+    >
+      <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 12px">
+        <template #title>
+          旧的安全码已立即作废。请保存下面这枚新码——它只显示这一次，系统不留明文，我们也无法帮你找回。
+        </template>
+      </el-alert>
+      <SecurityCodeBlock :code="newSecurityCode" />
+      <div class="fnwg-hint" style="margin-top: 10px">
+        它只能使用一次，用过之后系统会再下发新的一码。
+      </div>
+      <el-checkbox v-model="savedSecurityCode" style="margin-top: 6px">我已妥善保存这枚安全码</el-checkbox>
+      <template #footer>
+        <el-button type="primary" :disabled="!savedSecurityCode" @click="securityCodeDialog = false">
+          我已保存，关闭
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="userDialog" title="新建账号" :width="dialogWidth || '440px'">
       <el-form :model="newUser" class="fnwg-form" :label-position="isMobile ? 'top' : 'right'" label-width="100px">
@@ -456,6 +686,91 @@
       </template>
     </el-dialog>
 
+    <!-- 管理员代开二次验证：不改对方密码，只把二维码与恢复码交到账号主人手里 -->
+    <AdminTOTPDialog
+      v-if="adminTOTPUser"
+      v-model="adminTOTPDialog"
+      :user-id="adminTOTPUser.id"
+      :user-name="adminTOTPUser.username"
+      @done="onAdminTOTPDone"
+    />
+
+    <!-- 快照差异对比：把「回滚会撤销什么」摊开，确认后再回滚 -->
+    <el-dialog v-model="diffVisible" title="快照差异对比" :width="dialogWidth || '720px'">
+      <div v-if="diffLoading" class="fnwg-hint">正在比对差异…</div>
+      <template v-else-if="diff">
+        <el-alert
+          :type="diff.empty ? 'success' : 'warning'"
+          :closable="false"
+          show-icon
+          :title="diff.summary"
+          style="margin-bottom: 12px"
+        />
+        <div class="fnwg-hint" style="margin-bottom: 10px">
+          快照：{{ diff.note || diff.filename }} · {{ formatTime(diff.created_at) }}
+        </div>
+
+        <div class="fnwg-diff">
+          <div v-for="sec in diffSections" :key="sec.label" class="fnwg-diff-sec">
+            <div class="fnwg-diff-head">
+              <strong>{{ sec.label }}</strong>
+              <span class="fnwg-hint">
+                新增 {{ sec.added.length }} · 删除 {{ sec.removed.length }} · 修改 {{ sec.changed.length }}
+              </span>
+            </div>
+            <div
+              v-if="!sec.added.length && !sec.removed.length && !sec.changed.length"
+              class="fnwg-hint"
+            >
+              无变化
+            </div>
+            <div v-for="it in sec.added" :key="'a-' + it.key" class="fnwg-diff-item">
+              <el-tag size="small" type="success" effect="plain">新增</el-tag>
+              <span>{{ it.name }}</span>
+            </div>
+            <div v-for="it in sec.removed" :key="'r-' + it.key" class="fnwg-diff-item">
+              <el-tag size="small" type="danger" effect="plain">删除</el-tag>
+              <span>{{ it.name }}</span>
+            </div>
+            <div v-for="it in sec.changed" :key="'c-' + it.key" class="fnwg-diff-item">
+              <el-tag size="small" type="warning" effect="plain">修改</el-tag>
+              <div class="fnwg-diff-item-body">
+                <div>{{ it.name }}</div>
+                <div v-for="(d, i) in it.details || []" :key="i" class="fnwg-diff-detail">{{ d }}</div>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="diff.settings.length" class="fnwg-diff-sec">
+            <div class="fnwg-diff-head">
+              <strong>系统设置</strong>
+              <span class="fnwg-hint">{{ diff.settings.length }} 项变更（只显示键名）</span>
+            </div>
+            <div v-for="s in diff.settings" :key="'s-' + s.key" class="fnwg-diff-item">
+              <el-tag size="small" type="warning" effect="plain">修改</el-tag>
+              <span class="fnwg-mono">{{ s.key }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="fnwg-hint" style="margin-top: 10px">
+          回滚只恢复连接、设备、内网域名与设置项，不会回退账号密码与二次验证；回滚前会自动为当前状态留一份快照。
+        </div>
+      </template>
+
+      <template #footer>
+        <el-button @click="diffVisible = false">关闭</el-button>
+        <el-button
+          v-if="diff && !diff.empty && session.can('backup.restore')"
+          type="warning"
+          :loading="rollingBack"
+          @click="confirmRollback"
+        >
+          确认回滚到这份快照
+        </el-button>
+      </template>
+    </el-dialog>
+
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
@@ -463,10 +778,21 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Upload, Reading, Refresh } from '@element-plus/icons-vue'
+import { Plus, Upload, Reading, Refresh, Document } from '@element-plus/icons-vue'
 import { api, download, postRaw } from '@/api/client'
-import type { BackupRecord, DNSRecord, Health, NotifyResult, NotifyStatus, User } from '@/api/types'
+import type {
+  BackupRecord,
+  DNSRecord,
+  Health,
+  NotifyResult,
+  NotifyStatus,
+  SnapshotDiff,
+  SnapshotDiffSection,
+  User,
+} from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import SecurityCodeBlock from '@/components/SecurityCodeBlock.vue'
+import AdminTOTPDialog from '@/components/AdminTOTPDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
@@ -507,10 +833,36 @@ const helpVisible = ref(false)
 const users = ref<User[]>([])
 const userDialog = ref(false)
 const newUser = reactive({ username: '', password: '', role: 'viewer' })
+// 管理员代开二次验证：与「本人开启」共用同一套绑定流程，只是不校验本人密码
+const adminTOTPDialog = ref(false)
+const adminTOTPUser = ref<User | null>(null)
 
 const backups = ref<BackupRecord[]>([])
 const shareDir = ref('')
 const backupFileInput = ref<HTMLInputElement | null>(null)
+
+// 配置快照：关键改动前自动留档，可看差异、可一键回滚。
+const snapshots = ref<BackupRecord[]>([])
+const snapshotKeep = ref(50)
+const snapshotCreating = ref(false)
+const diffVisible = ref(false)
+const diffLoading = ref(false)
+const diff = ref<SnapshotDiff | null>(null)
+const rollingBack = ref(false)
+
+/**
+ * 差异分组：把后端按对象类型给的三个小段拼成便于渲染的列表。
+ * 空段也保留，好让用户看到「这一类无变化」，而不是以为漏了什么。
+ */
+const diffSections = computed<(SnapshotDiffSection & { label: string })[]>(() => {
+  const d = diff.value
+  if (!d) return []
+  return [
+    { label: '连接', ...d.interfaces },
+    { label: '设备', ...d.peers },
+    { label: '内网域名', ...d.dns },
+  ]
+})
 
 // 内网域名解析：开关走设置项，记录走独立接口；
 // 运行状态复用全局体检的同一份数据，避免「设置页说正常、维护页说异常」。
@@ -554,6 +906,7 @@ async function loadAll() {
   await loadHealth()
   if (session.isAdmin) await loadUsers()
   await loadBackups()
+  await loadSnapshots()
   await loadDNS()
   void refreshSystemHealth()
 }
@@ -657,6 +1010,43 @@ async function loadHealth() {
   }
 }
 
+/** 应急安全码的状态与重新生成（只有管理员能看，因此接口本身也挂 user.manage 权限）。 */
+const securityCodeConfigured = ref(false)
+const securityCodeDialog = ref(false)
+const newSecurityCode = ref('')
+const savedSecurityCode = ref(false)
+
+async function loadSecurityCode() {
+  if (!session.isAdmin) return
+  try {
+    const res = await api.get<{ configured: boolean }>('/auth/security-code')
+    securityCodeConfigured.value = res.configured
+  } catch {
+    /* 忽略 */
+  }
+}
+
+async function regenerateSecurityCode() {
+  try {
+    await ElMessageBox.confirm(
+      '将生成一枚新的应急安全码，旧码立即作废（已保存的旧码将无法再使用）。确认继续？',
+      '重新生成安全码',
+      { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  try {
+    const res = await api.post<{ code: string }>('/auth/security-code')
+    newSecurityCode.value = res.code
+    savedSecurityCode.value = false
+    securityCodeDialog.value = true
+    securityCodeConfigured.value = true
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 async function loadUsers() {
   try {
     const data = await api.get<{ items: User[] }>('/users')
@@ -664,6 +1054,7 @@ async function loadUsers() {
   } catch {
     /* 忽略 */
   }
+  await loadSecurityCode()
 }
 
 async function loadBackups() {
@@ -673,6 +1064,99 @@ async function loadBackups() {
     shareDir.value = data.share_dir || ''
   } catch {
     /* 忽略 */
+  }
+}
+
+async function loadSnapshots() {
+  try {
+    const data = await api.get<{ items: BackupRecord[]; keep: number }>('/snapshots')
+    snapshots.value = data.items || []
+    snapshotKeep.value = data.keep || 50
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 手动留档。
+ *
+ * 若当前配置与最近一份快照一致，后端不会重复落盘（否则连点几次会堆出一串同样的文件），
+ * 此时要如实告诉用户「这次没留下新的」，而不是让他以为存了、回头却找不到。
+ */
+async function createSnapshot() {
+  let note = ''
+  try {
+    const r = await ElMessageBox.prompt('给这份快照写个说明（可留空）', '手动留档', { inputValue: '' })
+    note = r.value
+  } catch {
+    return
+  }
+  snapshotCreating.value = true
+  try {
+    const res = await api.post<{ created: boolean; message?: string }>('/snapshots', { note })
+    if (res.created) ElMessage.success('已留档')
+    else ElMessage.info(res.message || '当前配置与最近一份快照一致，未重复留档')
+    await loadSnapshots()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    snapshotCreating.value = false
+  }
+}
+
+/** 查看快照与当前配置的差异；回滚的确认按钮也在这个弹窗里，先看清再决定。 */
+async function openDiff(row: BackupRecord) {
+  diff.value = null
+  diffVisible.value = true
+  diffLoading.value = true
+  try {
+    diff.value = await api.get<SnapshotDiff>(`/snapshots/${row.id}/diff`)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+    diffVisible.value = false
+  } finally {
+    diffLoading.value = false
+  }
+}
+
+/** 确认回滚：用差异结论做二次确认，回滚后刷新全部数据与系统自检。 */
+async function confirmRollback() {
+  const d = diff.value
+  if (!d) return
+  try {
+    await ElMessageBox.confirm(
+      `${d.summary}。\n\n` +
+        '回滚会覆盖当前的连接、设备、内网域名与设置项，并立即下发到内核。\n' +
+        '账号密码与二次验证不受影响；回滚前会自动为当前状态留一份快照，滚错了还能再滚回来。\n\n确认回滚？',
+      '回滚配置',
+      { type: 'warning', confirmButtonText: '确认回滚', cancelButtonText: '再想想' },
+    )
+  } catch {
+    return
+  }
+  rollingBack.value = true
+  try {
+    const res = await api.post<{ restored_interfaces: number }>(`/snapshots/${d.snapshot_id}/rollback`)
+    ElMessage.success(`已回滚 ${res.restored_interfaces} 条连接`)
+    diffVisible.value = false
+    await loadAll()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    rollingBack.value = false
+  }
+}
+
+async function removeSnapshot(row: BackupRecord) {
+  try {
+    await ElMessageBox.confirm(`确认删除快照「${row.filename}」？删除后无法再用它回滚。`, '删除快照', {
+      type: 'warning',
+    })
+    await api.del(`/snapshots/${row.id}`)
+    ElMessage.success('已删除')
+    await loadSnapshots()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error((e as Error).message)
   }
 }
 
@@ -790,6 +1274,43 @@ async function resetPassword(row: User) {
   }
 }
 
+/** 打开管理员代开二次验证的对话框；真正的绑定/确认由对话框内部完成。 */
+function openAdminTOTP(row: User) {
+  adminTOTPUser.value = row
+  adminTOTPDialog.value = true
+}
+
+/** 绑定成功后刷新列表：状态列要从「未开启」变成「已开启」。 */
+async function onAdminTOTPDone() {
+  await loadUsers()
+}
+
+/**
+ * 管理员重置某账号的二次验证。
+ *
+ * 这是「用户手机丢了、恢复码也没了」时唯一的救法，因此把后果写清楚：
+ * 重置后该账号只剩密码一道防线，且会被强制登出，需要用新密码重新登录并重新绑定。
+ */
+async function resetUserTOTP(row: User) {
+  try {
+    await ElMessageBox.confirm(
+      `将关闭「${row.username}」的二次验证，并清空其恢复码与受信任设备，该账号的在线会话也会被登出。\n\n` +
+        '重置后该账号仅凭密码即可登录（安全性下降），请提醒对方尽快重新绑定。确认重置？',
+      '重置二次验证',
+      { type: 'warning', confirmButtonText: '确认重置' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.post(`/users/${row.id}/totp/reset`)
+    ElMessage.success('已重置该账号的二次验证')
+    await loadUsers()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 async function removeUser(row: User) {
   try {
     await ElMessageBox.confirm(`确认删除账号「${row.username}」？删除后该账号立即无法登录。`, '删除账号', {
@@ -867,6 +1388,60 @@ async function onImportFile(e: Event) {
   }
 }
 
+/**
+ * 开源许可的文本。
+ *
+ * 只在第一次打开时取一次：第三方清单里带着几十个组件的许可全文，分量不小，
+ * 而它是一份不会变的内容 —— 每次开弹窗都拉一遍没有意义。
+ */
+const licenseDialog = ref(false)
+const licenseTab = ref('gpl')
+const licenseLoading = ref(false)
+const licenses = reactive({ license: '', third_party: '' })
+
+async function openLicenses() {
+  licenseDialog.value = true
+  if (licenses.license || licenseLoading.value) return
+  licenseLoading.value = true
+  try {
+    const d = await api.get<{ license: string; third_party: string }>('/about/licenses')
+    licenses.license = d.license || ''
+    licenses.third_party = d.third_party || ''
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    licenseLoading.value = false
+  }
+}
+
+/** 下载当前这一页为文本：许可全文常被要求随分发物一起留存，只给屏幕不让带走并不方便。 */
+function downloadLicenses() {
+  const isGpl = licenseTab.value === 'gpl'
+  const text = isGpl ? licenses.license : licenses.third_party
+  if (!text) {
+    ElMessage.warning('内容还没读取出来')
+    return
+  }
+  const name = isGpl ? 'GPL-3.0-only.txt' : 'THIRD_PARTY_LICENSES.md'
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+/** 项目源码地址。 */
+const REPO_URL = 'https://github.com/newcdl/fn-WireGuard'
+
+/** 打开项目源码。显式带 noopener：新开的页面拿不到本页的引用，避免被反向操作。 */
+function openRepo() {
+  window.open(REPO_URL, '_blank', 'noopener,noreferrer')
+}
+
 onMounted(async () => {
   await loadAll()
 })
@@ -893,6 +1468,89 @@ onMounted(async () => {
   color: var(--el-text-color-regular);
   line-height: 1.9;
   font-size: 13.5px;
+}
+
+/* 快照差异：分段列出新增/删除/修改，改动详情缩进显示便于扫读 */
+.fnwg-diff {
+  max-height: 52vh;
+  overflow-y: auto;
+}
+
+.fnwg-diff-sec {
+  padding: 8px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.fnwg-diff-sec:first-child {
+  border-top: none;
+}
+
+.fnwg-diff-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.fnwg-diff-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.fnwg-diff-item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.fnwg-diff-detail {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  padding-left: 2px;
+}
+
+/* 许可全文：逐字展示，必须原样保留换行与缩进（pre-wrap 而不是 pre，
+   免得第三方清单里的长行把弹窗顶出横向滚动条）。 */
+.fnwg-license-text {
+  margin: 0;
+  max-height: 52vh;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--fnwg-border);
+  border-radius: 8px;
+  background: var(--el-fill-color-light);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.fnwg-github-icon {
+  margin-right: 6px;
+  vertical-align: -2px;
+}
+
+/* 关于页的功能概览：逐条列出来比一大段话好扫，用户找的是「有没有我要的能力」。 */
+.fnwg-about-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.9;
+}
+
+.fnwg-about-list code {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--el-fill-color);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
 }
 
 </style>

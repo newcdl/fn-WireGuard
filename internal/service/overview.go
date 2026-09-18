@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 package service
 
 import (
@@ -121,18 +124,19 @@ func (s *Service) SetSettings(ctx context.Context, kv map[string]string, a Actor
 	if err := normalizeNotifySettings(kv); err != nil {
 		return err
 	}
-	for k, v := range kv {
-		if err := s.Store.SetSetting(ctx, k, v); err != nil {
-			return err
-		}
-	}
 	// 只记键名不记取值：设置里包含通知地址这类带令牌的敏感内容，
-	// 写进审计等于把凭据交给每个能查审计的人。
+	// 写进审计等于把凭据交给每个能查审计的人。快照同理，备注里也只给键名。
 	changed := make([]string, 0, len(kv))
 	for k := range kv {
 		changed = append(changed, k)
 	}
 	sort.Strings(changed)
+	s.snapshotBefore(ctx, "settings.update", settingsNote(changed))
+	for k, v := range kv {
+		if err := s.Store.SetSetting(ctx, k, v); err != nil {
+			return err
+		}
+	}
 	s.audit(ctx, a, "settings.update", "settings", "", "", "", "ok", "变更项："+strings.Join(changed, "、"))
 	return nil
 }

@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <template>
   <div class="fnwg-layout">
     <!-- 桌面端侧边导航 -->
@@ -63,17 +66,50 @@
             <el-button link :icon="Reading" @click="helpVisible = true" />
           </el-tooltip>
 
+          <!-- 外观：浅色 / 深色 / 跟随系统。
+               放在顶栏而不是「系统设置」里：它改的是眼前这个界面，不属于任何一条业务配置；
+               想切换的人往往正看着某个页面，不该为了换个底色先跳到设置页。
+               按钮只留图标不带文字：顶栏在手机上已经很挤，而图标本身能说明这里是外观。 -->
+          <el-dropdown trigger="click" @command="onThemeCommand">
+            <el-button link :title="`外观：${themeLabel}（点击切换）`">
+              <el-icon :size="16"><component :is="themeIcon" /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item v-for="t in themeOptions" :key="t.value" :command="t.value">
+                  <el-icon><component :is="t.icon" /></el-icon>
+                  <span style="margin-left: 6px">{{ t.label }}</span>
+                  <el-icon v-if="themeMode === t.value" style="margin-left: auto">
+                    <Check />
+                  </el-icon>
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+
           <el-dropdown @command="onCommand">
             <span style="cursor: pointer; display: flex; align-items: center; gap: 6px">
               <el-icon><Avatar /></el-icon>
-              <span v-if="!isMobile">{{ session.user?.username }}</span>
+              <span v-if="!isMobile">{{ myName }}</span>
               <el-icon v-if="isMobile"><ArrowDown /></el-icon>
             </span>
             <template #dropdown>
               <el-dropdown-menu>
-                <el-dropdown-item disabled>{{ session.user?.username }}（{{ roleLabel }}）</el-dropdown-item>
+                <el-dropdown-item disabled>{{ myName }}（{{ roleLabel }}）</el-dropdown-item>
                 <el-dropdown-item command="help" divided>配置说明大全</el-dropdown-item>
                 <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                <el-dropdown-item command="totp">
+                  二次验证
+                  <el-tag
+                    v-if="session.user?.totp_enabled"
+                    size="small"
+                    type="success"
+                    effect="plain"
+                    style="margin-left: 6px"
+                  >
+                    已开启
+                  </el-tag>
+                </el-dropdown-item>
                 <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -158,11 +194,14 @@
         <el-button type="primary" @click="submitPassword">确定</el-button>
       </template>
     </el-dialog>
+
+    <TwoFactorDialog v-model="totpVisible" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import type { Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -174,17 +213,23 @@ import {
   Tools,
   Avatar,
   ArrowDown,
+  Check,
   Menu,
+  Monitor,
+  Moon,
   Reading,
   Connection,
+  Sunny,
   WarningFilled,
   Search,
 } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import TwoFactorDialog from '@/components/TwoFactorDialog.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
+import { useTheme, type ThemeMode } from '@/composables/useTheme'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
@@ -257,6 +302,7 @@ const title = computed(() => titles[route.name as string] || 'WireGuard 管理�
 const roleLabel = computed(
   () => ({ admin: '管理员', operator: '运维', viewer: '只读' })[session.user?.role || 'viewer'],
 )
+const myName = computed(() => session.user?.username || '')
 const backendLabel = computed(() => {
   const b = realtime.status?.backend
   return ({ kernel: '标准模式', userspace: '兼容模式', mock: '演示模式' } as Record<string, string>)[b || ''] || ''
@@ -269,12 +315,47 @@ const syncTip = computed(() =>
 
 const helpGroups = allHelpGroups
 
+// ---------------------------------------------------------------- 外观
+
+const { mode: themeMode, isDark, setMode: setThemeMode } = useTheme()
+
+/**
+ * 三种外观。
+ *
+ * 图标、名称都只在这张表里写一遍：顶栏按钮的图标、它的提示语、下拉里的三个选项
+ * 全部从这里取，避免同一件事在两处各写一份、改了一处忘了另一处。
+ */
+const fallbackTheme = { value: 'system' as ThemeMode, label: '跟随系统', icon: Monitor }
+const themeOptions: { value: ThemeMode; label: string; icon: Component }[] = [
+  { value: 'light', label: '浅色', icon: Sunny },
+  { value: 'dark', label: '深色', icon: Moon },
+  fallbackTheme,
+]
+const currentTheme = computed(
+  () => themeOptions.find((t) => t.value === themeMode.value) || fallbackTheme,
+)
+const themeIcon = computed(() => currentTheme.value.icon)
+const themeLabel = computed(() => currentTheme.value.label)
+
+function onThemeCommand(cmd: string | number | object) {
+  const next = cmd as ThemeMode
+  setThemeMode(next)
+  // 切到「跟随系统」时界面可能没有任何肉眼可见的变化（系统本来就是深色），
+  // 一句提示才说得清「点了确实生效了、当前跟随的是哪一种」。
+  ElMessage.success(
+    next === 'system'
+      ? `已跟随系统外观（当前为${isDark.value ? '深色' : '浅色'}）`
+      : `已切换为${themeLabel.value}`,
+  )
+}
+
 const navVisible = ref(false)
 const searchRef = ref()
 const mobileSearchVisible = ref(false)
 const helpVisible = ref(false)
 const pwVisible = ref(false)
 const pw = ref({ old: '', next: '' })
+const totpVisible = ref(false)
 
 /** 菜单只处理真实路由，未知 index 一律忽略（防止误导航导致白屏） */
 function onMenuSelect(index: string) {
@@ -317,6 +398,10 @@ async function onCommand(cmd: string) {
   if (cmd === 'password') {
     pw.value = { old: '', next: '' }
     pwVisible.value = true
+    return
+  }
+  if (cmd === 'totp') {
+    totpVisible.value = true
     return
   }
   if (cmd === 'logout') {

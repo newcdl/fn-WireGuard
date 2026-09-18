@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <template>
   <div>
     <el-tabs v-model="tab">
@@ -239,6 +242,16 @@ const ACTION_LABELS: Record<string, string> = {
   'user.delete': '删除了账号',
   'user.change_password': '修改了密码',
   'auth.login': '登录',
+  'auth.login.totp': '二次验证登录',
+  'totp.setup': '发起了二次验证绑定',
+  'totp.enable': '开启了二次验证',
+  'totp.disable': '关闭了二次验证',
+  'totp.trust_device': '信任了一台设备',
+  'totp.revoke_device': '撤销了受信任设备',
+  'totp.admin_reset': '重置了账号的二次验证',
+  'security.code_issue': '生成了新的安全码',
+  'security.emergency_login': '用安全码应急登录',
+  'user.reset_password': '重置了账号密码',
 }
 
 const TARGET_LABELS: Record<string, string> = {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 package service_test
 
 import (
@@ -26,6 +29,14 @@ import (
 // 「创建接口失败: operation not permitted」。
 func newTestEnv(t *testing.T) (*service.Service, *store.Store) {
 	t.Helper()
+	svc, st, _ := newTestEnvWithDir(t)
+	return svc, st
+}
+
+// newTestEnvWithDir 与 newTestEnv 相同，但额外返回共享目录。
+// 配置快照要落盘到共享目录，测试需要显式 svc.SetSnapshotDir(dir) 才会启用自动留档。
+func newTestEnvWithDir(t *testing.T) (*service.Service, *store.Store, string) {
+	t.Helper()
 	dir := t.TempDir()
 	box, err := secretbox.New(make([]byte, 32))
 	if err != nil {
@@ -41,7 +52,7 @@ func newTestEnv(t *testing.T) (*service.Service, *store.Store) {
 	backend := wgback.NewMock(filepath.Join(dir, "netstate.json"))
 	engine := reconcile.New(st, backend, logger)
 	svc := service.New(st, core.NewLocal(engine), logger, "test")
-	return svc, st
+	return svc, st, dir
 }
 
 func TestInterfaceAndPeerLifecycle(t *testing.T) {
@@ -680,13 +691,17 @@ func TestAuthAndAudit(t *testing.T) {
 	if _, err := svc.Setup(ctx, "other", "admin12345"); err == nil {
 		t.Fatal("已初始化后不应允许重复初始化")
 	}
-	if _, _, err := svc.Login(ctx, "admin", "wrong-password", "test", "127.0.0.1"); err == nil {
+	if _, err := svc.Login(ctx, service.LoginInput{Username: "admin", Password: "wrong-password", UserAgent: "test", SrcIP: "127.0.0.1"}); err == nil {
 		t.Fatal("错误口令应登录失败")
 	}
-	token, user, err := svc.Login(ctx, "admin", "admin12345", "test", "127.0.0.1")
+	step, err := svc.Login(ctx, service.LoginInput{Username: "admin", Password: "admin12345", UserAgent: "test", SrcIP: "127.0.0.1"})
 	if err != nil {
 		t.Fatalf("登录失败: %v", err)
 	}
+	if step.TOTPRequired() {
+		t.Fatal("未开启二次验证的账号不应要求动态口令")
+	}
+	token, user := step.Token, step.User
 	if user.Username != "admin" || token == "" {
 		t.Fatal("登录返回值异常")
 	}

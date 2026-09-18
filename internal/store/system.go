@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 package store
 
 import (
@@ -50,6 +53,7 @@ func (s *Store) scanUser(sc interface{ Scan(...any) error }) (*model.User, error
 	}
 	u.LastLoginAt = parseTSNull(lastLoginAt)
 	u.CreatedAt = parseTS(createdAt)
+	u.TOTPEnabled = u.TOTPSecret != ""
 	return &u, nil
 }
 
@@ -168,6 +172,315 @@ func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
 // CleanExpiredSessions 清理过期会话。
 func (s *Store) CleanExpiredSessions(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_session WHERE expires_at < ?`, ts(time.Now()))
+	return err
+}
+
+// ---------------------------------------------------------------- 二次验证
+
+// CreateTOTPChallenge 写入一次二次验证挑战。
+func (s *Store) CreateTOTPChallenge(ctx context.Context, tokenHash string, userID int64, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO sys_totp_challenge(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)`,
+		tokenHash, userID, ts(expiresAt), ts(time.Now()))
+	return err
+}
+
+// GetTOTPChallenge 查询未过期的挑战；过期即删除并按「不存在」返回。
+func (s *Store) GetTOTPChallenge(ctx context.Context, tokenHash string) (*model.TOTPChallenge, error) {
+	var (
+		c         model.TOTPChallenge
+		expiresAt string
+		createdAt string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT token_hash,user_id,expires_at,attempts,created_at FROM sys_totp_challenge WHERE token_hash=?`, tokenHash).
+		Scan(&c.TokenHash, &c.UserID, &expiresAt, &c.Attempts, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.ExpiresAt = parseTS(expiresAt)
+	c.CreatedAt = parseTS(createdAt)
+	if time.Now().After(c.ExpiresAt) {
+		_ = s.DeleteTOTPChallenge(ctx, tokenHash)
+		return nil, ErrNotFound
+	}
+	return &c, nil
+}
+
+// BumpTOTPChallengeAttempts 累加失败次数并返回最新值，用于限制单次挑战的尝试次数。
+func (s *Store) BumpTOTPChallengeAttempts(ctx context.Context, tokenHash string) (int, error) {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE sys_totp_challenge SET attempts=attempts+1 WHERE token_hash=?`, tokenHash); err != nil {
+		return 0, err
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT attempts FROM sys_totp_challenge WHERE token_hash=?`, tokenHash).Scan(&n)
+	return n, err
+}
+
+// DeleteTOTPChallenge 删除挑战。验证成功后必须调用，保证挑战只能用一次。
+func (s *Store) DeleteTOTPChallenge(ctx context.Context, tokenHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_totp_challenge WHERE token_hash=?`, tokenHash)
+	return err
+}
+
+// CleanExpiredTOTPChallenges 清理过期挑战。
+func (s *Store) CleanExpiredTOTPChallenges(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_totp_challenge WHERE expires_at < ?`, ts(time.Now()))
+	return err
+}
+
+// SetUserTOTPSecret 写入二次验证密钥（开启二次验证时调用）。
+func (s *Store) SetUserTOTPSecret(ctx context.Context, userID int64, secret string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sys_user SET totp_secret=? WHERE id=?`, secret, userID)
+	return err
+}
+
+// ClearUserTOTP 关闭 / 重置二次验证：清空密钥、删除恢复码与受信任设备，
+// 并顺手清掉该账号未完成的挑战。
+//
+// 受信任设备必须一起删：它本身就是「跳过二次验证」的凭据，留着它就等于
+// 二次验证虽然关了但后门还在，而且重新开启后这个后门会自动复活。
+func (s *Store) ClearUserTOTP(ctx context.Context, userID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`UPDATE sys_user SET totp_secret='' WHERE id=?`,
+		`DELETE FROM sys_recovery_code WHERE user_id=?`,
+		`DELETE FROM sys_totp_challenge WHERE user_id=?`,
+		`DELETE FROM sys_trusted_device WHERE user_id=?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ReplaceRecoveryCodes 用新一批恢复码哈希整体替换旧记录。
+func (s *Store) ReplaceRecoveryCodes(ctx context.Context, userID int64, hashes []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sys_recovery_code WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	now := ts(time.Now())
+	for _, h := range hashes {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO sys_recovery_code(user_id,code_hash,created_at) VALUES(?,?,?)`, userID, h, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListUnusedRecoveryCodes 返回某账号尚未使用过的恢复码（只含哈希）。
+func (s *Store) ListUnusedRecoveryCodes(ctx context.Context, userID int64) ([]model.RecoveryCode, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id,user_id,code_hash,created_at FROM sys_recovery_code WHERE user_id=? AND used_at IS NULL ORDER BY id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.RecoveryCode{}
+	for rows.Next() {
+		var (
+			c         model.RecoveryCode
+			createdAt string
+		)
+		if err := rows.Scan(&c.ID, &c.UserID, &c.CodeHash, &createdAt); err != nil {
+			return nil, err
+		}
+		c.CreatedAt = parseTS(createdAt)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// MarkRecoveryCodeUsed 标记恢复码已使用（恢复码是一次性的）。
+func (s *Store) MarkRecoveryCodeUsed(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sys_recovery_code SET used_at=? WHERE id=?`, ts(time.Now()), id)
+	return err
+}
+
+// CountUnusedRecoveryCodes 统计剩余可用恢复码数量。
+func (s *Store) CountUnusedRecoveryCodes(ctx context.Context, userID int64) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM sys_recovery_code WHERE user_id=? AND used_at IS NULL`, userID).Scan(&n)
+	return n, err
+}
+
+// ---------------------------------------------------------------- 受信任设备
+
+// CreateTrustedDevice 记录一台受信任设备（tokenHash 是设备令牌的 SHA-256）。
+func (s *Store) CreateTrustedDevice(ctx context.Context, d *model.TrustedDevice) error {
+	now := time.Now()
+	if d.CreatedAt.IsZero() {
+		d.CreatedAt = now
+	}
+	if d.LastUsedAt.IsZero() {
+		d.LastUsedAt = now
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO sys_trusted_device(user_id,token_hash,name,src_ip,created_at,last_used_at,expires_at) VALUES(?,?,?,?,?,?,?)`,
+		d.UserID, d.TokenHash, d.Name, d.SrcIP, ts(d.CreatedAt), ts(d.LastUsedAt), ts(d.ExpiresAt))
+	if err != nil {
+		return err
+	}
+	d.ID, _ = res.LastInsertId()
+	return nil
+}
+
+// GetTrustedDevice 按令牌哈希查询；已过期即删除并按「不存在」返回。
+func (s *Store) GetTrustedDevice(ctx context.Context, tokenHash string) (*model.TrustedDevice, error) {
+	var (
+		d          model.TrustedDevice
+		createdAt  string
+		lastUsedAt string
+		expiresAt  string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id,user_id,token_hash,name,src_ip,created_at,last_used_at,expires_at FROM sys_trusted_device WHERE token_hash=?`, tokenHash).
+		Scan(&d.ID, &d.UserID, &d.TokenHash, &d.Name, &d.SrcIP, &createdAt, &lastUsedAt, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.CreatedAt = parseTS(createdAt)
+	d.LastUsedAt = parseTS(lastUsedAt)
+	d.ExpiresAt = parseTS(expiresAt)
+	if time.Now().After(d.ExpiresAt) {
+		_ = s.DeleteTrustedDeviceByID(ctx, d.ID)
+		return nil, ErrNotFound
+	}
+	return &d, nil
+}
+
+// TouchTrustedDevice 更新最近使用时间，便于用户在列表里识别哪台在用。
+func (s *Store) TouchTrustedDevice(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sys_trusted_device SET last_used_at=? WHERE id=?`, ts(time.Now()), id)
+	return err
+}
+
+// ListTrustedDevices 返回某账号的全部受信任设备（不含令牌哈希）。
+func (s *Store) ListTrustedDevices(ctx context.Context, userID int64) ([]model.TrustedDevice, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id,user_id,name,src_ip,created_at,last_used_at,expires_at FROM sys_trusted_device WHERE user_id=? ORDER BY id DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.TrustedDevice{}
+	for rows.Next() {
+		var (
+			d          model.TrustedDevice
+			createdAt  string
+			lastUsedAt string
+			expiresAt  string
+		)
+		if err := rows.Scan(&d.ID, &d.UserID, &d.Name, &d.SrcIP, &createdAt, &lastUsedAt, &expiresAt); err != nil {
+			return nil, err
+		}
+		d.CreatedAt = parseTS(createdAt)
+		d.LastUsedAt = parseTS(lastUsedAt)
+		d.ExpiresAt = parseTS(expiresAt)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeleteTrustedDevice 撤销一台受信任设备。带 userID 条件是为了防越权：
+// 即使 id 猜对了，也只能删自己的设备。
+func (s *Store) DeleteTrustedDevice(ctx context.Context, userID, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE id=? AND user_id=?`, id, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteTrustedDeviceByID 按主键删除（内部清理过期记录用，不做属主校验）。
+func (s *Store) DeleteTrustedDeviceByID(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE id=?`, id)
+	return err
+}
+
+// DeleteAllTrustedDevices 清空某账号的全部受信任设备。
+//
+// 改密码、切换二次验证开关、管理员重置后都必须调用它。
+func (s *Store) DeleteAllTrustedDevices(ctx context.Context, userID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE user_id=?`, userID)
+	return err
+}
+
+// CleanExpiredTrustedDevices 清理已过期的受信任设备。
+func (s *Store) CleanExpiredTrustedDevices(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_trusted_device WHERE expires_at < ?`, ts(time.Now()))
+	return err
+}
+
+// DeleteOtherSessions 删除该账号除指定会话外的全部会话（改密码后把其它设备踢下线）。
+func (s *Store) DeleteOtherSessions(ctx context.Context, userID int64, keepTokenHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_session WHERE user_id=? AND token_hash<>?`, userID, keepTokenHash)
+	return err
+}
+
+// DeleteUserSessions 删除该账号的全部会话（管理员重置密码 / 二次验证时使用）。
+func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_session WHERE user_id=?`, userID)
+	return err
+}
+
+// ---------------------------------------------------------------- 应急安全码
+
+// SetSecurityCode 写入新的安全码哈希。
+//
+// 会先清空旧记录——一是保证「同时只有一枚有效安全码」，二是让「应急登录用掉旧码」
+// 与「管理员重新生成」这两件事共用同一条路径，不会出现两枚码同时有效的窗口。
+func (s *Store) SetSecurityCode(ctx context.Context, codeHash string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sys_security_code`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sys_security_code(code_hash,created_at) VALUES(?,?)`,
+		codeHash, ts(time.Now())); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// GetSecurityCode 返回当前安全码的哈希；未设置时返回 ErrNotFound。
+func (s *Store) GetSecurityCode(ctx context.Context) (string, error) {
+	var h string
+	err := s.db.QueryRowContext(ctx, `SELECT code_hash FROM sys_security_code ORDER BY id DESC LIMIT 1`).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return h, err
+}
+
+// ClearSecurityCode 清空安全码（没有任何有效安全码时，应急登录不可用）。
+func (s *Store) ClearSecurityCode(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sys_security_code`)
 	return err
 }
 
@@ -399,6 +712,14 @@ func (s *Store) AllSettings(ctx context.Context) (map[string]string, error) {
 
 // ---------------------------------------------------------------- 备份记录
 
+// 备份记录类型。快照与备份同表存放，靠该字段分流：
+// 备份列表只显示 manual/imported，快照列表只显示 auto。
+const (
+	BackupKindManual   = "manual"   // 用户主动创建的全量备份
+	BackupKindImported = "imported" // 用户从外部导入的备份文件
+	BackupKindAuto     = "auto"     // 关键配置操作前自动留下的配置快照
+)
+
 type BackupRecord struct {
 	ID         int64     `json:"id"`
 	Filename   string    `json:"filename"`
@@ -424,10 +745,30 @@ func (s *Store) CreateBackupRecord(ctx context.Context, r *BackupRecord) error {
 	return nil
 }
 
-// ListBackups 返回备份记录。
+// ListBackups 返回备份记录（含自动快照，调用方按 kind 自行区分）。
 func (s *Store) ListBackups(ctx context.Context) ([]BackupRecord, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id,filename,size,sha256,kind,note,include_key,created_at FROM backup_record ORDER BY id DESC`)
+	return s.ListBackupsByKind(ctx)
+}
+
+// ListBackupsByKind 按类型返回备份记录，结果按时间倒序。
+//
+// 快照（kind=auto）与用户备份共用 backup_record 表：前者只含配置、可随时回滚，
+// 后者是用户主动存档的全量备份。列表接口靠 kind 分流，
+// 否则每次改一条设备都会冒出一行快照，把真正的备份挤得看不见。
+// 不传 kinds 表示不限类型。
+func (s *Store) ListBackupsByKind(ctx context.Context, kinds ...string) ([]BackupRecord, error) {
+	query := `SELECT id,filename,size,sha256,kind,note,include_key,created_at FROM backup_record`
+	args := make([]any, 0, len(kinds))
+	if len(kinds) > 0 {
+		holders := make([]string, 0, len(kinds))
+		for _, k := range kinds {
+			holders = append(holders, "?")
+			args = append(args, k)
+		}
+		query += ` WHERE kind IN (` + strings.Join(holders, ",") + `)`
+	}
+	query += ` ORDER BY id DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

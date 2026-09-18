@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 package wgback
 
 import (
@@ -29,6 +32,12 @@ type BaselineRoute struct {
 type State struct {
 	// ManagedInterfaces 由本应用创建的接口名。
 	ManagedInterfaces []string `json:"managed_interfaces"`
+	// InterfaceBackends 记录每个接口由哪种数据面实现创建（kernel / userspace）。
+	//
+	// 为什么必须记：内核 wireguard 网卡与用户态 TUN 是两种不同的东西 ——
+	// 换成另一种实现后，同一张网卡既读不到配置也配不上去。记住创建者，
+	// 才能在实现变化时明确地「删掉重建」，而不是抛一句「配置失败」让用户去猜。
+	InterfaceBackends map[string]string `json:"interface_backend,omitempty"`
 	// ManagedPolicyRoutes 本应用写入专用策略路由表的路由及配套 ip rule。
 	// 记录它是为了只清理自己创建的条目，绝不碰别人的规则。
 	ManagedPolicyRoutes []PolicyRoute `json:"managed_policy_routes"`
@@ -140,6 +149,24 @@ func (s *State) UnmarkManaged(name string) {
 		}
 	}
 	s.ManagedInterfaces = out
+	delete(s.InterfaceBackends, name)
+}
+
+// SetInterfaceBackend 记录接口由哪种数据面实现创建。
+func (s *State) SetInterfaceBackend(name, kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.InterfaceBackends == nil {
+		s.InterfaceBackends = map[string]string{}
+	}
+	s.InterfaceBackends[name] = kind
+}
+
+// InterfaceBackend 返回接口的创建者实现；未记录（升级前创建的历史接口）时返回空串。
+func (s *State) InterfaceBackend(name string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.InterfaceBackends[name]
 }
 
 // IsManaged 判断接口是否由本应用创建。

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Package service 承载业务编排：参数校验、审计留痕、触发特权代理收敛。
 package service
 
@@ -40,6 +43,12 @@ type Service struct {
 	// 真正的事件投递在代理进程的收敛引擎里（那里才知道设备上下线），
 	// Web 进程不启动队列，避免同一事件被两个进程各发一遍。
 	notifier *notify.Sender
+
+	// snapshotDir 是配置快照的落盘目录（见 SetSnapshotDir）。
+	// 未设置时自动留档静默跳过，命令行与测试环境因此不受影响。
+	snapshotDir string
+	// snapMu 串行化快照生成：并发改动配置时避免文件名相撞与重复留档。
+	snapMu sync.Mutex
 }
 
 // New 创建服务。

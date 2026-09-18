@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 import { computed, ref } from 'vue'
 import { api } from '@/api/client'
 import type { Health, NetworkCheckResult, NotifyStatus, Overview } from '@/api/types'
@@ -97,16 +100,39 @@ const issues = computed<HealthIssue[]>(() => {
     })
   }
 
-  // ② 标准模式不可用：新建连接会失败，但已有连接可能仍在工作
-  if (h && h.agent_up && !h.kernel_module) {
-    out.push({
-      key: 'kernel',
-      level: 'error',
-      title: '系统未开启标准加速模式',
-      detail: '找不到内核加密网络模块，新建的连接无法工作。',
-      fix: '确认 NAS 系统版本较新（一般 0.9.0 以上），或用「兼容模式」相关选项。',
-      to: 'logs',
-    })
+  // ② 运行模式：标准模式优先，不可用时看兼容模式能否顶上。
+  //    两种都不可用才叫「新建连接一定失败」；兼容模式可用时只提示「用的是备选方案」——
+  //    报成错误会让一台其实工作正常的 NAS 一直顶着红点，用户反而不知道该信哪个。
+  //
+  //    演示模式（内存后端）下整条判断都不适用：那种后端既不碰内核也不碰网卡，
+  //    能力位必然报「无模块、无 TUN」，照真实环境的口径就会得到一条永远成立的结论
+  //    （「新建的连接无法工作」），而演示模式里的连接是模拟正常工作的。
+  //    同上一条的理由：这不是用户需要处理的异常，报出来只会让开发环境常驻一条红点。
+  const demo = h?.backend === 'mock'
+  if (h && h.agent_up && !h.kernel_module && !demo) {
+    if (h.tun_device) {
+      out.push({
+        key: 'compat',
+        level: 'warning',
+        title: '正在使用兼容模式',
+        detail:
+          '系统没有可用的内核加密网络模块，已自动改用兼容模式，连接可以正常工作，速度和资源占用略逊于标准模式。',
+        fix: '无需手动操作；若 NAS 系统升级后支持了内核模块，会自动切回标准模式。',
+        to: 'maintenance',
+      })
+    } else {
+      out.push({
+        key: 'kernel',
+        level: 'error',
+        title: '系统未开启标准加速模式',
+        detail:
+          '既找不到内核加密网络模块，也没有可用的兼容模式（缺少 TUN 设备），新建的连接无法工作。',
+        // 不写具体版本号：这句话写死过「一般 0.9.0 以上」，而能装上本应用的系统早已高于它，
+        // 于是提示变成一句无法执行的废话。现在只说清「去更新系统」，并把反馈路径写明。
+        fix: '这属于系统内核能力问题：请先把 NAS 系统更新到较新版本再试。若更新后仍不支持，请把系统版本与内核版本（uname -r）反馈给我们以便适配。',
+        to: 'logs',
+      })
+    }
   }
 
   // ③ NAS 系统上网路线被本应用占用：唯一可能影响系统网络的情况，最要紧
@@ -121,6 +147,22 @@ const issues = computed<HealthIssue[]>(() => {
         : n.messages?.join('；') || '系统网络自检未通过。',
       fix: '点「立即修复」，或到「系统维护」执行一键修复；本应用只会清理自己造成的残留。',
       repairable: true,
+      to: 'maintenance',
+    })
+  }
+
+  // ③′ 飞牛桌面入口（从桌面点图标那条通道）失效：端口能打开、进程也在跑、日志里
+  //    只有一次启动记录，唯独点图标是 502 —— 这类故障在端口侧的任何检查里都看不出来。
+  //    level 取 error 而不是 warning：这条通道一断，桌面图标是**确定**打不开的，
+  //    不是「待确认」。判定用后端真去连一次 socket 的结果，前端不自己猜。
+  const gw = n?.gateway
+  if (gw?.configured && !gw.ready) {
+    out.push({
+      key: 'gateway',
+      level: 'error',
+      title: '从飞牛桌面点图标打不开本应用（会显示 502）',
+      detail: gw.detail || '飞牛统一网关入口没有就绪，而从飞牛桌面打开走的正是这条通道。',
+      fix: gw.fix || '应用每 15 秒会自动重建一次；若长期如此，请到应用中心重启本应用。',
       to: 'maintenance',
     })
   }

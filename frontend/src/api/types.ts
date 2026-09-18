@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 export interface WgInterface {
   id: number
   name: string
@@ -101,6 +104,12 @@ export interface Status {
   updated_at: string
 }
 
+export interface AuthState {
+  initialized: boolean
+  authenticated: boolean
+  user: User | null
+}
+
 export interface Health {
   agent_up: boolean
   agent_version: string
@@ -118,6 +127,38 @@ export interface User {
   status: number
   last_login_at?: string | null
   created_at: string
+  /** 是否已开启二次验证（密钥本身不会下发，只给这个派生标志） */
+  totp_enabled?: boolean
+}
+
+/** 二次验证状态。 */
+export interface TOTPStatus {
+  enabled: boolean
+  recovery_remaining: number
+}
+
+/** 绑定二次验证所需的密钥与扫码链接（此时尚未生效）。 */
+export interface TOTPSetup {
+  secret: string
+  uri: string
+}
+
+/** 受信任设备：登录时勾选「信任本设备」后登记，30 天内可跳过动态口令。 */
+export interface TrustedDevice {
+  id: number
+  user_id: number
+  name: string
+  src_ip: string
+  created_at: string
+  last_used_at: string
+  expires_at: string
+}
+
+/** 登录第一步的返回：口令正确但还需二次验证时不带用户信息。 */
+export interface LoginChallenge {
+  totp_required?: boolean
+  challenge?: string
+  username?: string
 }
 
 export interface Overview {
@@ -172,6 +213,49 @@ export interface BackupRecord {
   note: string
   include_key: boolean
   created_at: string
+}
+
+/** 配置快照与当前配置之间的一处变化 */
+export interface SnapshotDiffItem {
+  key: string
+  name: string
+  /** 字段级差异说明；新增/删除时为空 */
+  details?: string[]
+}
+
+/** 一类对象的三组变化：新增 / 删除 / 修改 */
+export interface SnapshotDiffSection {
+  added: SnapshotDiffItem[]
+  removed: SnapshotDiffItem[]
+  changed: SnapshotDiffItem[]
+}
+
+/** 一条设置项变化（只给键名、不给取值，避免把凭据摊给只读账号） */
+export interface SnapshotSettingDiff {
+  key: string
+}
+
+/** 「快照 → 当前配置」的差异，用于回滚前确认会撤销什么 */
+export interface SnapshotDiff {
+  snapshot_id: number
+  filename: string
+  note: string
+  created_at: string
+  /** 一句话结论，形如「回滚将撤销：连接 +1 -0 ~0」 */
+  summary: string
+  /** 与当前配置完全一致 */
+  empty: boolean
+  interfaces: SnapshotDiffSection
+  peers: SnapshotDiffSection
+  dns: SnapshotDiffSection
+  settings: SnapshotSettingDiff[]
+}
+
+/** 手动留档结果：created=false 表示与最近一份快照一致，未重复留档 */
+export interface SnapshotCreateResult {
+  created: boolean
+  message?: string
+  item?: BackupRecord
 }
 
 /** 可配置的事件通知类型（由后端下发，避免前后端各维护一份清单） */
@@ -278,6 +362,25 @@ export interface AccessIssue {
   to?: string
 }
 
+/**
+ * 飞牛统一网关入口（从飞牛桌面点图标那条通道）的状态。
+ *
+ * 单独成一项的理由：这类故障最容易被误判 —— 端口能打开、进程在跑、日志也正常，
+ * 唯独点桌面图标是 502，差别只在这个 socket 文件上。
+ */
+export interface GatewayEntry {
+  /** 本机确实配置了入口（能定位到应用目录并落点） */
+  configured: boolean
+  /** 入口 socket 的路径 */
+  path: string
+  /** socket 文件在、且确实有人在监听（后端真去连了一次） */
+  ready: boolean
+  /** 不可用时的事实说明 */
+  detail?: string
+  /** 不可用时的处置办法 */
+  fix?: string
+}
+
 export interface NetworkCheckResult {
   healthy: boolean
   route_info_readable: boolean
@@ -293,6 +396,8 @@ export interface NetworkCheckResult {
   access_issues: AccessIssue[]
   /** 内网域名解析的运行状态 */
   dns: DNSStatus
+  /** 飞牛桌面入口（从桌面点图标那条通道）的状态 */
+  gateway: GatewayEntry
   messages: string[]
 }
 

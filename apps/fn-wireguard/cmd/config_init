@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 # 配置变更前置：校验端口占用（端口固定为 manifest 中声明的 service_port）。
 set -e
 

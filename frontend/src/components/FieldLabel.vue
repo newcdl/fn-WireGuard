@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <template>
   <span class="fnwg-field-label">
     <span class="fnwg-field-label-text">{{ meta.label }}</span>

@@ -1,12 +1,17 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Package config 负责加载 fn-WireGuard 的运行期配置。
 // 配置来源优先级：命令行参数 > TRIM_* 环境变量（fnOS 注入）> 默认值。
 package config
 
 import (
 	"flag"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Config 是 fnwg-web / fnwg-agent 共用的运行期配置。
@@ -39,6 +44,9 @@ type Config struct {
 	// Timezone 仅用于日志展示，留空使用系统时区。
 	Timezone string
 
+	// LogLevel 控制日志详细程度：debug / info / warn / error，默认 info。
+	LogLevel string
+
 	// Once 仅用于 fnwg-agent：执行一次收敛后退出（便于排查与脚本化）。
 	Once bool
 	// Cleanup 仅用于 fnwg-agent：删除本应用创建的全部内核对象后退出（停用/卸载使用）。
@@ -60,6 +68,7 @@ func Load(args []string) *Config {
 		SocketPath: "",
 		Dev:        false,
 		Timezone:   envOr("TRIM_SYS_LANGUAGE", ""),
+		LogLevel:   envOr("FNWG_LOG_LEVEL", "info"),
 	}
 
 	fs := flag.NewFlagSet("fnwg", flag.ContinueOnError)
@@ -74,6 +83,7 @@ func Load(args []string) *Config {
 	fs.BoolVar(&c.Dev, "dev", false, "开发模式：使用内存后端，不连接特权代理")
 	fs.BoolVar(&c.Once, "once", false, "只执行一次收敛后退出（fnwg-agent）")
 	fs.BoolVar(&c.Cleanup, "cleanup", false, "删除本应用创建的全部网络对象后退出（fnwg-agent）")
+	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "日志级别：debug / info / warn / error")
 	_ = fs.Parse(args)
 
 	if c.Port == 0 {
@@ -83,6 +93,25 @@ func Load(args []string) *Config {
 		c.SocketPath = filepath.Join(c.VarDir, "agent.sock")
 	}
 	return c
+}
+
+// SlogLevel 把 LogLevel 文本转成 slog 级别，无法识别时回退 info。
+//
+// 之所以要有这个开关：像「请求到底有没有到达服务端」这类问题，只有 Debug 级的
+// 访问日志（见 api.accessLog）能回答，而它平时必须保持关闭 —— 每个请求记一行
+// 会把真正重要的日志淹掉。做成运行期可调，排障时改一行 systemd 环境变量即可，
+// 不必为了看一眼请求轨迹重新打包发版。
+func (c *Config) SlogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // DBPath 返回 SQLite 数据库文件路径。
@@ -97,6 +126,50 @@ func (c *Config) NetStatePath() string { return filepath.Join(c.VarDir, "netstat
 
 // LogDir 返回日志目录。
 func (c *Config) LogDir() string { return filepath.Join(c.VarDir, "log") }
+
+// AppSockFile 是飞牛统一网关约定的 socket 文件名。
+//
+// 官方要求 gatewaySocket 只填文件名（不能带路径），且文件必须落在应用的
+// target 目录下，因此这里只暴露文件名，路径由 AppSockPath 拼出来。
+const AppSockFile = "app.sock"
+
+// AppSockPath 返回飞牛统一网关使用的 Unix Socket 路径。
+//
+// 位置由网关约定：必须是应用 target 目录下的 app.sock，写成别处网关就找不到。
+// 取址顺序是「显式传入的 --appdest / TRIM_APPDEST → 可执行文件所在目录」。
+//
+// 为什么必须有第二级兜底：二进制本身就装在 target 目录里，所以「可执行文件在哪，
+// socket 就在哪」恒成立；而 TRIM_APPDEST 只存在于安装/配置脚本的进程环境里，
+// **systemd 不会继承它**。只认 TRIM_APPDEST 的话，服务由 systemd 拉起时会退化成
+// 「相对当前工作目录」——systemd 下即 /，普通用户无权在那里建 socket，bind 直接失败，
+// 最终表现为「从飞牛桌面点图标只有 502」，而日志里只有一句容易被忽略的警告。
+func (c *Config) AppSockPath() string {
+	if dir := c.appDestDir(); dir != "" {
+		return filepath.Join(dir, AppSockFile)
+	}
+	return ""
+}
+
+// appDestDir 返回应用 target 目录；两种来源都拿不到时返回空串。
+func (c *Config) appDestDir() string {
+	if d := strings.TrimSpace(c.AppDest); filepath.IsAbs(d) {
+		return d
+	}
+	// 回退到可执行文件目录。先解析软链：网关找的是真实 target 目录，
+	// 而不是软链所在的位置（fnOS 会在 /usr/local/bin 下建软链）。
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	dir := filepath.Dir(exe)
+	if dir == "" || dir == "." || dir == string(filepath.Separator) {
+		return ""
+	}
+	return dir
+}
 
 // ShareDir 返回面向用户的共享导出目录（fnOS data-share）。
 // 优先使用 fnOS 依据 config/resource 创建的共享目录，其次回退到 var/share。

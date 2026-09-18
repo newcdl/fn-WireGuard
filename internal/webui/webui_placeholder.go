@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 //go:build !embedui
 
 // Package webui 的默认（开发）实现：不内嵌任何前端产物，

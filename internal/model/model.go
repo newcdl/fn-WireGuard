@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Package model 定义贯穿数据层、收敛引擎与 API 的领域模型。
 package model
 
@@ -323,6 +326,69 @@ type User struct {
 	Status       int        `json:"status"` // 1 启用 0 禁用
 	LastLoginAt  *time.Time `json:"last_login_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
+	// TOTPEnabled 是派生给人看的字段：TOTPSecret 本身必须用 `json:"-"` 隐藏
+	// （它落在 /users 响应里就等于把二次验证密钥泄给了任何能读账号列表的人），
+	// 但「这个账号有没有开二次验证」需要让管理员看得到。
+	// 由 store 在扫描时按 TOTPSecret 是否为空填充，不是数据库列。
+	TOTPEnabled bool `json:"totp_enabled"`
+}
+
+// GatewayEntry 描述飞牛统一网关入口（从飞牛桌面点图标那条通道）此刻的状态。
+//
+// 单独成一个自检项的理由：这类故障最容易被误判 —— 端口能打开、进程在跑、
+// 日志里也一切正常，唯独从飞牛桌面点图标是 502，差别只在这个 socket 文件上。
+// 不主动报出来，用户就只能对着一个无法解释的 502 猜。
+type GatewayEntry struct {
+	// Configured 表示本机确实配置了网关入口（能定位到应用目录并落点）。
+	// 为 false 时界面不作任何断言：这台机器可能根本不走这条通道。
+	Configured bool `json:"configured"`
+	// Path 是入口 socket 的路径。
+	Path string `json:"path"`
+	// Ready 表示 socket 文件在、且确实有人在监听（判定方式是真去连一次）。
+	Ready bool `json:"ready"`
+	// Detail 是面向用户的事实说明；正常时为空。
+	Detail string `json:"detail,omitempty"`
+	// Fix 是不可用时的处置办法；正常时为空。
+	Fix string `json:"fix,omitempty"`
+}
+
+// TOTPChallenge 是一次二次验证登录挑战。
+//
+// 口令校验通过、动态口令尚未校验的这段时间里没有会话，只有这条挑战记录；
+// 因此它必须短命（见 service 里的 TTL）且只能用一次。
+type TOTPChallenge struct {
+	TokenHash string
+	UserID    int64
+	ExpiresAt time.Time
+	Attempts  int
+	CreatedAt time.Time
+}
+
+// RecoveryCode 是一条恢复码记录（只含哈希，明文不落库）。
+type RecoveryCode struct {
+	ID        int64
+	UserID    int64
+	CodeHash  string
+	UsedAt    *time.Time
+	CreatedAt time.Time
+}
+
+// TrustedDevice 是一条「受信任设备」记录：用户在二次验证界面勾选「信任本设备」后
+// 下发给该设备的凭据，之后从这台设备登录可跳过动态口令。
+//
+// 只保存令牌的 SHA-256，明文仅在签发时返回一次。Name / SrcIP 是给用户看的——
+// 用户要靠它们判断列表里有没有自己不认识的设备，从而发现异常登录。
+type TrustedDevice struct {
+	ID     int64  `json:"id"`
+	UserID int64  `json:"user_id"`
+	Name   string `json:"name"`
+	SrcIP  string `json:"src_ip"`
+	// TokenHash 只用于落库与比对，绝不出现在接口响应里
+	// （与 User.PasswordHash 同样的处理方式）。
+	TokenHash  string    `json:"-"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastUsedAt time.Time `json:"last_used_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 // Session 是登录会话。

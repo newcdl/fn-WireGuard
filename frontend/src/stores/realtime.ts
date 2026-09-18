@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 import { defineStore } from 'pinia'
+import { wsURL } from '@/api/base'
 import type { Status } from '@/api/types'
 
 let socket: WebSocket | null = null
@@ -16,10 +20,10 @@ export const useRealtime = defineStore('realtime', {
       if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
         return
       }
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-      const url = `${proto}://${location.host}/api/v1/ws`
+      // 地址由 base.ts 统一拼：网关下 WebSocket 与接口共用同一入口前缀，
+      // 写死 /api/v1/ws 会在网关里连到 fnOS 系统本身而不是本应用。
       try {
-        socket = new WebSocket(url)
+        socket = new WebSocket(wsURL())
       } catch {
         this.scheduleReconnect()
         return

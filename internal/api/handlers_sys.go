@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 package api
 
 import (
@@ -8,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"fnwg"
 	"fnwg/internal/model"
 	"fnwg/internal/service"
 )
@@ -20,7 +24,20 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	out := map[string]any{"initialized": initialized, "authenticated": false, "user": nil}
+	out := map[string]any{
+		"initialized":   initialized,
+		"authenticated": false,
+		"user":          nil,
+		// 正在运行的版本。放在这个免登录接口上，是为了让安装/升级脚本在收尾时
+		// 能核对「设备上真正在跑的就是刚装上去的那个版本」——
+		// 版本号是构建时从 manifest 编译进二进制的，读得到就一定准。
+		// 少了这个自查，「升级成功了但仍在跑旧版本」只能靠用户事后猜。
+		"version": s.version,
+		// 网关入口（飞牛桌面图标那条通道）是否已监听。与登录无关，
+		// 是给安装/升级脚本用的：只看端口就报「安装成功」，
+		// 用户点桌面图标才发现是 502（见 apps/fn-wireguard/cmd/common 的 fnwg_gateway_check）。
+		"socket_ready": s.gatewaySocketReady(),
+	}
 	if !initialized {
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -46,13 +63,80 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	token, _, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
+	step, err := s.svc.Login(r.Context(), service.LoginInput{
+		Username:  in.Username,
+		Password:  in.Password,
+		UserAgent: r.UserAgent(),
+		SrcIP:     clientIP(r),
+	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.setSessionCookie(w, token)
-	writeJSON(w, http.StatusOK, u)
+	if step.TOTPRequired() {
+		// 账号是刚刚创建的，不可能已开启二次验证；走到这里说明数据被外部改动过
+		writeErr(w, http.StatusInternalServerError, "账号状态异常，请手动登录")
+		return
+	}
+	s.setSessionCookie(w, step.Token)
+	out := map[string]any{"user": u}
+	// 初始化时同时下发一枚安全码：它是所有登录途径都失效时的最后入口，
+	// 必须在这一刻交给用户保存，否则将来无处可取。
+	if code, codeErr := s.svc.IssueSecurityCode(r.Context(), service.Actor{Username: in.Username}); codeErr != nil {
+		// 生成失败不该阻断初始化（账号已经建好了），但必须如实告知，
+		// 不能让用户以为自己已经拿到了后手。稍后可在「账号管理」里重新生成。
+		out["security_code_error"] = "安全码生成失败，请稍后到「账号管理」重新生成：" + codeErr.Error()
+	} else {
+		out["security_code"] = code
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleEmergencyLogin 用安全码应急登录（无需登录态，因为此时通常已经登不进来了）。
+func (s *Server) handleEmergencyLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Code        string `json:"code"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 与常规登录共用一套失败限流：安全码虽然强度极高，但没理由让它可以被无限次尝试。
+	key := "emergency|" + clientIP(r)
+	if s.loginBlocked(key) {
+		writeErr(w, http.StatusTooManyRequests, "尝试次数过多，请 5 分钟后再试")
+		return
+	}
+	res, err := s.svc.EmergencyLogin(r.Context(), in.Code, in.NewPassword, r.UserAgent(), clientIP(r), actorOf(r))
+	if err != nil {
+		s.recordLoginFail(key)
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	s.clearLoginFail(key)
+	s.setSessionCookie(w, res.Token)
+	writeJSON(w, http.StatusOK, map[string]any{"user": res.User, "new_code": res.NewCode})
+}
+
+// handleSecurityCodeState 返回是否已设置安全码（不返回安全码本身，它无法取回）。
+func (s *Server) handleSecurityCodeState(w http.ResponseWriter, r *http.Request) {
+	configured, err := s.svc.SecurityCodeConfigured(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"configured": configured})
+}
+
+// handleIssueSecurityCode 重新生成安全码（旧码立即作废），返回新码明文。
+func (s *Server) handleIssueSecurityCode(w http.ResponseWriter, r *http.Request) {
+	code, err := s.svc.IssueSecurityCode(r.Context(), actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"code": code})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -69,15 +153,227 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "登录失败次数过多，请 5 分钟后再试")
 		return
 	}
-	token, u, err := s.svc.Login(r.Context(), in.Username, in.Password, r.UserAgent(), clientIP(r))
+	step, err := s.svc.Login(r.Context(), service.LoginInput{
+		Username:    in.Username,
+		Password:    in.Password,
+		DeviceToken: extractDeviceToken(r),
+		UserAgent:   r.UserAgent(),
+		SrcIP:       clientIP(r),
+	})
 	if err != nil {
 		s.recordLoginFail(key)
 		writeErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+	if step.TOTPRequired() {
+		// 口令正确但还需二次验证：这里**绝不能设 Cookie**，
+		// 否则「只过了一半」的登录就变成了已登录。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"totp_required": true,
+			"challenge":     step.Challenge,
+			"username":      in.Username,
+		})
+		return
+	}
 	s.clearLoginFail(key)
-	s.setSessionCookie(w, token)
-	writeJSON(w, http.StatusOK, u)
+	s.setSessionCookie(w, step.Token)
+	writeJSON(w, http.StatusOK, step.User)
+}
+
+// handleLoginTOTP 是登录的第二步：用登录挑战 + 动态口令（或恢复码）换取会话。
+func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Challenge   string `json:"challenge"`
+		Code        string `json:"code"`
+		TrustDevice bool   `json:"trust_device"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 失败计数归到「IP+账号」这个键上，与密码那一步共用一套限流：
+	// 动态口令只有 6 位，若不限流，拿到口令的人可以靠反复重试撞开。
+	key := ""
+	if name, ok := s.svc.TOTPChallengeUser(r.Context(), in.Challenge); ok {
+		key = clientIP(r) + "|" + name
+		if s.loginBlocked(key) {
+			writeErr(w, http.StatusTooManyRequests, "登录失败次数过多，请 5 分钟后再试")
+			return
+		}
+	}
+	step, err := s.svc.CompleteTOTPLogin(r.Context(), in.Challenge, in.Code, in.TrustDevice, r.UserAgent(), clientIP(r))
+	if err != nil {
+		if key != "" {
+			s.recordLoginFail(key)
+		}
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if key != "" {
+		s.clearLoginFail(key)
+	}
+	// 勾选了「信任本设备」时下发设备令牌；没勾选时不碰这个 Cookie，
+	// 免得把上一次的信任状态莫名清掉（用户可能只是这次不想勾）。
+	if step.DeviceToken != "" {
+		s.setDeviceCookie(w, step.DeviceToken, step.DeviceExpiresAt)
+	}
+	s.setSessionCookie(w, step.Token)
+	writeJSON(w, http.StatusOK, step.User)
+}
+
+// handleTOTPStatus 返回当前账号的二次验证状态。
+func (s *Server) handleTOTPStatus(w http.ResponseWriter, r *http.Request) {
+	u := userOf(r)
+	st, err := s.svc.TOTPStatusOf(r.Context(), u.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// handleTOTPSetup 生成绑定密钥与 otpauth 扫码链接（此时尚未生效）。
+func (s *Server) handleTOTPSetup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.svc.BeginTOTPSetup(r.Context(), userOf(r).ID, in.Password, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleTOTPEnable 用一次有效动态口令确认绑定并正式开启，返回一次性恢复码。
+func (s *Server) handleTOTPEnable(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+		Secret   string `json:"secret"`
+		Code     string `json:"code"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	codes, err := s.svc.EnableTOTP(r.Context(), userOf(r).ID, in.Password, in.Secret, in.Code, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"recovery_codes": codes})
+}
+
+// handleTOTPDisable 关闭二次验证（需当前口令 + 一次动态口令或恢复码）。
+func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.svc.DisableTOTP(r.Context(), userOf(r).ID, in.Password, in.Code, actorOf(r)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 关闭二次验证会作废全部受信任设备，本地 Cookie 一起清掉。
+	s.clearDeviceCookie(w)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleListTrustedDevices 列出当前账号的受信任设备。
+func (s *Server) handleListTrustedDevices(w http.ResponseWriter, r *http.Request) {
+	u := userOf(r)
+	list, err := s.svc.ListTrustedDevices(r.Context(), u.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": list})
+}
+
+// handleRevokeTrustedDevice 撤销一台受信任设备。
+func (s *Server) handleRevokeTrustedDevice(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	if err := s.svc.RevokeTrustedDevice(r.Context(), userOf(r).ID, id, actorOf(r)); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
+}
+
+// handleRevokeAllTrustedDevices 撤销当前账号的全部受信任设备。
+func (s *Server) handleRevokeAllTrustedDevices(w http.ResponseWriter, r *http.Request) {
+	u := userOf(r)
+	if err := s.svc.RevokeAllTrustedDevices(r.Context(), u.ID, actorOf(r)); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.clearDeviceCookie(w)
+	writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
+}
+
+// handleResetUserTOTP 管理员重置某个账号的二次验证。
+func (s *Server) handleResetUserTOTP(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	if err := s.svc.ResetUserTOTP(r.Context(), id, actorOf(r)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleAdminUserTOTPSetup 管理员为某个账号生成二次验证绑定信息（尚未生效）。
+//
+// 用于「账号主人自己操作不熟」的场景：管理员把二维码交给对方扫。
+// 这里只生成、不启用 —— 对方扫完报回一次动态口令，再走 enable 才真正开启。
+// 中间那一步不能省：启用了却其实没绑成功，账号主人下次登录就被锁在门外，
+// 而那时他手里既没有验证器、也还没见过恢复码。
+func (s *Server) handleAdminUserTOTPSetup(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.svc.AdminBeginTOTPSetup(r.Context(), id, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleAdminUserTOTPEnable 管理员用一次动态口令确认绑定并正式开启，返回一次性恢复码。
+func (s *Server) handleAdminUserTOTPEnable(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Secret string `json:"secret"`
+		Code   string `json:"code"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	codes, err := s.svc.AdminEnableTOTP(r.Context(), id, in.Secret, in.Code, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"recovery_codes": codes})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -112,10 +408,13 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userOf(r)
-	if err := s.svc.ChangePassword(r.Context(), u.ID, in.OldPassword, in.NewPassword, actorOf(r)); err != nil {
+	// 传入当前会话令牌：改密码会登出其它设备，但必须保留正在操作的这一台。
+	if err := s.svc.ChangePassword(r.Context(), u.ID, in.OldPassword, in.NewPassword, extractToken(r), actorOf(r)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 改密码已作废全部受信任设备，本地这枚 Cookie 也就失效了，顺手清掉。
+	s.clearDeviceCookie(w)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -133,6 +432,41 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name: "fnwg_token", Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
+	})
+}
+
+// deviceCookieName 是「信任本设备」的设备令牌 Cookie 名。
+//
+// 刻意与会话 Cookie 分开：退出登录**不应该**清掉设备信任，
+// 否则「记住本设备」就退化成「只在当前会话内免验证」，功能等于白做。
+const deviceCookieName = "fnwg_device"
+
+// extractDeviceToken 读取受信任设备令牌。
+func extractDeviceToken(r *http.Request) string {
+	if c, err := r.Cookie(deviceCookieName); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
+func (s *Server) setDeviceCookie(w http.ResponseWriter, token string, expires time.Time) {
+	maxAge := int(time.Until(expires).Seconds())
+	if maxAge <= 0 {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     deviceCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+}
+
+func (s *Server) clearDeviceCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: deviceCookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
 	})
 }
 
@@ -159,6 +493,9 @@ func (s *Server) handleNetworkCheck(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 网关入口属于本进程的事实（socket 落在哪、现在还在不在），自检结果里补上这一段：
+	// 「端口一切正常、只有飞牛桌面点图标 502」时，这是唯一能说清原因的地方。
+	res.Gateway = s.gatewayEntryStatus()
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -421,7 +758,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------- 备份
 
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
-	items, err := s.svc.ListBackups(r.Context())
+	items, err := s.svc.ListUserBackups(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -511,4 +848,18 @@ func atoiDefault(v string, def int) int {
 		return def
 	}
 	return n
+}
+
+// ---------------------------------------------------------------- 开源许可
+
+// handleLicenses 返回本应用的许可信息：「关于」页的「开源许可」据此展示。
+//
+// 文本取自二进制内嵌的内容（见根目录 licenses.go），不读磁盘也不依赖网络：
+// 安装包里只有 apps 侧的 COPYING，而界面要同时给出 GPL 全文与第三方清单，
+// 内嵌是唯一不会出现「装了什么、显示什么」对不上的做法。
+func (s *Server) handleLicenses(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"license":     fnwg.GPLText,
+		"third_party": fnwg.ThirdPartyLicenses,
+	})
 }

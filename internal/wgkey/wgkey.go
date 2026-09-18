@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Package wgkey 负责 Curve25519 密钥与预共享密钥的生成与校验。
 // 仅依赖标准库，便于在任意平台进行单元测试。
 package wgkey

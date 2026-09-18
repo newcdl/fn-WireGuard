@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 小柿子 <newxsz@163.com>
+
 // Package wgback 抽象 WireGuard 数据面后端。
 //
 // 设计要点：

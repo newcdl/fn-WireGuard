@@ -4,9 +4,10 @@
             "title": "WireGuard 管理工具",
             "icon": "images/icon_{0}.png",
             "type": "iframe",
-            "protocol": "http",
-            "port": "34567",
-            "url": "/",
+            "protocol": "",
+            "gatewayPrefix": "/app/fn-wireguard",
+            "gatewaySocket": "app.sock",
+            "url": "/app/fn-wireguard",
             "allUsers": true
         }
     }

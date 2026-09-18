@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
+
 <template>
   <div>
     <!-- 总体状态：任意页面看到的红/黄/绿与这里完全同源（useSystemHealth） -->
@@ -96,6 +99,51 @@
           </span>
         </el-descriptions-item>
       </el-descriptions>
+    </div>
+
+    <!-- 分组一之二：飞牛桌面入口
+         「端口能打开、从飞牛桌面点图标却 502」时，差别只有这个 socket 文件，
+         而端口侧的任何检查都看不出这件事。这一组就是为了让那种故障有地方说话。 -->
+    <div class="fnwg-card">
+      <div class="fnwg-card-head">
+        <div>
+          <strong>飞牛桌面入口</strong>
+          <span class="fnwg-card-desc">
+            从飞牛桌面点本应用的图标，走的是应用目录下的一个 socket 文件。它没建立起来时，
+            桌面图标会显示 502，而 IP:端口 仍然完全正常 —— 只看端口是查不出这件事的。
+          </span>
+        </div>
+        <el-tag
+          v-if="net?.gateway"
+          size="small"
+          :type="net.gateway.ready ? 'success' : net.gateway.configured ? 'danger' : 'info'"
+          effect="plain"
+        >
+          {{ net.gateway.ready ? '正常' : net.gateway.configured ? '未就绪' : '未配置' }}
+        </el-tag>
+      </div>
+
+      <div v-if="!net" class="fnwg-hint">暂无数据，点击上方「立即体检」。</div>
+      <template v-else>
+        <div class="fnwg-hint">
+          socket 路径：<span class="fnwg-mono">{{ net.gateway?.path || '未知' }}</span>
+        </div>
+        <div v-if="net.gateway?.ready" class="fnwg-hint">
+          入口正常：从飞牛桌面点图标可以打开本应用（进去后照常要用本应用账号登录）。
+        </div>
+        <div v-else class="fnwg-nat-check">
+          <el-tag size="small" :type="net.gateway?.configured ? 'danger' : 'info'" effect="plain">
+            {{ net.gateway?.configured ? '未就绪' : '未配置' }}
+          </el-tag>
+          <div class="fnwg-nat-check-body">
+            <strong>
+              {{ net.gateway?.configured ? '从飞牛桌面点图标会显示 502' : '本机未建立飞牛桌面入口' }}
+            </strong>
+            <div class="fnwg-nat-check-detail">{{ net.gateway?.detail }}</div>
+            <div v-if="net.gateway?.fix" class="fnwg-issue-fix">处理建议：{{ net.gateway.fix }}</div>
+          </div>
+        </div>
+      </template>
     </div>
 
     <!-- 分组二：内网访问链路逐层诊断 -->
@@ -207,7 +255,7 @@
         </el-descriptions-item>
         <el-descriptions-item label="工作模式">{{ backendLabel }}</el-descriptions-item>
         <el-descriptions-item label="加密网络支持">
-          <el-tag size="small" :type="health?.kernel_module ? 'success' : 'danger'" effect="plain">
+          <el-tag size="small" :type="kernelTagType" effect="plain">
             {{ health?.kernel_module ? '已开启' : '未开启' }}
           </el-tag>
         </el-descriptions-item>
@@ -228,8 +276,8 @@
         style="margin-top: 12px"
       />
       <div class="fnwg-explain">
-        <div><strong>加密网络支持</strong>：标准模式，速度最快、资源占用最低。显示「未开启」时新建的连接无法工作。</div>
-        <div><strong>兼容模式支持</strong>：内核不支持标准模式时的备选方案，速度稍慢，目前版本尚未启用。</div>
+        <div><strong>加密网络支持</strong>：标准模式，速度最快、资源占用最低。显示「未开启」时若兼容模式可用，会自动改用兼容模式。</div>
+        <div><strong>兼容模式支持</strong>：内核不支持标准模式时的备选方案，功能完整、速度与资源占用略逊；两项都不可用时新建的连接无法工作。</div>
       </div>
     </div>
   </div>
@@ -275,6 +323,12 @@ const netAlert = computed<{ type: 'success' | 'warning' | 'error'; title: string
 const backendLabel = computed(() => {
   const b = health.value?.backend
   return ({ kernel: '标准模式', userspace: '兼容模式', mock: '演示模式' } as Record<string, string>)[b || ''] || b || '-'
+})
+
+// 内核模块没开不等于「不可用」：兼容模式能顶上时是警告级，只有两条路都断了才是红色。
+const kernelTagType = computed(() => {
+  if (health.value?.kernel_module) return 'success'
+  return health.value?.tun_device ? 'warning' : 'danger'
 })
 
 const uptime = computed(() => {
