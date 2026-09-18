@@ -89,11 +89,12 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 	if username == "" {
 		return nil, errors.New("用户名不能为空")
 	}
-	// 冒号保留给外部身份映射自动生成的账号名（如 nas:1000）。
-	// 不允许自建账号使用，否则「外部身份」与「本地账号」会共用同一个命名空间，
-	// 迟早撞在同一个用户名上。
+	// 冒号保留给历史上由飞牛账号免密登录自动创建的账号名（nas:<uid>）。
+	// 那套映射已在 0.8.20 移除，但老数据库里可能还留着这类账号（升级时会被清理，
+	// 从老库导出的备份若被恢复也可能带回来）。自建账号继续避开这个前缀，
+	// 清理逻辑就能一直安全地按 nas:* 判定。
 	if strings.Contains(username, ":") {
-		return nil, errors.New("用户名不能包含冒号（保留给飞牛账号映射使用）")
+		return nil, errors.New("用户名不能包含冒号（「nas:」前缀保留给历史账号使用）")
 	}
 	switch role {
 	case model.RoleAdmin, model.RoleOperator, model.RoleViewer:
@@ -112,19 +113,9 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 	return u, nil
 }
 
-// ListUsers 返回账号列表，并给每个账号标上来源与展示名。
-//
-// 装饰放在 service 而不是 store：来源要查网关映射表，是「账号 + 映射」两边的信息，
-// 属于业务拼装，不该让存储层认识网关。
+// ListUsers 返回账号列表。
 func (s *Service) ListUsers(ctx context.Context) ([]model.User, error) {
-	users, err := s.Store.ListUsers(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for i := range users {
-		s.decorateUserSource(ctx, &users[i])
-	}
-	return users, nil
+	return s.Store.ListUsers(ctx)
 }
 
 // UpdateUser 修改账号角色或状态（管理员操作）。
@@ -132,13 +123,6 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role string, status 
 	u, err := s.Store.GetUser(ctx, id)
 	if err != nil {
 		return err
-	}
-	// 飞牛账号的密码不归本应用管（见 gatewayPasswordRefusal）。
-	// 角色和状态照样允许改：停用一个飞牛账号是有效的 —— 网关那侧会拒绝它登录，
-	// 只有「设密码」这件事无论如何都不会生效。
-	if password != "" && s.IsGatewayUser(ctx, id) {
-		s.audit(ctx, a, "user.update", "user", fmt.Sprint(id), "", "", "deny", "飞牛账号的密码由飞牛统一管理")
-		return errors.New(gatewayPasswordRefusal)
 	}
 	if role != "" {
 		u.Role = role
@@ -202,12 +186,6 @@ func (s *Service) ChangePassword(ctx context.Context, id int64, oldPw, newPw, cu
 	u, err := s.Store.GetUser(ctx, id)
 	if err != nil {
 		return err
-	}
-	// 飞牛账号没有「自己的口令」可改（见 gatewayPasswordRefusal）：
-	// 它的口令是映射时写入的占位值，本人的登录走网关免密、从不比对它。
-	if s.IsGatewayUser(ctx, id) {
-		s.audit(ctx, a, "user.change_password", "user", fmt.Sprint(id), "", "", "deny", "飞牛账号的密码由飞牛统一管理")
-		return errors.New(gatewayPasswordRefusal)
 	}
 	if !VerifyPassword(oldPw, u.PasswordHash) {
 		s.audit(ctx, a, "user.change_password", "user", fmt.Sprint(id), "", "", "deny", "原密码错误")
@@ -322,10 +300,6 @@ func (s *Service) trustedDeviceOK(ctx context.Context, u *model.User, deviceToke
 
 // issueSession 为已通过全部校验的账号签发会话。
 func (s *Service) issueSession(ctx context.Context, u *model.User, ua, ip string) (*LoginStep, error) {
-	// 登录返回的这份账号对象会被前端直接拿去渲染顶栏，所以来源与展示名要在这里补上：
-	// 补晚了，前端只能先显示内部的 nas:<uid>、等下一次 /auth/me 才变成飞牛账号名，
-	// 用户会看到自己的名字在打开界面的一瞬间跳一下。
-	s.decorateUserSource(ctx, u)
 	token := newToken(32)
 	sess := &model.Session{
 		TokenHash: hashToken(token),
@@ -368,8 +342,5 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*model.User, 
 	if sess == nil || u.Status != 1 {
 		return nil, errors.New("账号不可用")
 	}
-	// 一次按 user_id 的索引查询，代价可忽略；换来的是「无论界面从哪个接口取账号，
-	// 拿到的都是能认出来的名字」这个统一保证。
-	s.decorateUserSource(ctx, u)
 	return u, nil
 }

@@ -328,22 +328,6 @@ type User struct {
 	// 但「这个账号有没有开二次验证」需要让管理员看得到。
 	// 由 store 在扫描时按 TOTPSecret 是否为空填充，不是数据库列。
 	TOTPEnabled bool `json:"totp_enabled"`
-
-	// 以下三个同样是派生字段（不是数据库列），由 service 层在返回给界面时填充。
-	//
-	// Source 是账号来源：SourceGateway（由飞牛账号映射而来）或 SourceLocal（应用内自建）。
-	// 界面靠它决定「改密码」这类操作该不该显示 —— 飞牛账号的密码由飞牛管，
-	// 给它一个改密码按钮比不给更糟：用户会以为改了能生效，实际上改完也登不进来。
-	//
-	// DisplayName 是给界面看的名字。飞牛账号的 Username 是 nas:<uid> 这种映射锚点，
-	// 是用户从未设置过、也无法识别的名字，直接显示出来等于让他对着编号发呆；
-	// 飞牛那边叫什么，这里就显示什么。本地账号的 DisplayName 就是 Username 本身，
-	// 前端因此可以一律用 display_name ?? username 渲染，不必分情况。
-	//
-	// TrimUID 只在飞牛账号上有值，供界面标注「飞牛账号 1000」这类可核对的信息。
-	Source      string `json:"source,omitempty"`
-	DisplayName string `json:"display_name,omitempty"`
-	TrimUID     string `json:"trim_uid,omitempty"`
 }
 
 // TOTPChallenge 是一次二次验证登录挑战。

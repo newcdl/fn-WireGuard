@@ -121,18 +121,6 @@ func (s *Service) SetSettings(ctx context.Context, kv map[string]string, a Actor
 	if err := normalizeNotifySettings(kv); err != nil {
 		return err
 	}
-	// 登录方式必须走它自己的入口：那条路径带「防止把自己锁在门外」的校验
-	// （没验证过网关可用就不许关闭端口登录）。通用设置接口若也能写这个键，
-	// 那道校验就形同虚设 —— 前端不展示它，不代表服务端可以接受它。
-	if v, ok := kv[SettingLoginMode]; ok {
-		delete(kv, SettingLoginMode)
-		if err := s.SetLoginMode(ctx, v, a); err != nil {
-			return err
-		}
-		if len(kv) == 0 {
-			return nil
-		}
-	}
 	// 只记键名不记取值：设置里包含通知地址这类带令牌的敏感内容，
 	// 写进审计等于把凭据交给每个能查审计的人。快照同理，备注里也只给键名。
 	changed := make([]string, 0, len(kv))

@@ -158,3 +158,101 @@ func TestNetworkSafetyMigration(t *testing.T) {
 		t.Fatal("安全迁移应记录一条日志，便于用户了解配置被调整过")
 	}
 }
+
+// TestGatewayRemovalMigration 回归「移除免密登录后，旧库里的残留账号不会留下来」。
+//
+// 免密登录自动创建的 nas:<uid> 账号，口令散列是格式非法的占位值，且旧版本拒绝给它改密码 ——
+// 免密一走它就永远登不进来。升级后如果还留在账号列表里，管理员会看到一个既解释不清、
+// 也用不上的账号，这正是「删功能要删干净」最容易漏掉的一环。
+//
+// 同时确认：自建账号与审计记录都不受影响（审计只记 user_id/username，没有外键）。
+func TestGatewayRemovalMigration(t *testing.T) {
+	dir := t.TempDir()
+	box, err := secretbox.New(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, "gateway.db")
+
+	st, err := store.Open(dbPath, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// 模拟 0.8.19 的库：一个自建管理员、两个免密映射账号、映射表，以及一条历史审计。
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO sys_user(id,username,password_hash,role,status,created_at)
+		 VALUES(1,'admin','HASH','admin',1,'2026-01-01T00:00:00Z'),
+		       (2,'nas:1000','$fnwg-gateway-placeholder$','admin',1,'2026-01-01T00:00:00Z'),
+		       (3,'nas:1001','$fnwg-gateway-placeholder$','viewer',1,'2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO sys_session(token_hash,user_id,expires_at,created_at) VALUES('H',2,'2030-01-01T00:00:00Z','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO audit_log(ts,user_id,username,action,result) VALUES('2026-01-01T00:00:00Z',2,'nas:1000','user.login','ok')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`CREATE TABLE sys_gateway_identity (
+		   trim_uid TEXT PRIMARY KEY, user_id INTEGER NOT NULL, trim_username TEXT NOT NULL DEFAULT '',
+		   is_admin INTEGER NOT NULL DEFAULT 0, last_seen_at TEXT, created_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO sys_gateway_identity(trim_uid,user_id,is_admin,created_at) VALUES('1000',2,1,'2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重新打开触发迁移
+	st2, err := store.Open(dbPath, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+
+	users, err := st2.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || users[0].Username != "admin" {
+		names := make([]string, 0, len(users))
+		for _, u := range users {
+			names = append(names, u.Username)
+		}
+		t.Fatalf("免密映射账号应被清理、自建账号应保留，实际: %v", names)
+	}
+
+	// 映射表不该再留在库里
+	var name string
+	err = st2.DB().QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='sys_gateway_identity'`).Scan(&name)
+	if err != sql.ErrNoRows {
+		t.Fatalf("映射表应已被删除，查询返回: name=%q err=%v", name, err)
+	}
+
+	// 级联：被删账号的会话一并消失（否则会留下指向不存在账号的会话）
+	var sessions int
+	if err := st2.DB().QueryRowContext(ctx, `SELECT count(*) FROM sys_session`).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 {
+		t.Fatalf("被清理账号的会话应级联删除，实际剩余 %d 条", sessions)
+	}
+
+	// 审计记录必须留下：免密账号进出的痕迹不该因为清理而消失
+	var audits int
+	if err := st2.DB().QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE username='nas:1000'`).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 {
+		t.Fatalf("审计记录不应被账号清理带走，实际剩余 %d 条", audits)
+	}
+}

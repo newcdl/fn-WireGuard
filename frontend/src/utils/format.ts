@@ -51,25 +51,3 @@ export function daysLeft(ts?: string | null): number | null {
   if (Number.isNaN(d.getTime())) return null
   return Math.ceil((d.getTime() - Date.now()) / 86400000)
 }
-
-/**
- * 账号的展示名。
- *
- * 飞牛账号（source=gateway）的 username 是 nas:<uid> 这样的映射锚点，是用户从未
- * 设置过、也认不出来的名字；飞牛那边叫什么，这里就显示什么。本地账号没有
- * display_name，回落成用户名本身 —— 所以调用方一律用它取值，不必分情况。
- */
-export function displayNameOf(u?: { username?: string; display_name?: string } | null): string {
-  return u?.display_name || u?.username || ''
-}
-
-/**
- * 账号是否由飞牛账号映射而来。
- *
- * 用来决定「改密码」「二次验证」这类入口要不要显示：飞牛账号的密码与二次验证
- * 都由飞牛 NAS 统一管理（它从桌面免密进入，不经过本应用的动态口令校验），
- * 在这里给入口只会让人以为改了能生效，而实际上永远用不上。
- */
-export function isGatewayAccount(u?: { source?: string } | null): boolean {
-  return u?.source === 'gateway'
-}

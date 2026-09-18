@@ -206,23 +206,6 @@ CREATE TABLE IF NOT EXISTS app_log (
 );
 CREATE INDEX IF NOT EXISTS idx_applog_ts ON app_log(ts DESC);
 
--- 飞牛统一网关的身份映射：网关校验会话后通过 X-Trim-* 头告知「当前是谁」，
--- 本应用把它映射成一个本地账号，后续一律用本地会话（业务权限仍由本应用负责）。
---
--- 为什么以 trim_uid 为键而不是用户名：
---   用户名可以改、也可能与本地自建账号重名。若按用户名匹配，一个叫 admin 的
---   飞牛普通用户就会直接对上本应用的本地管理员账号 —— 那是提权漏洞。
---   飞牛 UID 是稳定的，且本地账号名由我们生成（nas:<uid>），结构上不可能撞车。
-CREATE TABLE IF NOT EXISTS sys_gateway_identity (
-  trim_uid      TEXT    PRIMARY KEY,
-  user_id       INTEGER NOT NULL REFERENCES sys_user(id) ON DELETE CASCADE,
-  trim_username TEXT    NOT NULL DEFAULT '',
-  is_admin      INTEGER NOT NULL DEFAULT 0,
-  last_seen_at  TEXT,
-  created_at    TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_gw_identity_user ON sys_gateway_identity(user_id);
-
 CREATE TABLE IF NOT EXISTS app_setting (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL DEFAULT ''
@@ -274,7 +257,34 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
-	return s.migrateNetworkSafety()
+	if err := s.migrateNetworkSafety(); err != nil {
+		return err
+	}
+	return s.migrateGatewayRemoval()
+}
+
+// migrateGatewayRemoval 清理「飞牛账号免密登录」留下的痕迹。
+//
+// 0.8.20 移除了免密登录，升级上来的库里还留着两样东西，都不是能用但没用的数据：
+//   - sys_gateway_identity 映射表：已经没有任何代码读它；
+//   - 由映射自动创建的 nas:<uid> 账号：它的口令散列是一个**格式非法的占位值**，
+//     本来就只能靠网关免密进入，且旧版本会拒绝给它改密码 —— 免密一走，
+//     它就永远登不进来了。留着只会让管理员在账号列表里看到既解释不清也用不上的账号。
+//
+// 为什么敢按用户名前缀判定：自建账号一直禁止包含冒号（冒号保留给映射命名空间，
+// 见 service.CreateUser），所以库里的 nas:* 只可能来自映射。
+//
+// 删账号不会带走操作记录：audit_log 的 user_id 与 username 都是普通列，没有外键；
+// 而会话、受信任设备、恢复码这些以 user_id 外键关联的表都带 ON DELETE CASCADE，
+// 会随账号一并清掉（数据库以 foreign_keys(1) 打开，级联确实生效）。
+func (s *Store) migrateGatewayRemoval() error {
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS sys_gateway_identity`); err != nil {
+		return fmt.Errorf("清理免密登录映射表失败: %w", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM sys_user WHERE username LIKE 'nas:%'`); err != nil {
+		return fmt.Errorf("清理免密登录自动创建的账号失败: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ensureColumn(table, column, ddl string) error {

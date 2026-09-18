@@ -251,7 +251,7 @@
   `TestRevokeTrustedDevice`、`TestAdminResetUserTOTP`、`TestAdminResetPasswordKicksSessions`、
   `TestChangePasswordKicksOtherSessions`。
 
-#### P2-4 接入飞牛统一网关（NAS 账号免密登录、已完成）
+#### P2-4 接入飞牛统一网关（NAS 账号免密登录，0.8.20 已移除该能力）
 - **目标**：登录页同时提供「飞牛 NAS 账号」与「自建账号密码」两种方式，前者免密。
 - **官方机制**（`developer.fnnas.com` 核心概念 → 统一网关）：在 `app/ui/config` 用
   `gatewayPrefix` + `gatewaySocket` 注册入口，**请求先由 fnOS 校验用户会话**，再转发到应用
@@ -324,6 +324,22 @@
      旧模型解析入口，可入口配置里 `protocol` 已留空、也没有 `port`，拼不出上游，于是 502。
      修复即上面那条硬前提（改为 `1.1.3100`）。教训：**换入口模型时必须同时核对声明** ——
      只改 `app/ui/config` 而不改 manifest，两边各自看都「正确」，故障恰好落在它们之间。
+     10. **免密登录整套移除（0.8.20）**：**保留统一网关入口本身**（从飞牛桌面点图标仍经
+     `/app/fn-wireguard` + `app.sock` 打开本应用），移除的是「凭网关注入的身份直接进应用」这件事：
+     ① `X-Trim-*` 身份头不再被解析（连常量都不再存在，TCP 通道也就不需要「删除身份头」的中间件了）；
+     ② `sys_gateway_identity` 映射表、`nas:<uid>` 账号与「飞牛管理员→管理员 / 普通用户→只读」的同步规则；
+     ③ 登录方式开关（`both` / `gateway_only` / `password_only`）及「没验证过免密就不许关端口」的防自锁校验，
+     连同对 `onboarding`、通用设置接口的连带限制；
+     ④ 账号列表/顶栏的「飞牛账号」标注、`display_name`/`source`/`trim_uid` 派生字段，以及
+     由此而来的「改密码 / 开二次验证」只读限制（这些限制的存在理由已经消失）。
+     现在只有一种登录方式：**本应用账号密码**；忘记密码走安全码应急登录，管理员也可用 `fnwg-cli` 重置。
+     两条通道的权限完全相同，进入任何一条都必须先登录。
+     **仍然保留**的部分（与身份无关）：`gatewayPrefix` 子路径部署与两条通道共用同一份路由、
+     WebSocket 握手的网关通道判定（0.8.17 修的「飞牛桌面下实时状态连不上」靠的就是「连接来自 socket
+     且对端身份已核验」这个**通道事实**，不是身份头）、以及 `/auth/state` 继续上报 `socket_ready` ——
+     它是安装/升级脚本发现「socket 没建起来、点图标会 502」的唯一依据（0.8.16）。
+     为什么移除：免密把「谁能进来」交给了外部系统注入的请求头，为此付出的复杂度（身份头可信性的三重判定、
+     映射按 UID 而非用户名的提权规避、防自锁开关、两套登录路径各自的说明与自检）远超它省下的那一次输入。
 
 #### P2-5 防自锁后手（安全码 + CLI + 登录方式开关，已完成）
 - **背景**：P2-4 选定「关闭独立端口登录」后，必须有退路，否则飞牛网关侧一旦异常就再也进不去。
@@ -338,9 +354,10 @@
   2. **`fnwg-cli` 用户管理（已完成）**：新增 `user list` / `user reset-password` / `user reset-2fa` /
      `security-code`，复用与界面完全相同的安全约束（重置口令即作废受信任设备与全部在线会话），
      操作以 `fnwg-cli` 身份写入审计日志。
-  3. **登录方式开关（已完成，随 P2-4）**：应用内「系统设置 → 登录方式」页签，能进飞牛桌面即可切回
-     自建账号模式。启用「只用飞牛账号」前必须先**成功用过一次**免密登录，否则拒绝并说明该怎么做 ——
-     没验证过就把端口登录关掉，等于亲手把自己锁在门外。安全码应急登录始终可用。
+  3. **登录方式开关（已随 P2-4 于 0.8.20 移除）**：原实现是应用内「系统设置 → 登录方式」页签，
+     能进飞牛桌面即可切回自建账号模式，且启用「只用飞牛账号」前必须先**成功用过一次**免密登录。
+     免密整体移除后，「可切换的入口」不再存在，这一层后手随之作废；安全码与 `fnwg-cli`
+     两层后手保留不变，且安全码现在覆盖了原本需要它的全部场景。
 
 #### P2-3 配置快照与一键回滚（已完成）
 - **目标**：关键操作自动留快照，可查看差异并回滚。
@@ -540,27 +557,22 @@ P2-3 快照回滚    （独立，但 P3 报表可复用其快照数据）
   → `TestSnapshotPruneKeepsLimit`、`TestSnapshotSkipsUnchangedConfig`、`TestSnapshotsStayOutOfBackupList`、
     `TestRollbackRejectsNonSnapshot`、`TestBackupCoversDNSRecords`。
 
-### V9b 统一网关（P2-4）
-- 从飞牛桌面打开本应用即免密进入；飞牛管理员 → 应用管理员，普通用户 → 只读。
-  → `TestGatewayLoginProvisionsAccountAndSyncsRole`（按网关注入的身份开通本地账号并同步角色）、
-    `TestGatewayLoginRejectsBadIdentity`（身份头缺失或格式非法时拒绝，绝不猜一个身份）。
+### V9b 统一网关（P2-4，免密部分已于 0.8.20 移除）
+- ~~从飞牛桌面打开本应用即免密进入；飞牛管理员 → 应用管理员，普通用户 → 只读。~~
+  （0.8.20 移除：从飞牛桌面打开同样要用本应用账号密码，两条通道权限完全一致。）
+  → `TestAuthSetupCreatesAccountAndSession`、`TestGatewayLoginEndpointGone`、`TestAuthStateNoLongerExposesLoginMode`。
 - **端口上伪造 `X-Trim-Isadmin: true` 绝不能拿到管理员会话**（本版最高风险点）。
-  → `TestGatewayLoginRejectedOnTCPPort`（端口通道伪造身份返回 403，且不下发会话 Cookie）；
-    `TestStripGatewayHeaders`（身份头在进入业务逻辑前就被删除）。
-- 飞牛侧一个叫 `admin` 的普通用户不得对上本地自建管理员账号；飞牛撤权后本应用同步降权。
-  → `TestGatewayIdentityKeyedByUIDNotUsername`、`TestGatewayLoginProvisionsAccountAndSyncsRole`。
-- 映射账号无法用密码登录；本地停用的账号不能靠网关「登回来」。
-  → 上述两用例中的口令断言 + `TestDisabledGatewayAccountStaysDisabled`。
-- 防自锁：未验证过网关可用时不允许关闭端口登录；通用设置接口也不能绕过该校验；安全码入口始终可用。
-  → `TestGatewayOnlyRequiresProvenGateway`、`TestGenericSettingsCannotBypassLoginModeGuard`。
+  → `TestGatewayLoginEndpointGone`：照旧把三个身份头伪造一遍，接口不存在、也拿不到会话 Cookie。
+    比原来更强的一点是**结构上不可能**：解析这些头的代码已整体删除，不再依赖「入口中间件记得删干净」。
 - 子路径部署：网关前缀下页面、接口、静态资源与 WebSocket 全部正常。
-  → `TestSPAServedUnderGatewayPrefix`、`TestGatewayStateExposedForLoginPage`。
-- **免密登录本身要能在真机上真的走通**（本轮真机验证的第一条就没过：网关入口 socket 因启动参数漏项
-  而根本没建起来，见 P2-4 实际实现第 7 条）。
-  → `TestAppSockPathFallsBackToExecutableDir`、`TestAppSockPathHonoursAbsoluteAppDest`
-    （应用目录取不到时 socket 必须落到可执行文件所在目录，且显式给出的绝对目录优先）；
-    `TestLoginModeStateReportsGatewaySocket`、`TestGatewayDiagnosisRecorded`
-    （界面必须能区分「入口没起来」与「入口正常但还没走过」，否则只会给出无法执行的指引）。
+  → `TestSPAServedUnderGatewayPrefix`、`TestGatewaySocketServesLoginPage`。
+- 网关入口的就绪状态必须能被安装/升级脚本读到：只判端口就报「安装成功」的话，用户点图标才发现 502。
+  → `TestGatewaySocketReadyTracksListener`（未监听时必须为 false，监听后必须为 true）、
+    `TestAppSockPathFallsBackToExecutableDir`、`TestAppSockPathHonoursAbsoluteAppDest`
+    （应用目录取不到时 socket 必须落到可执行文件所在目录，且显式给出的绝对目录优先）。
+- WebSocket 在飞牛桌面（网关通道、Host 被代理改写）下必须能连上（0.8.17 的毛病不许回来）。
+  → `TestCheckWSOriginAllowsFnOSDesktop`、`TestWSHandshakeOverGatewaySocket`
+    （放行依据是「连接来自 socket 且对端身份已核验」这个通道事实，与身份头无关）。
 
 ### V10 流量报表（P3）
 - 可查询任意设备最近 7 天按天流量；与实时累计值误差 **< 5%**。

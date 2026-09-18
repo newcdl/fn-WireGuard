@@ -7,92 +7,25 @@
         <div style="font-size: 13px; opacity: 0.65">飞牛 NAS 原生 WireGuard 控制台</div>
       </div>
 
-      <!-- 第一步：账号与口令 -->
+      <!-- 唯一入口：账号与口令。
+           从飞牛桌面点图标进来也是这里 —— 图标只负责打开页面，
+           本应用不认飞牛账号身份，进去必须先登录。 -->
       <el-form v-if="step === 'password'" :model="form" label-position="top" @submit.prevent="submit">
-        <!-- 飞牛桌面入口：NAS 账号免密登录，一次点击（正常情况下已自动完成） -->
-        <template v-if="gatewayAvailable">
-          <el-alert type="success" :closable="false" show-icon style="margin-bottom: 12px">
-            <template #title>
-              已识别飞牛账号「{{ session.gateway.username || '当前用户' }}」，可直接免密进入。
-            </template>
-          </el-alert>
-          <el-button
-            type="primary"
-            size="large"
-            style="width: 100%; margin-bottom: 12px"
-            :loading="loading"
-            @click="submitGateway"
-          >
-            用飞牛账号进入
-          </el-button>
-        </template>
-
-        <!-- 管理员关掉了免密登录：入口还在，但不能给一个必然失败的按钮 -->
-        <el-alert
-          v-else-if="gatewayLoginDisabled"
-          type="info"
-          :closable="false"
-          show-icon
-          style="margin-bottom: 12px"
-        >
-          <template #title>管理员已关闭「飞牛账号免密登录」，请使用账号密码进入。</template>
-          <template #default>
-            想改回来：先用账号密码登录，再到「系统设置 → 登录方式」切换。
-          </template>
-        </el-alert>
-
-        <!-- 网关通道存在但身份不可信：把原因说清楚，而不是只说一句「失败」 -->
-        <el-alert
-          v-else-if="session.gateway.blocked_reason"
-          type="warning"
-          :closable="false"
-          show-icon
-          style="margin-bottom: 12px"
-          :title="session.gateway.blocked_reason"
-        />
-
-        <!-- 没有飞牛账号入口时说明缘由：它取决于「这次是怎么打开本应用的」，
-             而不是登录开关——不说清楚，用户只会以为功能没做或坏了 -->
-        <el-alert
-          v-else
-          type="info"
-          :closable="false"
-          show-icon
-          style="margin-bottom: 12px"
-          :title="gatewayEntryHint"
-        />
-
-        <!-- 管理员关闭了端口登录：不展示表单，直接指路，避免用户白试一遍 -->
-        <el-alert
-          v-if="passwordLoginDisabled"
-          type="warning"
-          :closable="false"
-          show-icon
-          style="margin-bottom: 12px"
-        >
-          <template #title>管理员已关闭「账号密码登录」，请从飞牛桌面打开本应用。</template>
-          <template #default>
-            若进不去，可用下方的「安全码应急登录」——它始终可用，是防止把自己锁在门外的最后入口。
-          </template>
-        </el-alert>
-
-        <template v-if="!passwordLoginDisabled">
-          <el-form-item label="登录账号">
-            <el-input v-model="form.username" placeholder="请输入登录账号" autofocus />
-          </el-form-item>
-          <el-form-item label="登录密码">
-            <el-input
-              v-model="form.password"
-              type="password"
-              show-password
-              placeholder="请输入登录密码"
-              @keyup.enter="submit"
-            />
-          </el-form-item>
-          <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="submit">
-            登录
-          </el-button>
-        </template>
+        <el-form-item label="登录账号">
+          <el-input v-model="form.username" placeholder="请输入登录账号" autofocus />
+        </el-form-item>
+        <el-form-item label="登录密码">
+          <el-input
+            v-model="form.password"
+            type="password"
+            show-password
+            placeholder="请输入登录密码"
+            @keyup.enter="submit"
+          />
+        </el-form-item>
+        <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="submit">
+          登录
+        </el-button>
         <el-button link style="width: 100%; margin: 10px 0 0" @click="step = 'emergency'">
           密码和验证码都用不了？用安全码应急登录
         </el-button>
@@ -178,7 +111,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useSession } from '@/stores/session'
@@ -192,45 +125,6 @@ const realtime = useRealtime()
 const loading = ref(false)
 const form = reactive({ username: '', password: '' })
 
-/**
- * 管理员是否关闭了「飞牛账号免密登录」。
- *
- * 与「入口可不可用」是两回事：入口照样在、身份头照样会到，只是服务端会拒绝。
- * 所以这里必须自己也挡一层——展示一个必定失败的按钮，等于把用户送去撞一次墙再回来。
- */
-const gatewayLoginDisabled = computed(() => session.loginMode === 'password_only')
-/** 当前是不是飞牛桌面打开的应用，且管理员没有关掉免密登录。 */
-const gatewayAvailable = computed(() => !!session.gateway.available && !gatewayLoginDisabled.value)
-/** 管理员是否关闭了端口上的账号密码登录（安全码应急入口不受影响）。 */
-const passwordLoginDisabled = computed(() => session.loginMode === 'gateway_only')
-
-/**
- * 「为什么这个页面上没有飞牛账号登录」的说明。
- *
- * 飞牛账号入口不看登录方式开关，只看**这次请求是怎么进来的**：身份是飞牛网关
- * 校验会话后注入的请求头，而请求头是明文、可伪造的，所以服务端只认经 Unix Socket
- * 通道到达的请求。直接用 IP:端口 打开时无法证明「你是谁」，因此这里只有账号密码 ——
- * 这是通道事实，不是开关被关掉了。页面不说明的话，用户只能猜是功能没了还是坏了。
- */
-const gatewayEntryHint = computed(() => {
-  if (session.gateway.entry) {
-    // 通道对，但身份头没到（例如登录页被直接刷新、链接被复制到别处打开）
-    return '本次请求确实走了飞牛网关通道，但没带上飞牛账号信息。常见原因是登录页被刷新过、或链接被复制到别处打开，回飞牛桌面重新点开本应用图标即可。'
-  }
-  // 请求没走网关通道。这时还剩两种**完全不同的**原因，必须分开说：
-  // 不说清就等于把用户送去反复点桌面图标，而他本来就是从飞牛桌面打开的。
-  if (session.gateway.socket_ready) {
-    // 入口本身是好的 → 问题在于这次请求没走到它上面（真机表现为桌面图标指向端口）
-    return '本次请求不是经飞牛网关通道进来的，所以无法确认你是哪个飞牛账号，这里只提供账号密码登录。' +
-      '本应用的网关入口（app.sock）是正常就绪的，说明这次请求没走到那条通道上——' +
-      '从飞牛桌面打开却仍看到这句话，就属于入口注册问题。' +
-      '请先用账号密码登录，再到「系统设置 → 登录方式」把网关诊断信息反馈给维护者。'
-  }
-  return '本次请求不是经飞牛网关通道进来的，所以无法确认你是哪个飞牛账号，这里只提供账号密码登录。' +
-    '而且本机当前没有监听网关入口（app.sock），这种情况下无论怎么打开都不会有免密登录。' +
-    '请先用账号密码登录，再到「系统设置 → 登录方式」查看诊断信息。'
-})
-
 /** 当前界面：password（账号口令）→ totp（二次验证）/ emergency（安全码）→ newcode（保存新安全码）。 */
 const step = ref<'password' | 'totp' | 'emergency' | 'newcode'>('password')
 const challenge = ref('')
@@ -241,19 +135,6 @@ const emCode = ref('')
 const emPassword = ref('')
 const newCode = ref('')
 const savedNew = ref(false)
-
-/** 飞牛账号免密登录（正常情况下进页面前已自动完成，这里是手动兜底）。 */
-async function submitGateway() {
-  loading.value = true
-  try {
-    await session.gatewayLogin()
-    enter()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  } finally {
-    loading.value = false
-  }
-}
 
 async function submit() {
   if (!form.username || !form.password) {

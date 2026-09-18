@@ -71,34 +71,21 @@
             </span>
             <template #dropdown>
               <el-dropdown-menu>
-                <el-dropdown-item disabled>
-                  {{ myName }}（{{ roleLabel }}）
-                  <el-tag v-if="isGatewayUser" size="small" effect="plain" style="margin-left: 6px">
-                    飞牛账号
-                  </el-tag>
-                </el-dropdown-item>
+                <el-dropdown-item disabled>{{ myName }}（{{ roleLabel }}）</el-dropdown-item>
                 <el-dropdown-item command="help" divided>配置说明大全</el-dropdown-item>
-                <!-- 飞牛账号的密码与二次验证都由飞牛 NAS 管，本应用给了也不会生效：
-                     它从桌面免密进来，不经过这里的动态口令校验。与其摆一个点了没用的
-                     入口，不如直接说明去哪里改。 -->
-                <el-dropdown-item v-if="isGatewayUser" disabled>
-                  密码与二次验证由飞牛 NAS 统一管理
-                </el-dropdown-item>
-                <template v-else>
-                  <el-dropdown-item command="password">修改密码</el-dropdown-item>
-                  <el-dropdown-item command="totp">
-                    二次验证
-                    <el-tag
-                      v-if="session.user?.totp_enabled"
-                      size="small"
-                      type="success"
-                      effect="plain"
-                      style="margin-left: 6px"
-                    >
+                <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                <el-dropdown-item command="totp">
+                  二次验证
+                  <el-tag
+                    v-if="session.user?.totp_enabled"
+                    size="small"
+                    type="success"
+                    effect="plain"
+                    style="margin-left: 6px"
+                  >
                     已开启
                   </el-tag>
                 </el-dropdown-item>
-                </template>
                 <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -216,7 +203,6 @@ import { useBreakpoint } from '@/composables/useBreakpoint'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
-import { displayNameOf, isGatewayAccount } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
@@ -286,11 +272,7 @@ const title = computed(() => titles[route.name as string] || 'WireGuard 管理�
 const roleLabel = computed(
   () => ({ admin: '管理员', operator: '运维', viewer: '只读' })[session.user?.role || 'viewer'],
 )
-// 顶栏与菜单里的名字一律取展示名：飞牛账号的内部名是 nas:<uid> 这种映射锚点，
-// 显示出来等于让用户对着一个自己从没设置过的编号发呆。
-const myName = computed(() => displayNameOf(session.user))
-// 飞牛账号的密码与二次验证由飞牛 NAS 管，相关入口对它们隐藏（理由见模板里的注释）。
-const isGatewayUser = computed(() => isGatewayAccount(session.user))
+const myName = computed(() => session.user?.username || '')
 const backendLabel = computed(() => {
   const b = realtime.status?.backend
   return ({ kernel: '标准模式', userspace: '兼容模式', mock: '演示模式' } as Record<string, string>)[b || ''] || ''

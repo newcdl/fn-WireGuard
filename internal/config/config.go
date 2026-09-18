@@ -139,7 +139,7 @@ const AppSockFile = "app.sock"
 // socket 就在哪」恒成立；而 TRIM_APPDEST 只存在于安装/配置脚本的进程环境里，
 // **systemd 不会继承它**。只认 TRIM_APPDEST 的话，服务由 systemd 拉起时会退化成
 // 「相对当前工作目录」——systemd 下即 /，普通用户无权在那里建 socket，bind 直接失败，
-// 最终表现为「从飞牛桌面打开也不免密」，而日志里只有一句容易被忽略的警告。
+// 最终表现为「从飞牛桌面点图标只有 502」，而日志里只有一句容易被忽略的警告。
 func (c *Config) AppSockPath() string {
 	if dir := c.appDestDir(); dir != "" {
 		return filepath.Join(dir, AppSockFile)

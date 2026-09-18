@@ -33,12 +33,13 @@ type Server struct {
 	loginMu    sync.Mutex
 	loginFails map[string]loginFail
 
-	// gatewaySockPath 是统一网关 socket 的实际监听路径（未监听时为空串），
-	// gatewayDiag 记录最近一次「网关入口没能用起来」的原因。
-	// 这两个字段是给界面用的：免密登录不可用时必须说清是哪一环断了，
-	// 否则用户只会拿到一句自己无法执行的指引（「请从飞牛桌面打开一次」）。
+	// gatewaySockPath 是统一网关入口 socket 的实际监听路径（未监听时为空串）。
+	//
+	// 它只回答「飞牛桌面点图标这条通道建起来没有」，与登录无关：
+	// 本应用不认任何外部身份。之所以要留着，是因为安装/升级脚本会读
+	// /auth/state 的 socket_ready 来判断这次装完桌面入口能不能用 ——
+	// 只看端口就报「安装成功」的话，用户点图标才发现是 502（见 0.8.16）。
 	gatewaySockPath atomic.Pointer[string]
-	gatewayDiag     atomic.Pointer[string]
 }
 
 type loginFail struct {
@@ -220,35 +221,18 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 // ---------------------------------------------------------------- 网关入口自检
 
 // SetGatewaySocket 由启动方告知「网关 socket 是否真的监听上了」。
-// path 非空表示就绪；否则 reason 说明断在哪一环，会被界面原样展示给用户。
-func (s *Server) SetGatewaySocket(path, reason string) {
+// path 非空表示就绪。
+func (s *Server) SetGatewaySocket(path string) {
 	s.gatewaySockPath.Store(&path)
-	s.gatewayDiag.Store(&reason)
 }
 
 // gatewaySocketReady 表示本进程确实在监听统一网关入口。
+//
+// 以进程自报为准而不是看 socket 文件：进程已经退出、文件却还留在目录里时，
+// 看文件会把「入口其实已经没了」误判成已就绪。
 func (s *Server) gatewaySocketReady() bool {
 	p := s.gatewaySockPath.Load()
 	return p != nil && *p != ""
-}
-
-// noteGatewayDiag 记录一次网关入口的失败线索（后写覆盖先写）。
-//
-// 只在「网关入口存在却没能用起来」时调用：这类失败发生在请求到达之前或身份校验阶段，
-// 不记下来在界面上就完全不可见，用户只能看到反复失败、却不知道去看哪个日志。
-func (s *Server) noteGatewayDiag(reason string) {
-	if reason == "" {
-		return
-	}
-	s.gatewayDiag.Store(&reason)
-}
-
-// gatewayDiagnosis 返回当前网关入口的诊断说明（正常时为空串）。
-func (s *Server) gatewayDiagnosis() string {
-	if d := s.gatewayDiag.Load(); d != nil {
-		return *d
-	}
-	return ""
 }
 
 func requirePerm(perm string) func(http.Handler) http.Handler {

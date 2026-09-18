@@ -26,8 +26,8 @@ const GatewayPrefix = "/app/fn-wireguard"
 //   - 飞牛统一网关：/app/fn-wireguard/api/v1/... 与 /app/fn-wireguard/...
 //
 // 两条通道共用同一份路由实现，因此不可能出现「网关下能用、端口下不能用」
-// 这类只在一条路径上验证过的差异；它们的唯一区别是**身份头是否可信**，
-// 而那件事由 TCPRouter 与网关监听器分别把守（见 gateway.go）。
+// 这类只在一条路径上验证过的差异，权限也完全一致：本应用不解析飞牛网关注入的
+// 任何身份信息，两条通道上的会话都必须先用自己的账号密码登录（见 gateway.go）。
 func (s *Server) Router(assets fs.FS) http.Handler {
 	s.assets = assets
 
@@ -47,15 +47,6 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 	return r
 }
 
-// TCPRouter 是「直接访问端口」那条通道使用的处理器。
-//
-// 与网关通道的唯一差别：进入业务逻辑前先把网关注入类身份头删干净。
-// 端口是面向局域网的，任何人都能往请求里塞 X-Trim-Isadmin: true；
-// 在入口处删除它们，使「伪造身份」在结构上不可能，而不是依赖每处代码自觉。
-func (s *Server) TCPRouter(assets fs.FS) http.Handler {
-	return stripGatewayHeaders(s.Router(assets))
-}
-
 // mountAPI 注册 REST 路由（挂载位置由调用方决定，可挂多个前缀）。
 func (s *Server) mountAPI(r chi.Router) {
 	// 无需登录
@@ -66,9 +57,6 @@ func (s *Server) mountAPI(r chi.Router) {
 	r.Post("/auth/login/totp", s.handleLoginTOTP)
 	// 应急登录：用安全码进入，所有常规途径都失效时的最后入口
 	r.Post("/auth/emergency", s.handleEmergencyLogin)
-	// 飞牛账号免密登录：身份由网关注入，但**只在网关通道上可信**（见 gateway.go）。
-	// 端口通道上它是不可用的 —— 那条路上的身份头已被入口中间件删除。
-	r.Post("/auth/gateway", s.handleGatewayLogin)
 
 	// 需要登录
 	r.Group(func(r chi.Router) {
@@ -89,10 +77,6 @@ func (s *Server) mountAPI(r chi.Router) {
 		// 应急安全码：属于实例级凭据，只有管理员能查看状态与重新生成
 		r.With(requirePerm(model.PermUserManage)).Get("/auth/security-code", s.handleSecurityCodeState)
 		r.With(requirePerm(model.PermUserManage)).Post("/auth/security-code", s.handleIssueSecurityCode)
-		// 登录方式（飞牛账号免密 / 端口账号密码）：防自锁的关键开关 ——
-		// 只要还能进飞牛桌面，就一定能把它改回来。读对所有登录用户开放，改限管理员。
-		r.Get("/auth/login-mode", s.handleLoginModeState)
-		r.With(requirePerm(model.PermUserManage)).Put("/auth/login-mode", s.handleSetLoginMode)
 
 		r.Get("/overview", s.handleOverview)
 		r.Get("/health", s.handleHealth)
@@ -185,8 +169,6 @@ func (s *Server) mountAPI(r chi.Router) {
 		// 管理员重置某账号的二次验证（用户把自己锁在门外时的正规救法）
 		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/reset", s.handleResetUserTOTP)
 		// 管理员为某账号开启二次验证：账号主人自己操作不熟时的正规做法。
-		// 只对应用内自建账号有效；飞牛账号会被服务层拒绝并说明原因 ——
-		// 它从飞牛桌面免密进入、不经过本应用的动态口令校验，开关在它身上不可能生效。
 		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/setup", s.handleAdminUserTOTPSetup)
 		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/enable", s.handleAdminUserTOTPEnable)
 

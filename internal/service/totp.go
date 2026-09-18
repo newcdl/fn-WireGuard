@@ -196,13 +196,6 @@ func (s *Service) ResetUserTOTP(ctx context.Context, userID int64, a Actor) erro
 	if err != nil {
 		return err
 	}
-	// 飞牛账号在本应用里不该有绑定：开启入口本身就拒绝（见 gatewayTOTPRefusal）。
-	// 这里一并挡掉，是为了让「界面不显示」与「接口不接受」两处语义一致，
-	// 而不是留一个只在 UI 上隐藏、直连接口仍能生效的后门。
-	if s.IsGatewayUser(ctx, userID) {
-		s.audit(ctx, a, "totp.admin_reset", "user", fmt.Sprint(userID), u.Username, "", "deny", "飞牛账号的二次验证由飞牛管理")
-		return errors.New(gatewayTOTPRefusal)
-	}
 	if u.TOTPSecret == "" {
 		return errors.New("该账号未开启二次验证")
 	}
@@ -301,17 +294,11 @@ func (s *Service) newTOTPSetup(u *model.User) (*TOTPSetup, error) {
 // AdminBeginTOTPSetup 由管理员为指定账号生成绑定信息（尚未生效）。
 //
 // 与自助路径只差一处：不校验「本人密码」—— 操作者本来就不是账号主人，
-// 权限由调用方要求的 user.manage 保证。正因为它少了那道校验，才必须在入口
-// 挡住飞牛账号（见 gatewayTOTPRefusal）：那条路上二次验证不可能生效，
-// 允许绑定等于让管理员以为自己加固了这个账号，实际上什么也没发生。
+// 权限由调用方要求的 user.manage 保证。
 func (s *Service) AdminBeginTOTPSetup(ctx context.Context, userID int64, a Actor) (*TOTPSetup, error) {
 	u, err := s.Store.GetUser(ctx, userID)
 	if err != nil {
 		return nil, err
-	}
-	if s.IsGatewayUser(ctx, userID) {
-		s.audit(ctx, a, "totp.admin_setup", "user", fmt.Sprint(userID), u.Username, "", "deny", "飞牛账号的二次验证由飞牛管理")
-		return nil, errors.New(gatewayTOTPRefusal)
 	}
 	s.audit(ctx, a, "totp.admin_setup", "user", fmt.Sprint(userID), u.Username, "", "ok", "管理员发起了二次验证绑定")
 	return s.newTOTPSetup(u)
@@ -324,10 +311,6 @@ func (s *Service) AdminEnableTOTP(ctx context.Context, userID int64, secret, cod
 	u, err := s.Store.GetUser(ctx, userID)
 	if err != nil {
 		return nil, err
-	}
-	if s.IsGatewayUser(ctx, userID) {
-		s.audit(ctx, a, "totp.admin_enable", "user", fmt.Sprint(userID), u.Username, "", "deny", "飞牛账号的二次验证由飞牛管理")
-		return nil, errors.New(gatewayTOTPRefusal)
 	}
 	return s.enableTOTPWith(ctx, u, secret, code, a)
 }

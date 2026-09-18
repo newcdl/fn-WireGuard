@@ -24,15 +24,15 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 		"initialized":   initialized,
 		"authenticated": false,
 		"user":          nil,
-		// 登录方式与网关入口信息要在「登录之前」就告诉前端，
-		// 否则登录页无法判断该显示账号密码表单还是「一键免密登录」。
-		"login_mode": s.svc.LoginMode(r.Context()),
-		"gateway":    s.gatewayState(r),
 		// 正在运行的版本。放在这个免登录接口上，是为了让安装/升级脚本在收尾时
 		// 能核对「设备上真正在跑的就是刚装上去的那个版本」——
 		// 版本号是构建时从 manifest 编译进二进制的，读得到就一定准。
 		// 少了这个自查，「升级成功了但仍在跑旧版本」只能靠用户事后猜。
 		"version": s.version,
+		// 网关入口（飞牛桌面图标那条通道）是否已监听。与登录无关，
+		// 是给安装/升级脚本用的：只看端口就报「安装成功」，
+		// 用户点桌面图标才发现是 502（见 apps/fn-wireguard/cmd/common 的 fnwg_gateway_check）。
+		"socket_ready": s.gatewaySocketReady(),
 	}
 	if !initialized {
 		writeJSON(w, http.StatusOK, out)
@@ -49,27 +49,10 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
-		// LoginMode 初始化时一并选定的登录方式；留空表示不改动（沿用默认的两种都可用），
-		// 好让旧版前端与命令行调用继续按原样工作。
-		LoginMode string `json:"login_mode"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	// 登录方式必须在**建号之前**校验完：取值不合法时宁可让用户重提一次，
-	// 也不能出现「管理员已经建好、开关却没设成」这种半初始化状态 ——
-	// 那时他看到的是初始化失败，重来时却只会得到一句「系统已初始化」。
-	//
-	// 判据里的「免密可用」取本次请求的通道事实（gatewayTrusted），而不是历史记录：
-	// 初始化之前本应用从没用过免密登录，历史必然为空，此刻唯一可信的证明就是
-	// 「这一次初始化请求本身就是经飞牛网关通道带着身份头进来的」。
-	gatewayProven := gatewayTrusted(r)
-	if in.LoginMode != "" {
-		if err := s.svc.CheckLoginModeAtSetup(in.LoginMode, gatewayProven); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
 	}
 	u, err := s.svc.Setup(r.Context(), in.Username, in.Password)
 	if err != nil {
@@ -93,18 +76,6 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	s.setSessionCookie(w, step.Token)
 	out := map[string]any{"user": u}
-	// 会话已下发，到这一步才落登录方式：上面校验过，这里几乎不可能失败。
-	// 真失败了也不能把已经建好的账号当成「初始化失败」回滚 —— 那会让用户重来一遍，
-	// 而第二次他只会得到一句「系统已初始化」。如实回报，剩下的交给设置页。
-	if in.LoginMode != "" {
-		if err := s.svc.SetLoginModeAtSetup(r.Context(), in.LoginMode, gatewayProven,
-			service.Actor{Username: in.Username}); err != nil {
-			out["login_mode_error"] = "登录方式未能保存，当前仍是「两种都可用」，" +
-				"请稍后到「系统设置 → 登录方式」重设：" + err.Error()
-		}
-	}
-	// 回报落库后的实际值，而不是用户选的那一项：前端据此决定第二步怎么提示，不靠猜。
-	out["login_mode"] = s.svc.LoginMode(r.Context())
 	// 初始化时同时下发一枚安全码：它是所有登录途径都失效时的最后入口，
 	// 必须在这一刻交给用户保存，否则将来无处可取。
 	if code, codeErr := s.svc.IssueSecurityCode(r.Context(), service.Actor{Username: in.Username}); codeErr != nil {
@@ -171,14 +142,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	// 管理员若关闭了端口上的账号密码登录（仅保留飞牛账号免密），
-	// 这里必须挡住：界面上的隐藏只是体验，服务端拒绝才是规则。
-	if s.svc.LoginMode(r.Context()) == service.LoginModeGatewayOnly {
-		writeErr(w, http.StatusForbidden,
-			"管理员已关闭端口登录，请从飞牛桌面打开本应用（飞牛账号免密登录）；"+
-				"若进不去，可用登录页的「安全码应急登录」")
 		return
 	}
 	key := clientIP(r) + "|" + in.Username

@@ -12,8 +12,10 @@ import (
 //
 // 为什么必须做这件事：socket 文件在应用目录里，被 chmod 成网关可写；
 // 而 Linux 上**任何有权限打开该文件的本地进程**都能连上来，包括别的第三方应用。
-// 只凭「请求是从 socket 来的」就相信 X-Trim-Isadmin，等于把管理员权限交给
-// 本机所有用户。SO_PEERCRED 拿到的是内核记录的对端凭据，客户端无法伪造。
+// 「这条连接确实来自飞牛网关」是 WebSocket 握手跨站判断里唯一可用于放行的事实
+// （见 gateway.go）—— 只凭「请求是从 socket 来的」就放行，等于让本机所有用户
+// 都能绕过那层检查。本应用不解析网关注入的身份，所以这里核验的是通道，不是权限。
+// SO_PEERCRED 拿到的是内核记录的对端凭据，客户端无法伪造。
 func peerUID(c *net.UnixConn) (int, error) {
 	raw, err := c.SyscallConn()
 	if err != nil {

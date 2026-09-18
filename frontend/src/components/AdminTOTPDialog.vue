@@ -121,7 +121,7 @@ async function start() {
     secret.value = out.secret
     qr.value = await QRCode.toDataURL(out.uri, { margin: 1, width: 320 })
   } catch (e) {
-    // 飞牛账号会在这里被服务端拒绝，并把「为什么」说清楚（见后端 gatewayTOTPRefusal）
+    // 失败原因由服务端给全（例如账号已停用），这里原样展示，不自己编一个说法
     loadError.value = (e as Error).message
   } finally {
     busy.value = false

@@ -7,31 +7,20 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	"fnwg/internal/service"
 )
 
-// 飞牛统一网关在完成会话校验后注入的身份头。
+// 本文件描述「一次请求是怎么来的」——即**通道**，与「请求者是谁」无关。
 //
-// ⚠️ 本应用的最高安全风险点就在这里：这三个头是**明文**的，谁都能往请求里塞。
-// 因此信任它们需要**同时**满足两个条件，缺一不可：
+// 本应用不解析、也不信任飞牛网关注入的任何身份信息：没有免密登录，
+// 每个浏览器会话都必须走本应用自己的账号密码登录（见 service/auth.go）。
+// 因此这里的判断只用于两件事：
 //
-//	① 请求经由 Unix Domain Socket 到达本进程（网关只能这么访问我们，
-//	   而 socket 文件在应用目录内，普通客户端无法从网络到达）；
-//	② 该 socket 连接的对端进程身份在允许列表内（见 peercred_*.go）——
-//	   仅靠 ① 还不够：socket 是所有本地用户都可连接的文件，
-//	   本机上一个别的应用进程同样能连上来伪造管理员头。
+//	① 日志：把「从网关入口进来的」与「从端口进来的」区分开；
+//	② WebSocket 握手的跨站判断（见 checkWSOrigin）：网关转发会改写 Host，
+//	   只看 Host 会把飞牛桌面打开的正常握手误判成跨站，那是 0.8.17 修掉的毛病。
 //
-// 正面入口是 gatewayIdentity()；TCP 监听器上还有一道 stripGatewayHeaders
-// 中间件把这些头直接删掉，构成「双保险」——即便将来有人误在 TCP 侧的
-// 处理函数里读了这些头，读到的也只会是空值。
-const (
-	headerTrimUserID   = "X-Trim-Userid"
-	headerTrimUsername = "X-Trim-Username"
-	headerTrimIsAdmin  = "X-Trim-Isadmin"
-)
-
-// GatewayPeer 描述一次 Unix Socket 连接的对端进程。
+// 也就是说，通道判定只影响「要不要怀疑这是一次跨站握手」，不影响权限：
+// 两条通道上的会话都必须先登录、且权限完全相同。
 type GatewayPeer struct {
 	// Unix 表示该连接来自 Unix Domain Socket（而非 TCP 端口）。
 	Unix bool
@@ -39,7 +28,7 @@ type GatewayPeer struct {
 	UID int
 	// Verified 表示对端身份已在允许列表内。
 	Verified bool
-	// Detail 说明未被信任的原因，仅用于日志与界面提示。
+	// Detail 说明未被信任的原因，仅用于日志。
 	Detail string
 }
 
@@ -81,44 +70,12 @@ func gatewayPeer(r *http.Request) GatewayPeer {
 }
 
 // gatewayTrusted 表示当前请求可以作为「飞牛网关转发的请求」来对待。
+//
+// 它回答的是通道问题，不是身份问题：请求确实由网关进程经 socket 递过来。
+// 别处不要用它来放宽任何权限判断。
 func gatewayTrusted(r *http.Request) bool {
 	p := gatewayPeer(r)
 	return p.Unix && p.Verified
-}
-
-// gatewayIdentity 从可信请求中取出飞牛身份。
-// 只在 gatewayTrusted 为真时才会返回 ok=true，其余情况一律返回零值。
-func gatewayIdentity(r *http.Request) (service.GatewayIdentity, bool) {
-	if !gatewayTrusted(r) {
-		return service.GatewayIdentity{}, false
-	}
-	uid := strings.TrimSpace(r.Header.Get(headerTrimUserID))
-	if uid == "" {
-		return service.GatewayIdentity{}, false
-	}
-	return service.GatewayIdentity{
-		UID:      uid,
-		Username: strings.TrimSpace(r.Header.Get(headerTrimUsername)),
-		IsAdmin:  strings.EqualFold(strings.TrimSpace(r.Header.Get(headerTrimIsAdmin)), "true"),
-	}, true
-}
-
-// stripGatewayHeaders 在 TCP 监听器上删除网关注入类请求头。
-//
-// 为什么必须删而不是「不读就行」：这些头的含义完全由读取方决定，
-// 一旦将来任何一处代码图省事直接读了它们，TCP 端口立刻变成提权入口。
-// 在入口处彻底删掉，是把「不能伪造」这件事从约定变成事实。
-func stripGatewayHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(headerTrimUserID) != "" ||
-			r.Header.Get(headerTrimUsername) != "" ||
-			r.Header.Get(headerTrimIsAdmin) != "" {
-			r.Header.Del(headerTrimUserID)
-			r.Header.Del(headerTrimUsername)
-			r.Header.Del(headerTrimIsAdmin)
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 // envGatewayUIDs 允许额外信任的连接方用户 ID（逗号分隔）。

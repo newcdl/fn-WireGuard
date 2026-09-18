@@ -101,53 +101,10 @@ export interface Status {
   updated_at: string
 }
 
-/** 登录方式：网关免密 / 端口账号密码 的组合。 */
-export type LoginMode = 'both' | 'gateway_only' | 'password_only'
-
-/** 当前页面所处入口的描述（登录前就要知道，用于决定登录页怎么展示）。 */
-export interface GatewayEntry {
-  /** 是否经由飞牛统一网关的 Unix Socket 到达。 */
-  entry?: boolean
-  /**
-   * 本机是否真的在监听网关入口（app.sock）。
-   *
-   * 与 entry 合起来才能把「没有飞牛账号登录」拆成两种不同的原因：
-   * entry=false + socket_ready=true 说明入口是好的、只是这次请求没走那条通道；
-   * entry=false + socket_ready=false 说明入口压根没建起来，与用户怎么打开无关。
-   */
-  socket_ready?: boolean
-  /** 是否拿到了可信的飞牛身份（可用于一键免密登录）。 */
-  available?: boolean
-  username?: string
-  is_admin?: boolean
-  /** 通道存在但身份未被信任时的原因，直接展示给用户/运维。 */
-  blocked_reason?: string
-}
-
 export interface AuthState {
   initialized: boolean
   authenticated: boolean
   user: User | null
-  login_mode: LoginMode
-  gateway: GatewayEntry
-}
-
-/** 登录方式开关的当前状态。 */
-export interface LoginModeState {
-  mode: LoginMode
-  /** 是否已成功用过飞牛账号免密登录（未验证前不允许关闭端口登录）。 */
-  gateway_proven: boolean
-  /** 当前请求是否来自网关入口。 */
-  gateway_entry: boolean
-  /**
-   * 本机是否真的在监听网关入口（app.sock）。
-   *
-   * 为 false 时「去飞牛桌面打开一次」是做不到的动作，界面必须改说环境问题，
-   * 否则用户会一直在两个入口之间来回试。
-   */
-  gateway_socket: boolean
-  /** 网关入口不可用/未被信任的原因（正常时为空串）。 */
-  gateway_diagnosis: string
 }
 
 export interface Health {
@@ -163,17 +120,6 @@ export interface Health {
 export interface User {
   id: number
   username: string
-  /**
-   * 展示名：飞牛账号是飞牛那边的账号名，本地账号就是用户名本身。
-   *
-   * 界面一律用它渲染，别直接用 username —— 飞牛账号的 username 是 nas:<uid>，
-   * 那是映射用的锚点，用户从没设置过、也认不出来。用 displayNameOf() 取值。
-   */
-  display_name?: string
-  /** 账号来源：gateway=由飞牛账号映射而来（只能免密进入），local=应用内自建 */
-  source?: 'gateway' | 'local'
-  /** 仅飞牛账号有值：飞牛侧的用户 ID，供界面标注与核对 */
-  trim_uid?: string
   role: 'admin' | 'operator' | 'viewer'
   status: number
   last_login_at?: string | null

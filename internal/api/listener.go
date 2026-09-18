@@ -22,13 +22,14 @@ type GatewayListener struct {
 
 // ListenGateway 绑定网关 socket 并做好准备，但不开始提供服务。
 //
-// 与端口监听相比只有两点不同，但都很关键：
-//  1. 请求只能来自本机（网络不可达），网关校验过飞牛会话后才转发过来；
-//  2. 能够查到连接方进程的身份（SO_PEERCRED），因此**只有**这条通道上的
-//     `X-Trim-*` 身份头才可能被信任 —— 见 gatewayConnContext。
+// 与端口监听相比只有两点事实上的不同：
+//  1. 请求只能来自本机（网络不可达），由网关校验过飞牛会话后转发过来；
+//  2. 能够查到连接方进程的身份（SO_PEERCRED），因此「这条连接确实来自网关」
+//     是一个可核实的事实 —— 见 gatewayConnContext。
 //
-// 这里刻意与 TCP 监听共用同一套路由：业务逻辑只能有一份，
-// 「哪条通道来的」只影响身份来源的可信度，不影响任何业务判断。
+// 这里刻意与 TCP 监听共用同一套路由：业务逻辑只能有一份。
+// 这两点差异都只关乎**通道**，不关乎权限：本应用不解析网关注入的任何身份，
+// 两条通道上的会话都必须先自己登录、权限完全相同。
 func (s *Server) ListenGateway(path string, h http.Handler) (*GatewayListener, error) {
 	if path == "" {
 		return nil, errors.New("未指定网关 socket 路径")
@@ -46,8 +47,8 @@ func (s *Server) ListenGateway(path string, h http.Handler) (*GatewayListener, e
 		return nil, fmt.Errorf("监听网关 socket 失败: %w", err)
 	}
 	// socket 文件设为可读写：网关以哪个用户运行不由本应用决定，靠文件权限
-	// 拦不住也认不出人。真正的访问控制是连接层的对端身份校验 ——
-	// 文件权限只能回答「能不能连上」，而我们要回答的是「是谁连的」。
+	// 拦不住也认不出人。因此文件权限不承担准入职责 —— 能连上不代表能做什么，
+	// 会话都必须先自己登录；对端身份只用来判断「这次请求是不是走的网关通道」。
 	if err := os.Chmod(path, 0o666); err != nil {
 		_ = ln.Close()
 		return nil, fmt.Errorf("设置网关 socket 权限失败: %w", err)

@@ -153,8 +153,7 @@
         <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
           <template #title>
             管理谁能登录这个界面。可以给家人或同事开通「只读」查看权限，避免误改配置。
-            本地账号的二次验证可由本人在右上角开启，也可由管理员在这里代为开启；
-            飞牛账号标记为「飞牛账号」，其密码与二次验证由飞牛 NAS 统一管理，本应用不重复设置。
+            二次验证可由本人在右上角开启，也可由管理员在这里代为开启。
           </template>
         </el-alert>
 
@@ -169,7 +168,7 @@
                 </el-tag>
               </div>
               <div class="fnwg-hint">
-                当管理员忘记密码、手机丢失且恢复码也遗失、或飞牛网关异常导致界面进不去时，
+                当管理员忘记密码、手机丢失且恢复码也遗失、或界面根本打不开时，
                 在登录页点「应急登录」输入它即可进入并重置密码或关闭二次验证。
                 它只能使用一次，用过立即作废并下发新的一码；系统只存哈希，无法再次查看，请离线保存。
               </div>
@@ -186,15 +185,7 @@
           <el-table :data="users" size="small" empty-text="暂无账号">
             <el-table-column label="登录账号" min-width="200">
               <template #default="{ row }">
-                <!-- 飞牛账号的 username 是 nas:<uid> 这种内部锚点，用户认不出来，
-                     所以这里显示飞牛那边的名字，并明确标出来源与 UID。 -->
-                <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap">
-                  <span>{{ displayNameOf(row) }}</span>
-                  <el-tag v-if="isGatewayAccount(row)" size="small" type="info" effect="plain">飞牛账号</el-tag>
-                </div>
-                <div v-if="isGatewayAccount(row)" class="fnwg-hint" style="font-size: 12px">
-                  飞牛 UID {{ row.trim_uid || '-' }}
-                </div>
+                <span>{{ row.username }}</span>
               </template>
             </el-table-column>
             <el-table-column label="权限" width="120">
@@ -211,8 +202,7 @@
             </el-table-column>
             <el-table-column label="二次验证" width="130">
               <template #default="{ row }">
-                <span v-if="isGatewayAccount(row)" class="fnwg-hint" style="font-size: 12px">由飞牛 NAS 管理</span>
-                <el-tag v-else size="small" :type="row.totp_enabled ? 'success' : 'info'" effect="plain">
+                <el-tag size="small" :type="row.totp_enabled ? 'success' : 'info'" effect="plain">
                   {{ row.totp_enabled ? '已开启' : '未开启' }}
                 </el-tag>
               </template>
@@ -225,17 +215,13 @@
                 <el-button link type="primary" @click="toggleUser(row)">
                   {{ row.status === 1 ? '停用' : '启用' }}
                 </el-button>
-                <!-- 飞牛账号免密进入、不经过本应用的口令校验，改密码/开关二次验证都不会生效，
-                     因此不给入口，避免让人以为设置成功却始终用不上。 -->
-                <template v-if="!isGatewayAccount(row)">
-                  <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
-                  <el-button v-if="!row.totp_enabled" link type="primary" @click="openAdminTOTP(row)">
-                    开启二次验证
-                  </el-button>
-                  <el-button v-else link type="warning" @click="resetUserTOTP(row)">
-                    重置二次验证
-                  </el-button>
-                </template>
+                <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
+                <el-button v-if="!row.totp_enabled" link type="primary" @click="openAdminTOTP(row)">
+                  开启二次验证
+                </el-button>
+                <el-button v-else link type="warning" @click="resetUserTOTP(row)">
+                  重置二次验证
+                </el-button>
                 <el-button link type="danger" @click="removeUser(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -247,25 +233,18 @@
             v-for="row in users"
             :key="row.id"
             :status="row.status === 1 ? 'ok' : 'off'"
-            :title="displayNameOf(row)"
+            :title="row.username"
           >
             <template #extra>
               <el-tag size="small" effect="plain">{{ roleLabel(row.role) }}</el-tag>
-              <el-tag v-if="isGatewayAccount(row)" size="small" type="info" effect="plain">飞牛账号</el-tag>
             </template>
-            <div v-if="isGatewayAccount(row)" class="fnwg-kv">
-              <span class="fnwg-kv-key">飞牛 UID</span>
-              <span class="fnwg-kv-val">{{ row.trim_uid || '-' }}</span>
-            </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">状态</span>
               <span class="fnwg-kv-val">{{ row.status === 1 ? '可登录' : '已停用' }}</span>
             </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">二次验证</span>
-              <span class="fnwg-kv-val">
-                {{ isGatewayAccount(row) ? '由飞牛 NAS 管理' : row.totp_enabled ? '已开启' : '未开启' }}
-              </span>
+              <span class="fnwg-kv-val">{{ row.totp_enabled ? '已开启' : '未开启' }}</span>
             </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">最近登录</span>
@@ -273,75 +252,14 @@
             </div>
             <template #actions>
               <el-button size="small" @click="toggleUser(row)">{{ row.status === 1 ? '停用' : '启用' }}</el-button>
-              <template v-if="!isGatewayAccount(row)">
-                <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
-                <el-button v-if="!row.totp_enabled" size="small" @click="openAdminTOTP(row)">
-                  开启二次验证
-                </el-button>
-                <el-button v-else size="small" @click="resetUserTOTP(row)">重置二次验证</el-button>
-              </template>
+              <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
+              <el-button v-if="!row.totp_enabled" size="small" @click="openAdminTOTP(row)">
+                开启二次验证
+              </el-button>
+              <el-button v-else size="small" @click="resetUserTOTP(row)">重置二次验证</el-button>
               <el-button size="small" @click="removeUser(row)">删除</el-button>
             </template>
           </ItemCard>
-        </div>
-      </el-tab-pane>
-
-      <!-- 登录方式：决定「谁能用什么方式进来」。
-           单独一个页签而不是塞进「账号管理」，是因为它管的是入口，
-           与「有哪些账号」是两件事。 -->
-      <el-tab-pane v-if="session.isAdmin" label="登录方式" name="login">
-        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
-          <template #title>
-            从飞牛桌面打开本应用时，飞牛已经确认了你的账号，可直接免密进入；
-            飞牛的管理员在本应用里也是管理员，普通用户为只读。
-          </template>
-        </el-alert>
-
-        <div class="fnwg-card" style="max-width: 860px">
-          <el-radio-group v-model="loginModeChoice" :disabled="loginModeSaving">
-            <el-radio value="both" class="fnwg-radio-line">两种方式都允许（推荐）</el-radio>
-            <el-radio value="gateway_only" class="fnwg-radio-line">只用飞牛账号（关闭端口登录）</el-radio>
-            <el-radio value="password_only" class="fnwg-radio-line">只用应用账号密码</el-radio>
-          </el-radio-group>
-
-          <div class="fnwg-hint" style="margin-top: 4px">
-            <div v-if="loginModeChoice === 'gateway_only'">
-              关闭后，直接访问端口将无法用账号密码登录，端口只保留「安全码应急登录」。
-              只要还能进飞牛桌面，就随时可以回到这里改回来。
-            </div>
-            <div v-else-if="loginModeChoice === 'password_only'">
-              关闭后，从飞牛桌面进入时也要输入应用账号密码；由飞牛账号自动创建的账号本来就没有密码，
-              将无法登录，需要管理员为它单独设置密码。
-            </div>
-            <div v-else>手机、电脑用应用账号密码登录；从飞牛桌面进入时免密。</div>
-          </div>
-
-          <el-alert
-            v-if="loginModeChoice === 'gateway_only' && !loginModeState.gateway_proven"
-            type="warning"
-            :closable="false"
-            show-icon
-            style="margin: 10px 0 0"
-            title="还不能关闭端口登录：本应用尚未成功用过一次飞牛账号免密登录"
-          >
-            <!-- 说清卡在哪一环：入口本身没起来时，让用户去点桌面图标是白费功夫。 -->
-            <div>{{ gatewayBlockReason }}</div>
-          </el-alert>
-
-          <div class="fnwg-toolbar" style="margin-top: 14px">
-            <el-button
-              type="primary"
-              :loading="loginModeSaving"
-              :disabled="loginModeChoice === loginModeState.mode"
-              @click="saveLoginMode"
-            >
-              保存
-            </el-button>
-            <el-tag v-if="loginModeState.gateway_entry" size="small" type="success" effect="plain">
-              当前正通过飞牛桌面入口访问
-            </el-tag>
-            <el-tag v-else size="small" type="info" effect="plain">当前正通过端口访问</el-tag>
-          </div>
         </div>
       </el-tab-pane>
 
@@ -691,7 +609,7 @@
       v-if="adminTOTPUser"
       v-model="adminTOTPDialog"
       :user-id="adminTOTPUser.id"
-      :user-name="displayNameOf(adminTOTPUser)"
+      :user-name="adminTOTPUser.username"
       @done="onAdminTOTPDone"
     />
 
@@ -784,8 +702,6 @@ import type {
   BackupRecord,
   DNSRecord,
   Health,
-  LoginMode,
-  LoginModeState,
   NotifyResult,
   NotifyStatus,
   SnapshotDiff,
@@ -803,7 +719,7 @@ import { useBreakpoint } from '@/composables/useBreakpoint'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
-import { displayNameOf, formatBytes, formatTime, isGatewayAccount } from '@/utils/format'
+import { formatBytes, formatTime } from '@/utils/format'
 
 const session = useSession()
 const realtime = useRealtime()
@@ -819,71 +735,6 @@ const settings = reactive<Record<string, string>>({
   default_dns: '',
 })
 const savingSettings = ref(false)
-
-// 登录方式：与「接入设置」分开保存。它决定谁能进得来，误改的后果比改错一个
-// 对外地址严重得多，因此不跟其它设置项共用一个保存按钮。
-const loginModeState = reactive<LoginModeState>({
-  mode: 'both',
-  gateway_proven: false,
-  gateway_entry: false,
-  // 读取前不假定入口是坏的，免得刚进页面就吓人一跳
-  gateway_socket: true,
-  gateway_diagnosis: '',
-})
-const loginModeChoice = ref<LoginMode>('both')
-const loginModeSaving = ref(false)
-
-/**
- * 「为什么现在还不能关闭端口登录」的准确说法。
- *
- * 必须把「入口本身没起来」和「入口正常但你还没走过」分开：前者无论点多少次
- * 飞牛桌面图标都不会成功，得直说是环境问题；混在一起说，用户会在两个入口之间
- * 反复来回，拿到的却始终是同一句提示。
- */
-const gatewayBlockReason = computed(() => {
-  if (!loginModeState.gateway_socket) {
-    return (
-      loginModeState.gateway_diagnosis ||
-      '本机没有监听网关入口（app.sock），因此从飞牛桌面打开本应用也无法免密登录。请重新安装本应用后再试。'
-    )
-  }
-  if (loginModeState.gateway_diagnosis) return loginModeState.gateway_diagnosis
-  return '请先从飞牛桌面用本应用图标打开一次，再回来开启。'
-})
-
-async function loadLoginMode() {
-  if (!session.isAdmin) return
-  try {
-    const st = await session.loadLoginMode()
-    loginModeState.mode = st.mode
-    loginModeState.gateway_proven = st.gateway_proven
-    loginModeState.gateway_entry = st.gateway_entry
-    loginModeState.gateway_socket = st.gateway_socket
-    loginModeState.gateway_diagnosis = st.gateway_diagnosis || ''
-    loginModeChoice.value = st.mode
-  } catch {
-    // 读不到不该影响其它设置页；保存时服务端仍会做同样的校验
-  }
-}
-
-async function saveLoginMode() {
-  loginModeSaving.value = true
-  try {
-    const out = await session.setLoginMode(loginModeChoice.value)
-    loginModeState.mode = out.mode
-    loginModeState.gateway_proven = out.gateway_proven
-    loginModeState.gateway_socket = out.gateway_socket
-    loginModeState.gateway_diagnosis = out.gateway_diagnosis || ''
-    loginModeChoice.value = out.mode
-    ElMessage.success('登录方式已更新')
-  } catch (e) {
-    // 服务端会说明「为什么现在不能这么改」（例如还没验证过网关可用），
-    // 不能吞掉它，否则用户只会看到一个点了没反应的按钮。
-    ElMessage.error((e as Error).message)
-  } finally {
-    loginModeSaving.value = false
-  }
-}
 
 // 事件通知单独一组状态，与「接入设置」各自保存：
 // 改通知渠道不该连带改动对外访问地址这类会影响所有设备的配置。
@@ -1331,7 +1182,7 @@ async function toggleUser(row: User) {
 
 async function resetPassword(row: User) {
   try {
-    const { value } = await ElMessageBox.prompt(`为「${displayNameOf(row)}」设置新密码（至少 8 位）`, '重置密码', {
+    const { value } = await ElMessageBox.prompt(`为「${row.username}」设置新密码（至少 8 位）`, '重置密码', {
       inputType: 'password',
     })
     await api.patch(`/users/${row.id}`, { role: row.role, password: value })
@@ -1361,7 +1212,7 @@ async function onAdminTOTPDone() {
 async function resetUserTOTP(row: User) {
   try {
     await ElMessageBox.confirm(
-      `将关闭「${displayNameOf(row)}」的二次验证，并清空其恢复码与受信任设备，该账号的在线会话也会被登出。\n\n` +
+      `将关闭「${row.username}」的二次验证，并清空其恢复码与受信任设备，该账号的在线会话也会被登出。\n\n` +
         '重置后该账号仅凭密码即可登录（安全性下降），请提醒对方尽快重新绑定。确认重置？',
       '重置二次验证',
       { type: 'warning', confirmButtonText: '确认重置' },
@@ -1380,7 +1231,7 @@ async function resetUserTOTP(row: User) {
 
 async function removeUser(row: User) {
   try {
-    await ElMessageBox.confirm(`确认删除账号「${displayNameOf(row)}」？删除后该账号立即无法登录。`, '删除账号', {
+    await ElMessageBox.confirm(`确认删除账号「${row.username}」？删除后该账号立即无法登录。`, '删除账号', {
       type: 'warning',
     })
     await api.del(`/users/${row.id}`)
@@ -1457,7 +1308,6 @@ async function onImportFile(e: Event) {
 
 onMounted(async () => {
   await loadAll()
-  await loadLoginMode()
 })
 </script>
 

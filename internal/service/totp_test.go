@@ -295,26 +295,6 @@ func TestAdminTOTPSetupOnBehalf(t *testing.T) {
 	if !step.TOTPRequired() {
 		t.Fatal("代开之后登录应要求动态口令")
 	}
-
-	// 飞牛账号：绑定、确认、重置三条路都必须被拒，且理由指向飞牛
-	gwStep, err := svc.GatewayLogin(ctx, service.GatewayIdentity{
-		UID: "8000", Username: "frank", IsAdmin: true,
-	}, "ua", "127.0.0.1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	gid := gwStep.User.ID
-	if _, err := svc.AdminBeginTOTPSetup(ctx, gid, actor); err == nil {
-		t.Fatal("飞牛账号不应允许管理员代开二次验证")
-	} else if !strings.Contains(err.Error(), "飞牛") {
-		t.Fatalf("拒绝理由要说清由飞牛管理，实际: %v", err)
-	}
-	if _, err := svc.AdminEnableTOTP(ctx, gid, "JBSWY3DPEHPK3PXP", "000000", actor); err == nil {
-		t.Fatal("飞牛账号不应允许管理员确认开启二次验证")
-	}
-	if err := svc.ResetUserTOTP(ctx, gid, actor); err == nil {
-		t.Fatal("飞牛账号不应允许重置二次验证")
-	}
 }
 
 // TestTOTPChallengeUser 验证失败限流键能反查到账号（限流器只知道随机挑战令牌）。
