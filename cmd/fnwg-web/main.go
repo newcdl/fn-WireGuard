@@ -30,6 +30,7 @@ import (
 	"fnwg/internal/service"
 	"fnwg/internal/store"
 	"fnwg/internal/sysutil"
+	"fnwg/internal/traffic"
 	"fnwg/internal/webui"
 	"fnwg/internal/wgback"
 )
@@ -80,6 +81,8 @@ func main() {
 		backend := wgback.New(cfg.NetStatePath())
 		engine := reconcile.New(st, backend, logger)
 		go engine.Run(ctx)
+		// 开发模式也要采样：否则报表与额度在本地永远是空的，等于没做。
+		traffic.New(st, engine.Status, logger).Start(ctx)
 		kore = core.NewLocal(engine)
 		logger.Warn("开发模式已启用：使用内存后端，不会操作真实网络", "backend", backend.Kind())
 		if err := ensureDevAdmin(ctx, st, logger); err != nil {

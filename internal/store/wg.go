@@ -170,6 +170,9 @@ func (s *Store) DeleteInterface(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM wg_peer WHERE interface_id=?`, id)
+	// 流量记录同理一并清掉（理由见 DeletePeer）：连接没了，它的设备也没了，
+	// 而 interface_id 会被后续新建的连接复用。
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM wg_traffic_hourly WHERE interface_id=?`, id)
 	return nil
 }
 
@@ -360,6 +363,14 @@ func (s *Store) DeletePeer(ctx context.Context, id int64) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	// 该设备的流量记录一并删除。
+	//
+	// 不留在库里当历史：设备删掉之后 peer_id 会被后续新建的设备复用，
+	// 留着就会把上一台设备的用量算到新设备头上 —— 报表与「每月额度」都会因此失真，
+	// 而两者看起来都「有数据」，没人会怀疑是串了账。
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM wg_traffic_hourly WHERE peer_id=?`, id); err != nil {
+		return err
 	}
 	return nil
 }

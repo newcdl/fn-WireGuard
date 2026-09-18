@@ -111,6 +111,27 @@ CREATE TABLE IF NOT EXISTS wg_peer_stat (
 );
 CREATE INDEX IF NOT EXISTS idx_stat_peer_ts ON wg_peer_stat(interface_id, public_key, ts);
 
+-- 按小时聚合的流量：报表与「每月额度」的唯一依据。
+--
+-- 为什么不直接用上面那张原始采样表算：
+--   原始采样是「一个点一行」，按 5 分钟采样 × 每台设备 × 90 天就是百万级行数，
+--   长期写放大不可接受（ROADMAP R8）；这里每小时一行、增量累加，
+--   20 台设备保留 90 天也只有四万余行。
+--
+-- 为什么存增量而不是累计快照：
+--   内核的累计计数会在接口重建（重启、重新下发配置）后归零，
+--   存增量才能让「这个月用了多少」不受影响 —— 采集侧负责识别计数回绕、
+--   把它当作新基线，绝不把负数写进来。
+CREATE TABLE IF NOT EXISTS wg_traffic_hourly (
+  peer_id      INTEGER NOT NULL,
+  interface_id INTEGER NOT NULL,
+  hour_ts      INTEGER NOT NULL,
+  rx_bytes     INTEGER NOT NULL DEFAULT 0,
+  tx_bytes     INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_traffic_hour ON wg_traffic_hourly(peer_id, hour_ts);
+CREATE INDEX IF NOT EXISTS idx_traffic_iface ON wg_traffic_hourly(interface_id, hour_ts);
+
 CREATE TABLE IF NOT EXISTS sys_user (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT    NOT NULL UNIQUE,

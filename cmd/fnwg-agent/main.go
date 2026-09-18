@@ -24,6 +24,7 @@ import (
 	"fnwg/internal/secretbox"
 	"fnwg/internal/store"
 	"fnwg/internal/sysutil"
+	"fnwg/internal/traffic"
 	"fnwg/internal/wgback"
 )
 
@@ -110,6 +111,10 @@ func main() {
 
 	// 采样与收敛循环：进程启动即执行一次全量收敛，实现重启自恢复。
 	go engine.Run(ctx)
+
+	// 流量采样：把内核里的累计计数折算成按小时的增量，供报表与「每月额度」使用。
+	// 只在这里（生产）与开发模式的 web 进程里各起一个 —— 两个进程同时写会重复计账。
+	traffic.New(st, engine.Status, logger).Start(ctx)
 
 	// 周期性修正共享文件权限，覆盖 SQLite 自行创建 -wal/-shm 的情况
 	go func() {
