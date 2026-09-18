@@ -11,6 +11,7 @@ import 'element-plus/theme-chalk/dark/css-vars.css'
 
 import App from './App.vue'
 import router from './router'
+import { initTheme } from './composables/useTheme'
 import './styles/main.css'
 
 const app = createApp(App)
@@ -21,13 +22,8 @@ for (const [name, comp] of Object.entries(Icons)) {
   app.component(name, comp as never)
 }
 
-// 跟随 fnOS 桌面的深浅色主题（应用以 iframe 形式内嵌在桌面窗口中）
-function syncTheme() {
-  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-  const html = document.documentElement
-  html.classList.toggle('dark', prefersDark)
-}
-syncTheme()
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncTheme)
+// 外观：用户选定浅色/深色/跟随系统，未选过时跟随系统（应用内嵌在 fnOS 桌面窗口中时，
+// 系统的深浅色就是桌面的深浅色）。偏好的应用与系统订阅都在 useTheme 里，见其注释。
+initTheme()
 
 app.mount('#app')
