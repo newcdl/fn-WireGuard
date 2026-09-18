@@ -80,6 +80,7 @@ import QRCode from 'qrcode'
 import { api } from '@/api/client'
 import type { TOTPSetup } from '@/api/types'
 import { useBreakpoint } from '@/composables/useBreakpoint'
+import { copyText } from '@/utils/clipboard'
 
 const props = defineProps<{ modelValue: boolean; userId: number; userName: string }>()
 const emit = defineEmits<{ 'update:modelValue': [boolean]; done: [] }>()
@@ -154,12 +155,12 @@ function close() {
 }
 
 async function copy(text: string) {
-  try {
-    await navigator.clipboard.writeText(text)
+  // 局域网 http 访问下 navigator.clipboard 不存在，走 copyText 的退路（见 utils/clipboard.ts）
+  if (await copyText(text)) {
     ElMessage.success('已复制到剪贴板')
-  } catch {
-    ElMessage.warning('浏览器拒绝了剪贴板访问，请手动选择复制')
+    return
   }
+  ElMessage.warning('当前访问方式下浏览器不允许自动复制，请手动选择复制')
 }
 </script>
 

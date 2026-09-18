@@ -74,7 +74,7 @@
             v-model="emCode"
             type="textarea"
             :rows="3"
-            placeholder="52 位字母数字，带分组连字符也可以"
+            placeholder="52 位字母数字；带分组连字符、空格或大小写不同都可以"
           />
         </el-form-item>
         <el-form-item label="新的登录密码（可留空）">

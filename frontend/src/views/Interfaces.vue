@@ -390,6 +390,7 @@ import { useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes } from '@/utils/format'
+import { copyText } from '@/utils/clipboard'
 
 const route = useRoute()
 const router = useRouter()
@@ -678,12 +679,12 @@ function exportAll() {
 }
 
 async function copy(text: string) {
-  try {
-    await navigator.clipboard.writeText(text)
+  // 局域网 http 访问下 navigator.clipboard 不存在，走 copyText 的退路（见 utils/clipboard.ts）
+  if (await copyText(text)) {
     ElMessage.success('已复制到剪贴板')
-  } catch {
-    ElMessage.warning('浏览器拒绝了剪贴板访问，请手动选择复制')
+    return
   }
+  ElMessage.warning('当前访问方式下浏览器不允许自动复制，请手动选择复制')
 }
 
 function gotoPeers(row: WgInterface) {

@@ -89,13 +89,7 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 	if username == "" {
 		return nil, errors.New("用户名不能为空")
 	}
-	// 冒号保留给历史上由飞牛账号免密登录自动创建的账号名（nas:<uid>）。
-	// 那套映射已在 0.8.20 移除，但老数据库里可能还留着这类账号（升级时会被清理，
-	// 从老库导出的备份若被恢复也可能带回来）。自建账号继续避开这个前缀，
-	// 清理逻辑就能一直安全地按 nas:* 判定。
-	if strings.Contains(username, ":") {
-		return nil, errors.New("用户名不能包含冒号（「nas:」前缀保留给历史账号使用）")
-	}
+
 	switch role {
 	case model.RoleAdmin, model.RoleOperator, model.RoleViewer:
 	default:
