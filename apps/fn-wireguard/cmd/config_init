@@ -11,9 +11,39 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$DIR/common"
 
 port="$(fnwg_service_port)"
+
+# fnwg_port_is_ours：端口上那个监听者是不是本应用自己。
+#
+# 这一段是被真机故障教出来的，必须留说明：原先的判据是「pid 文件里的进程已经不在
+# + 端口有人监听 = 被其他程序占用」。而 systemd 模式下**根本不写 web.pid**
+# （只有 PID 文件回退模式才写），于是应用正在运行时：
+#   前半句永远成立（没有 pid 文件）、后半句也永远成立（正是本应用在听）
+#   → 结论必然错。
+# 现象是：只要应用在跑，用户在飞牛里改任意一项配置（加授权目录、改对外地址……）
+# 都会以「执行配置初始化失败」告终，而端口其实一直是它自己在听。
+fnwg_port_is_ours() {
+    # 首选服务状态：这是「应用活着」最直接的答案，与进程管理方式无关。
+    if fnwg_status; then
+        return 0
+    fi
+    if fnwg_pid_alive "$TRIM_PKGVAR/web.pid"; then
+        return 0
+    fi
+    # 服务状态查不到时（单元刚崩、pid 文件丢了）从 socket 反查进程名兜底：
+    # ss -ltnp 只有 root 能看到进程名，而这些脚本都以 root 运行。
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnp 2>/dev/null | grep -q ":${port}[[:space:]].*fnwg-web" && return 0
+    fi
+    return 1
+}
+
 if command -v ss >/dev/null 2>&1; then
-    if ! fnwg_pid_alive "$TRIM_PKGVAR/web.pid" && ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}\$"; then
-        fnwg_fail "端口 ${port} 已被其他程序占用，本次配置无法生效。"
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}\$"; then
+        if fnwg_port_is_ours; then
+            fnwg_log "端口 ${port} 由本应用监听，配置检查通过"
+        else
+            fnwg_fail "端口 ${port} 已被其他程序占用，本次配置无法生效。"
+        fi
     fi
 fi
 

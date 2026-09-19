@@ -43,7 +43,10 @@ func newGatewayTestServer(t *testing.T) *Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	backend := wgback.NewMock(filepath.Join(dir, "netstate.json"))
 	svc := service.New(st, core.NewLocal(reconcile.New(st, backend, logger)), logger, "test")
-	return NewServer(svc, logger, "test", dir)
+	// 计划备份执行器：这些用例不碰它，给一个开发模式的最小实例即可
+	// （Dev 表示不做「必须在飞牛授权目录里」的校验——测试环境没有飞牛注入的环境变量）。
+	planRunner := service.NewBackupPlanRunner(st, "test", service.BackupPlanEnv{OwnDir: dir, Dev: true}, logger)
+	return NewServer(svc, logger, "test", dir, planRunner)
 }
 
 // TestCheckWSOriginAllowsFnOSDesktop 是「飞牛桌面实时状态永远连不上」的回归。

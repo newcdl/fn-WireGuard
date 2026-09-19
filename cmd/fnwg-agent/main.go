@@ -22,6 +22,7 @@ import (
 	"fnwg/internal/core"
 	"fnwg/internal/reconcile"
 	"fnwg/internal/secretbox"
+	"fnwg/internal/service"
 	"fnwg/internal/store"
 	"fnwg/internal/sysutil"
 	"fnwg/internal/traffic"
@@ -108,6 +109,21 @@ func main() {
 		}
 		return
 	}
+
+	// 计划备份：挂在常驻的收敛循环旁（见 reconcile.BackupPlanRunner）。
+	//
+	// 放在代理进程而不是 web 进程：代理是本应用里「一定在跑」的那个进程，
+	// 备份恰恰是最不该依赖界面进程是否活着的功能；另外失败通知要走通知队列，
+	// 而队列只在代理进程里启动。
+	//
+	// 授权目录来自飞牛注入的 TRIM_DATA_ACCESSIBLE_PATHS：应用只能写用户授权给它的目录，
+	// 目标目录必须落在其中（校验见 service.ValidateBackupTarget）。
+	engine.SetBackupPlanRunner(service.NewBackupPlanRunner(st, cfg.Version, service.BackupPlanEnv{
+		OwnDir:         cfg.ShareDir(),
+		AuthorizedDirs: cfg.AuthorizedDirs(),
+		Dev:            cfg.Dev,
+		GroupID:        sysutil.LookupGID(cfg.Group),
+	}, logger))
 
 	// 采样与收敛循环：进程启动即执行一次全量收敛，实现重启自恢复。
 	go engine.Run(ctx)

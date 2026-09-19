@@ -56,6 +56,27 @@ func (l *Local) CleanupNetwork(ctx context.Context) ([]string, error) {
 	return l.Eng.CleanupNetwork(ctx)
 }
 
+// RunBackupPlan 立即执行一次计划备份（本实现即以本进程的特权身份执行）。
+func (l *Local) RunBackupPlan(ctx context.Context, userID int64, username, srcIP string) (agentapi.BackupRunResult, error) {
+	ok, file, reason := l.Eng.RunBackupNow(ctx, userID, username, srcIP)
+	return agentapi.BackupRunResult{OK: ok, File: file, Error: reason}, nil
+}
+
+// InspectBackupDir 检查备份目标目录并列出其中的副本（本实现即以本进程身份读写）。
+func (l *Local) InspectBackupDir(ctx context.Context, dir string) (model.BackupDirInfo, error) {
+	return l.Eng.InspectBackupDir(ctx, dir)
+}
+
+// ReadBackupCopy 读取目标目录里的一份副本。
+func (l *Local) ReadBackupCopy(ctx context.Context, dir, name string) ([]byte, error) {
+	return l.Eng.ReadBackupCopy(ctx, dir, name)
+}
+
+// WriteBackupCopy 把一份本地备份另存到目标目录。
+func (l *Local) WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error) {
+	return l.Eng.WriteBackupCopy(ctx, dir, backupID, userID, username, srcIP)
+}
+
 // DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡。
 func (l *Local) DeleteForeignInterface(ctx context.Context, name string) ([]string, error) {
 	return l.Eng.DeleteForeignInterface(ctx, name)

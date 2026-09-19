@@ -13,6 +13,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -35,6 +36,39 @@ const SampleInterval = 2 * time.Second
 
 // persistInterval 是历史采样落库间隔。
 const persistInterval = 60 * time.Second
+
+// BackupPlanCheckInterval 是计划备份的检查间隔。
+//
+// 5 分钟一查：日程精度是分钟，查得更密没有额外收益；而按小时查会让「每天 03:30」
+// 最晚拖到 04:30 才跑——那一刻 NAS 若正好在忙或关机，就可能白等一天。
+const BackupPlanCheckInterval = 5 * time.Minute
+
+// BackupPlanRunner 由上层注入（见 SetBackupPlanRunner）：到点则执行一次计划备份。
+//
+// 用接口而不是直接调用业务层：引擎的方向一直是「只依赖存储与数据面」，
+// 让它 import service 会把这条边界拆掉（业务层本来就依赖引擎提供的状态）。
+// 返回值刻意用三个原始值，调用方只需要知道「跑没跑、成没成、为什么没成」。
+type BackupPlanRunner interface {
+	RunIfDue(ctx context.Context, now time.Time) (ran, ok bool, reason string)
+	// RunBackupNow 立刻执行一次（界面上点「立即执行一次」），不看日程。
+	//
+	// 手动执行也放在这里，是因为它**必须由特权代理执行**：写入目标是飞牛授权给应用的目录，
+	// 而界面进程（fnwg）对那个目录没有写权限。让界面进程自己写，就会出现「保存时检查通过、
+	// 真写文件时被拒」这种自相矛盾的结果 —— 真机上已经这样翻过一次车。
+	// 两条路（按日程 / 手动）落在同一个进程、同一个身份上，就不会再各走一套。
+	RunBackupNow(ctx context.Context, userID int64, username, srcIP string) (ok bool, file, reason string)
+	// InspectBackupDir 检查备份目标目录并列出其中的副本。
+	//
+	// 「能不能写」必须由本进程（特权代理）回答：目标目录是用户授权给应用的共享文件夹，
+	// 界面进程（fnwg）对它没有写权限，问它得到的是它自己的权限，与备份能否成功无关。
+	InspectBackupDir(ctx context.Context, dir string) (model.BackupDirInfo, error)
+	// ReadBackupCopy 读取目标目录里的一份副本（供界面下载、或用它还原）。
+	ReadBackupCopy(ctx context.Context, dir, name string) ([]byte, error)
+	// WriteBackupCopy 把一份本地备份另存到目标目录，返回实际写出的文件名。
+	//
+	// 源按备份 ID 指定，不接受任意路径：这是特权进程，协议层刻意不提供任意路径读写能力。
+	WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error)
+}
 
 type peerSample struct {
 	rx int64
@@ -76,9 +110,60 @@ type Engine struct {
 	lastDiff   []string
 	// dnsOn 记录当前「内网域名解析」开关状态，供状态上报使用。
 	dnsOn bool
+	// backupPlan 计划备份执行器，由 cmd 层注入；为 nil 时跳过（命令行与测试环境）。
+	backupPlan BackupPlanRunner
 
 	trigger chan struct{}
 }
+
+// RunBackupNow 以特权身份立即执行一次计划备份，返回「成没成、写到哪、为什么没成」。
+//
+// 界面上的「立即执行一次」走这里：写入目标是用户授权的目录，界面进程没有写权限，
+// 而本进程（代理）以 root 运行，不受这个限制。
+//
+// 执行者信息（谁、从哪来）整份往下传：这次执行要写审计，审计页得能看出是有人手动跑的，
+// 而不是系统自己跑了一次。
+func (e *Engine) RunBackupNow(ctx context.Context, userID int64, username, srcIP string) (bool, string, string) {
+	if e.backupPlan == nil {
+		return false, "", errNoBackupRunner.Error()
+	}
+	return e.backupPlan.RunBackupNow(ctx, userID, username, srcIP)
+}
+
+// InspectBackupDir 检查备份目标目录并列出其中的副本。
+//
+// 目标目录的一切读写都由本进程完成（见 BackupPlanRunner 的说明），因此这里的结论
+// 可以直接当成事实：能写就是能写。
+func (e *Engine) InspectBackupDir(ctx context.Context, dir string) (model.BackupDirInfo, error) {
+	if e.backupPlan == nil {
+		return model.BackupDirInfo{}, errNoBackupRunner
+	}
+	return e.backupPlan.InspectBackupDir(ctx, dir)
+}
+
+// ReadBackupCopy 读取目标目录里的一份副本。
+func (e *Engine) ReadBackupCopy(ctx context.Context, dir, name string) ([]byte, error) {
+	if e.backupPlan == nil {
+		return nil, errNoBackupRunner
+	}
+	return e.backupPlan.ReadBackupCopy(ctx, dir, name)
+}
+
+// WriteBackupCopy 把一份本地备份另存到目标目录。
+func (e *Engine) WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error) {
+	if e.backupPlan == nil {
+		return "", errNoBackupRunner
+	}
+	return e.backupPlan.WriteBackupCopy(ctx, dir, backupID, userID, username, srcIP)
+}
+
+// errNoBackupRunner 表示引擎里没有注入计划备份执行器（命令行、测试环境）。
+var errNoBackupRunner = errors.New("后台服务未启用计划备份（请确认特权代理正在运行）")
+
+// SetBackupPlanRunner 注入计划备份执行器。
+//
+// 由 cmd 层调用：只有那里同时知道「应用自己的数据目录在哪」和「谁来生成备份内容」。
+func (e *Engine) SetBackupPlanRunner(r BackupPlanRunner) { e.backupPlan = r }
 
 // New 创建引擎。
 func New(st *store.Store, back wgback.Backend, logger *slog.Logger) *Engine {
@@ -798,11 +883,13 @@ func (e *Engine) Run(ctx context.Context) {
 	reconc := time.NewTicker(ReconcileInterval)
 	quota := time.NewTicker(30 * time.Second)
 	cleanup := time.NewTicker(time.Hour)
+	backupPlan := time.NewTicker(BackupPlanCheckInterval)
 	defer func() {
 		sample.Stop()
 		reconc.Stop()
 		quota.Stop()
 		cleanup.Stop()
+		backupPlan.Stop()
 	}()
 
 	for {
@@ -824,6 +911,34 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-cleanup.C:
 			_ = e.store.PruneLogs(ctx, time.Now().AddDate(0, 0, -14))
 			_ = e.store.CleanExpiredSessions(ctx)
+		case <-backupPlan.C:
+			e.runBackupPlan(ctx)
 		}
 	}
+}
+
+// runBackupPlan 到点执行一次计划备份，失败时推送通知。
+//
+// 通知放在引擎侧发：通知队列只在代理进程里启动（见 service 的说明），
+// 而计划备份可能与界面同进程、也可能不在——交给「持有已启动队列」的一方发最可靠。
+func (e *Engine) runBackupPlan(ctx context.Context) {
+	if e.backupPlan == nil {
+		return
+	}
+	ran, ok, reason := e.backupPlan.RunIfDue(ctx, time.Now())
+	if !ran {
+		return
+	}
+	if ok {
+		e.log.Info("计划备份已完成")
+		return
+	}
+	e.log.Warn("计划备份失败", "err", reason)
+	e.notifier.Notify(ctx, notify.Event{
+		Kind:  notify.KindBackupFailed,
+		Title: "计划备份失败",
+		Body: "这次没能把备份写到目标目录：" + reason +
+			"。修好之后可在「系统设置 → 备份还原 → 计划备份」里点「立即执行一次」补上。",
+		At: time.Now(),
+	})
 }

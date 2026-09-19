@@ -213,6 +213,8 @@ export interface BackupRecord {
   note: string
   include_key: boolean
   created_at: string
+  /** 记录在、文件却已经不在了（被手动删除或移走）：界面据此禁掉下载与还原 */
+  missing?: boolean
 }
 
 /** 配置快照与当前配置之间的一处变化 */
@@ -496,4 +498,55 @@ export interface TrafficReport {
   retention_days: number
   hour_rows: number
   oldest?: string | null
+}
+
+/** 计划备份的配置 */
+export interface BackupPlan {
+  enabled: boolean
+  /** daily（每天）| weekly（每周） */
+  freq: string
+  /** 执行时刻 HH:MM（NAS 本地时间） */
+  at: string
+  /** 1=周一 … 7=周日，仅每周执行时有效 */
+  weekday: number
+  /** 目标目录（绝对路径，必须落在应用自己的数据目录之外） */
+  dir: string
+  /** 保留份数 */
+  keep: number
+}
+
+/** 计划备份最近一次的执行结果 */
+export interface BackupRunState {
+  at: string
+  ok: boolean
+  /** 由「立即执行一次」触发 */
+  manual?: boolean
+  file?: string
+  size?: number
+  pruned?: number
+  error?: string
+}
+
+/** 目标目录里的一份备份副本 */
+export interface BackupPlanFile {
+  name: string
+  size: number
+  mod_time: string
+}
+
+/** 计划备份的完整状态 */
+export interface BackupPlanStatus {
+  plan: BackupPlan
+  last?: BackupRunState
+  since?: string
+  next_at?: string
+  files: BackupPlanFile[]
+  dir_ok: boolean
+  dir_note?: string
+  /** 用户在飞牛里授权给本应用的目录（目标目录只能从这里面选） */
+  authorized_dirs: string[]
+  /** 是否必须从上面那份清单里选（开发模式为 false） */
+  auth_required: boolean
+  /** 配置解析出来的实际落盘目录：目标选「应用自己的备份目录」时就是它 */
+  resolved_dir: string
 }

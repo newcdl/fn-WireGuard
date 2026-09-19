@@ -32,6 +32,9 @@ type Server struct {
 	assets   fs.FS
 	version  string
 	shareDir string
+	// planRunner 计划备份执行器。放在服务端而不是每次请求新建：
+	// 它内部靠包级锁串行化「写入 + 清理旧份」，每次新建就挡不住并发触发。
+	planRunner *service.BackupPlanRunner
 
 	loginMu    sync.Mutex
 	loginFails map[string]loginFail
@@ -51,7 +54,10 @@ type loginFail struct {
 }
 
 // NewServer 创建 API 服务。
-func NewServer(svc *service.Service, logger *slog.Logger, version, shareDir string) *Server {
+//
+// planRunner 由 cmd 层构造并注入：目标目录的合法性依赖飞牛注入的授权环境变量
+// （TRIM_DATA_ACCESSIBLE_PATHS），那只有 cmd 层拿得到。
+func NewServer(svc *service.Service, logger *slog.Logger, version, shareDir string, planRunner *service.BackupPlanRunner) *Server {
 	// 配置快照与备份共用共享目录：那里已经被应用中心授予了组读写权限，
 	// 另开子目录还得再走一遍权限自愈，不如同目录、靠文件名前缀区分。
 	svc.SetSnapshotDir(shareDir)
@@ -60,6 +66,7 @@ func NewServer(svc *service.Service, logger *slog.Logger, version, shareDir stri
 		log:        logger,
 		version:    version,
 		shareDir:   shareDir,
+		planRunner: planRunner,
 		loginFails: map[string]loginFail{},
 	}
 }

@@ -3,7 +3,9 @@
 
 <template>
   <span class="fnwg-field-label">
-    <span class="fnwg-field-label-text">{{ meta.label }}</span>
+    <!-- 按钮旁边、卡片标题旁边这类位置只需要那个问号：
+         标签文字已经在按钮/标题上写着了，再显示一遍就成了重复。 -->
+    <span v-if="!iconOnly" class="fnwg-field-label-text">{{ meta.label }}</span>
     <el-popover
       :width="helpPopoverWidth"
       trigger="click"
@@ -66,7 +68,14 @@ import { QuestionFilled } from '@element-plus/icons-vue'
 import type { FieldMeta } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 
-defineProps<{ meta: FieldMeta }>()
+withDefaults(
+  defineProps<{
+    meta: FieldMeta
+    /** 只显示问号图标（按钮、卡片标题旁边用），不重复显示标签文字 */
+    iconOnly?: boolean
+  }>(),
+  { iconOnly: false },
+)
 
 const { helpPopoverWidth } = useBreakpoint()
 </script>

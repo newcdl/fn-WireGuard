@@ -169,19 +169,29 @@ type BackupPayload struct {
 // 它们每几秒就变，混进文件不仅让快照无法做「内容相同即跳过」的去重，
 // 还会让快照之间的差异对比全是噪声。
 func (s *Service) buildBackupPayload(ctx context.Context, includeUsers bool) (*BackupPayload, error) {
-	ifaces, err := s.Store.ListInterfaces(ctx)
+	return BuildBackupPayload(ctx, s.Store, s.Version, includeUsers)
+}
+
+// BuildBackupPayload 采集当前配置生成备份内容（与 Service 上的同名方法同源，说明见上）。
+//
+// 之所以做成包级函数：计划备份要在**代理进程**的循环里跑，而那里没有 Service。
+// 为此在代理进程里也造一个 Service，等于为了一个定时任务把整套业务层搬过去；
+// 而把这段逻辑抄一份，两处迟早会长出不一样的口径 —— 备份文件一旦不一致，
+// 真出问题时连「哪一份才是对的」都说不清。
+func BuildBackupPayload(ctx context.Context, st *store.Store, version string, includeUsers bool) (*BackupPayload, error) {
+	ifaces, err := st.ListInterfaces(ctx)
 	if err != nil {
 		return nil, err
 	}
 	payload := &BackupPayload{
-		Version:    s.Version,
+		Version:    version,
 		CreatedAt:  time.Now(),
 		IncludeKey: true,
 		Interfaces: []model.Interface{},
 		Peers:      []model.Peer{},
 		Users:      []BackupUser{},
 	}
-	settings, err := s.Store.AllSettings(ctx)
+	settings, err := st.AllSettings(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +202,7 @@ func (s *Service) buildBackupPayload(ctx context.Context, includeUsers bool) (*B
 		it.Up, it.PeerCount, it.PeerOnline = false, 0, 0
 		it.RxBytes, it.TxBytes, it.RxRate, it.TxRate = 0, 0, 0, 0
 		payload.Interfaces = append(payload.Interfaces, it)
-		peers, err := s.Store.ListPeers(ctx, it.ID)
+		peers, err := st.ListPeers(ctx, it.ID)
 		if err != nil {
 			continue
 		}
@@ -208,14 +218,14 @@ func (s *Service) buildBackupPayload(ctx context.Context, includeUsers bool) (*B
 	}
 	// 内网域名映射同样属于「配置」：不回滚它，就会出现「配置已回到过去，
 	// 但设备用主机名访问的地址还是三天前那一版」这种半回滚状态。
-	if recs, err := s.Store.ListDNSRecords(ctx); err == nil {
+	if recs, err := st.ListDNSRecords(ctx); err == nil {
 		payload.HasDNSRecords = true
 		payload.DNSRecords = recs
 	}
 	if !includeUsers {
 		return payload, nil
 	}
-	users, err := s.Store.ListUsers(ctx)
+	users, err := st.ListUsers(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -247,9 +257,9 @@ func (s *Service) CreateBackup(ctx context.Context, dir, note string, a Actor) (
 	if err := os.MkdirAll(dir, 0o770); err != nil {
 		return nil, err
 	}
-	filename := fmt.Sprintf("fn-wireguard-backup-%s.json", time.Now().Format("20060102-150405"))
-	path := filepath.Join(dir, filename)
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
+	// 文件名精确到秒，同一秒内连点两次会撞名 —— 见 writeBackupFile 的说明。
+	filename, err := writeBackupFile(dir, fmt.Sprintf("fn-wireguard-backup-%s.json", time.Now().Format("20060102-150405")), raw, 0o600)
+	if err != nil {
 		return nil, err
 	}
 	sum := sha256.Sum256(raw)
@@ -371,6 +381,11 @@ func (s *Service) LoadBackupPayload(ctx context.Context, dir string, id int64) (
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, target.Filename))
 	if err != nil {
+		// 与 DownloadBackup 同一句话：记录还在、文件没了，是用户能自己处理的情形，
+		// 报「读取文件失败」只会让人以为系统坏了。
+		if os.IsNotExist(err) {
+			return nil, nil, fmt.Errorf("备份文件已经不在了（可能被手动删除或移动）：%s", target.Filename)
+		}
 		return nil, nil, fmt.Errorf("读取文件失败: %w", err)
 	}
 	var payload BackupPayload

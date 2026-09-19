@@ -529,3 +529,25 @@ type PeerSpec struct {
 	AllowedIPs   []string
 	Keepalive    int
 }
+
+// BackupCopy 是外部备份目录里的一份副本。
+//
+// 放在 model 里而不是各自定义一份：它以同一形状穿过三个包 ——
+// 特权代理（真正读写这个目录的进程）→ 协议 → 界面接口。
+// 三处各写一个同形结构，迟早会有一处的字段名或 json tag 走偏，
+// 而那种偏差的表现是「界面上少一列或时间显示不出来」，很难往回追。
+type BackupCopy struct {
+	Name    string    `json:"name"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+}
+
+// BackupDirInfo 是外部备份目录的实况：能不能写、有什么要说清的、里面有哪些副本。
+//
+// OK/Note 由**真正执行写入的进程**给出（见 internal/service 里 InspectTargetDir 的说明），
+// 界面只负责显示，不自己判断。
+type BackupDirInfo struct {
+	OK    bool         `json:"ok"`
+	Note  string       `json:"note,omitempty"`
+	Files []BackupCopy `json:"files,omitempty"`
+}

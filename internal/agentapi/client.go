@@ -185,6 +185,46 @@ func (c *Client) CleanupNetwork(ctx context.Context) ([]string, error) {
 	return out.Actions, nil
 }
 
+// RunBackupPlan 让特权代理立即执行一次计划备份。
+//
+// 由代理写、不由界面进程写：目标目录是用户授权给应用的共享文件夹，
+// 界面进程（fnwg）对它没有写权限。
+func (c *Client) RunBackupPlan(ctx context.Context, userID int64, username, srcIP string) (BackupRunResult, error) {
+	var out BackupRunResult
+	params := BackupRunParams{UserID: userID, Username: username, SrcIP: srcIP}
+	err := c.call(ctx, MethodBackupRun, params, &out)
+	return out, err
+}
+
+// InspectBackupDir 让代理检查备份目标目录并列出其中的副本。
+func (c *Client) InspectBackupDir(ctx context.Context, dir string) (model.BackupDirInfo, error) {
+	var out model.BackupDirInfo
+	if err := c.call(ctx, MethodBackupDirInspect, BackupDirParams{Dir: dir}, &out); err != nil {
+		return model.BackupDirInfo{}, err
+	}
+	return out, nil
+}
+
+// ReadBackupCopy 让代理读取目标目录里的一份副本。
+func (c *Client) ReadBackupCopy(ctx context.Context, dir, name string) ([]byte, error) {
+	var out BackupCopyRawResult
+	params := BackupCopyReadParams{Dir: dir, Name: name}
+	if err := c.call(ctx, MethodBackupCopyRead, params, &out); err != nil {
+		return nil, err
+	}
+	return out.Raw, nil
+}
+
+// WriteBackupCopy 让代理把一份本地备份另存到目标目录。
+func (c *Client) WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error) {
+	var out BackupCopyWriteResult
+	params := BackupCopyWriteParams{Dir: dir, BackupID: backupID, UserID: userID, Username: username, SrcIP: srcIP}
+	if err := c.call(ctx, MethodBackupCopyWrite, params, &out); err != nil {
+		return "", err
+	}
+	return out.Name, nil
+}
+
 // DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡（疑似残留）。
 func (c *Client) DeleteForeignInterface(ctx context.Context, name string) ([]string, error) {
 	var out struct {

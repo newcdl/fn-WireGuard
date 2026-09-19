@@ -82,7 +82,16 @@ export async function postRaw<T>(path: string, body: string): Promise<T> {
 export async function downloadText(path: string, filename: string) {
   const res = await fetch(BASE + path, { credentials: 'include' })
   if (!res.ok) {
-    throw new ApiError(res.status, '下载失败')
+    // 把服务端那句话带出来：「文件已不存在」和「没有权限」要用户做的事完全不同，
+    // 一律显示「下载失败」等于把原因吞掉，用户只能去猜。
+    let msg = `下载失败（HTTP ${res.status}）`
+    try {
+      const payload = await res.json()
+      if (payload?.message) msg = payload.message
+    } catch {
+      /* 响应不是 JSON：保留上面那句带状态码的兜底说明 */
+    }
+    throw new ApiError(res.status, msg)
   }
   const blob = await res.blob()
   const url = URL.createObjectURL(blob)

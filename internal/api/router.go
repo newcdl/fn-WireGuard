@@ -142,6 +142,17 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.With(requirePerm(model.PermBackupRestore)).Delete("/backups/{id}", s.handleDeleteBackup)
 		r.With(requirePerm(model.PermBackupRestore)).Post("/backups/{id}/restore", s.handleRestoreBackup)
 
+		// 计划备份：定时把备份写到用户授权的共享文件夹（在应用自己的数据目录之外）。
+		//
+		// 路径特意不用 /backups/plan：与 /backups/{id} 共处一棵路由树，
+		// 静态段虽然优先匹配，但少一层「谁赢」的推理，出错的可能就少一分。
+		// 全部要求备份还原权限：它能读取外部副本并覆盖整机配置，比「看备份列表」敏感得多。
+		r.With(requirePerm(model.PermBackupRestore)).Get("/backup-plan", s.handleBackupPlanStatus)
+		r.With(requirePerm(model.PermBackupRestore)).Put("/backup-plan", s.handleSaveBackupPlan)
+		r.With(requirePerm(model.PermBackupRestore)).Post("/backup-plan/run", s.handleRunBackupPlan)
+		r.With(requirePerm(model.PermBackupRestore)).Get("/backup-plan/download", s.handleDownloadPlanFile)
+		r.With(requirePerm(model.PermBackupRestore)).Post("/backup-plan/restore", s.handleRestorePlanFile)
+
 		// 配置快照与一键回滚：关键改动前自动留档，可看差异、可整体回滚。
 		// 查看类接口对所有登录用户开放（与备份列表一致）；
 		// 留档/回滚/删除会改动线上配置，需要备份还原权限。

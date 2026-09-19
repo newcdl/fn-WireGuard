@@ -75,11 +75,24 @@ func main() {
 		logger.Warn("导入安装向导配置失败", "err", err)
 	}
 
+	// 计划备份执行器：界面（保存配置、手动执行）与开发模式的引擎共用同一个实例。
+	// 生产环境里，按日程执行的那一份在代理进程中（见 cmd/fnwg-agent）。
+	planRunner := service.NewBackupPlanRunner(st, cfg.Version, service.BackupPlanEnv{
+		OwnDir:         cfg.ShareDir(),
+		AuthorizedDirs: cfg.AuthorizedDirs(),
+		Dev:            cfg.Dev,
+		// 属组用于把我们在授权目录里建的下层目录归到本应用，好让界面进程也能读写其中由代理写出的备份
+		GroupID: sysutil.LookupGID(cfg.Group),
+	}, logger)
+
 	var kore agentapi.Core
 	if cfg.Dev {
 		// 开发模式：进程内使用内存后端，不依赖特权代理
 		backend := wgback.New(cfg.NetStatePath())
 		engine := reconcile.New(st, backend, logger)
+		// 开发模式也要挂计划备份：否则本地永远看不到「到点自动备份」这条路径，
+		// 而那正是它最容易出错的地方（日程判定、目标目录、清理旧份）。
+		engine.SetBackupPlanRunner(planRunner)
 		go engine.Run(ctx)
 		// 开发模式也要采样：否则报表与额度在本地永远是空的，等于没做。
 		traffic.New(st, engine.Status, logger).Start(ctx)
@@ -103,7 +116,7 @@ func main() {
 	if err != nil {
 		logger.Warn("前端资源不可用", "err", err)
 	}
-	srv := api.NewServer(svc, logger, cfg.Version, cfg.ShareDir())
+	srv := api.NewServer(svc, logger, cfg.Version, cfg.ShareDir(), planRunner)
 
 	httpSrv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port),

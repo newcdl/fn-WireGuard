@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"fnwg"
 	"fnwg/internal/model"
 	"fnwg/internal/service"
+	"fnwg/internal/store"
 )
 
 // ---------------------------------------------------------------- 认证
@@ -763,12 +766,27 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "share_dir": s.shareDir})
+	// 多带一个 missing：记录在数据库里，文件却可能已经被手动删掉或移走。
+	// 让界面提前把这一行标出来并禁掉下载/还原，比等用户点了再报错省事 ——
+	// 那种报错（open …: no such file）既不好读，也说不清该怎么办。
+	type backupRow struct {
+		store.BackupRecord
+		Missing bool `json:"missing"`
+	}
+	rows := make([]backupRow, 0, len(items))
+	for _, it := range items {
+		_, statErr := os.Stat(filepath.Join(s.shareDir, it.Filename))
+		rows = append(rows, backupRow{BackupRecord: it, Missing: os.IsNotExist(statErr)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": rows, "share_dir": s.shareDir})
 }
 
 func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Note string `json:"note"`
+		// Dir 是可选的「另存一份到」：留空表示只存到应用自己的备份目录（与历史行为一致）。
+		// 只能选用户在飞牛里授权给本应用的目录；写入由特权代理执行，见 Core.WriteBackupCopy。
+		Dir string `json:"dir"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -779,7 +797,22 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, rec)
+	out := map[string]any{"backup": rec}
+	if strings.TrimSpace(in.Dir) != "" {
+		// 另存也交给代理：写入发生在用户授权的共享文件夹上，而界面进程对它没有写权限。
+		// 源按备份 ID 指定（代理自己去找文件），不给协议任何任意路径读写的能力。
+		a := actorOf(r)
+		_, derr := s.svc.Core.WriteBackupCopy(r.Context(), in.Dir, rec.ID, a.UserID, a.Username, a.SrcIP)
+		if derr != nil {
+			// 本地那份已经写好了，这里只是「另存一份」没成。不能整体报失败 ——
+			// 那会让人以为没备份，而备份其实好好地在列表里。返回成功 + 单独说明。
+			out["copy_error"] = derr.Error()
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		out["copied_to"] = filepath.Clean(strings.TrimSpace(in.Dir))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {

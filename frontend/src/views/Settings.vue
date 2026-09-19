@@ -373,82 +373,10 @@
 
       <!-- 备份与还原 -->
       <el-tab-pane label="备份还原" name="backup">
-        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
-          <template #title>
-            备份会保存全部连接、设备、系统设置与账号（含管理员密码与密钥），换机或误删后可一键完整还原。建议在每次大改动前先备份一次。
-          </template>
-        </el-alert>
-
-        <div class="fnwg-toolbar">
-          <el-button v-if="session.can('backup.restore')" type="primary" :icon="Plus" @click="createBackup">
-            立即备份
-          </el-button>
-          <el-button v-if="session.can('backup.restore')" :icon="Upload" @click="openImportBackup">
-            导入备份
-          </el-button>
-          <input
-            ref="backupFileInput"
-            type="file"
-            accept=".json,application/json"
-            style="display: none"
-            @change="onImportFile"
-          />
-          <div style="flex: 1"></div>
-          <span class="fnwg-hint">备份文件位置：{{ shareDir || '-' }}</span>
-        </div>
-
-        <div v-if="!isMobile" class="fnwg-card">
-          <el-table :data="backups" size="small" empty-text="还没有备份">
-            <el-table-column prop="filename" label="备份文件" min-width="240" />
-            <el-table-column label="大小" width="100">
-              <template #default="{ row }">{{ formatBytes(row.size) }}</template>
-            </el-table-column>
-            <el-table-column label="备份内容" width="110">
-              <template #default>
-                <el-tag size="small" type="warning" effect="plain">全量备份</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="备份时间" width="180">
-              <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
-            </el-table-column>
-            <el-table-column prop="note" label="备注" min-width="140" />
-            <el-table-column label="操作" width="200">
-              <template #default="{ row }">
-                <el-button v-if="session.can('backup.restore')" link type="primary" @click="restore(row)">还原</el-button>
-                <el-button v-if="session.can('backup.restore')" link type="primary" @click="downloadBackup(row)">下载</el-button>
-                <el-button v-if="session.can('backup.restore')" link type="danger" @click="removeBackup(row)">删除</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </div>
-
-        <div v-else>
-          <ItemCard v-for="row in backups" :key="row.id" :title="row.filename">
-            <template #extra>
-              <el-tag size="small" type="warning" effect="plain">全量备份</el-tag>
-            </template>
-            <div class="fnwg-kv">
-              <span class="fnwg-kv-key">备份时间</span>
-              <span class="fnwg-kv-val">{{ formatTime(row.created_at) }}</span>
-            </div>
-            <div class="fnwg-kv">
-              <span class="fnwg-kv-key">大小</span>
-              <span class="fnwg-kv-val">{{ formatBytes(row.size) }}</span>
-            </div>
-            <div v-if="row.note" class="fnwg-kv">
-              <span class="fnwg-kv-key">备注</span>
-              <span class="fnwg-kv-val">{{ row.note }}</span>
-            </div>
-            <template #actions>
-              <el-button v-if="session.can('backup.restore')" size="small" type="primary" @click="restore(row)">
-                还原
-              </el-button>
-              <el-button v-if="session.can('backup.restore')" size="small" @click="downloadBackup(row)">下载</el-button>
-              <el-button v-if="session.can('backup.restore')" size="small" @click="removeBackup(row)">删除</el-button>
-            </template>
-          </ItemCard>
-          <div v-if="!backups.length" class="fnwg-empty">还没有备份</div>
-        </div>
+        <!-- 整块交给组件：这里以前塞着「备份列表 + 计划备份 + 副本列表」三段，
+             加起来两百多行，而这个文件已经近两千行。备份相关的状态与动作一起搬走，
+             顺带能在页签打开时才去取数据（没打开就不请求）。 -->
+        <BackupPanel v-if="tab === 'backup'" />
       </el-tab-pane>
 
       <!-- 配置快照与一键回滚 -->
@@ -771,6 +699,9 @@
       </template>
     </el-dialog>
 
+    <!-- 立即备份：备注 + 目标目录。
+         目标目录默认是「应用自己的备份目录」（与以前一样，备份出现在下面的列表里，可下载可还原）；
+         也可以顺手在你授权的共享文件夹里留一份副本 —— 那正是备份想防的「同一块盘一起坏」。 -->
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
@@ -778,8 +709,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Upload, Reading, Refresh, Document } from '@element-plus/icons-vue'
-import { api, download, postRaw } from '@/api/client'
+import { Plus, Reading, Refresh, Document } from '@element-plus/icons-vue'
+import { api } from '@/api/client'
 import type {
   BackupRecord,
   DNSRecord,
@@ -796,6 +727,7 @@ import AdminTOTPDialog from '@/components/AdminTOTPDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
+import BackupPanel from '@/components/BackupPanel.vue'
 import { allHelpGroups, settingFields, userFields } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
@@ -836,10 +768,6 @@ const newUser = reactive({ username: '', password: '', role: 'viewer' })
 // 管理员代开二次验证：与「本人开启」共用同一套绑定流程，只是不校验本人密码
 const adminTOTPDialog = ref(false)
 const adminTOTPUser = ref<User | null>(null)
-
-const backups = ref<BackupRecord[]>([])
-const shareDir = ref('')
-const backupFileInput = ref<HTMLInputElement | null>(null)
 
 // 配置快照：关键改动前自动留档，可看差异、可一键回滚。
 const snapshots = ref<BackupRecord[]>([])
@@ -905,7 +833,7 @@ async function loadAll() {
   await loadNotify()
   await loadHealth()
   if (session.isAdmin) await loadUsers()
-  await loadBackups()
+  // 备份与计划备份在各自的组件里按需取（见 BackupPanel）
   await loadSnapshots()
   await loadDNS()
   void refreshSystemHealth()
@@ -1055,16 +983,6 @@ async function loadUsers() {
     /* 忽略 */
   }
   await loadSecurityCode()
-}
-
-async function loadBackups() {
-  try {
-    const data = await api.get<{ items: BackupRecord[]; share_dir: string }>('/backups')
-    backups.value = data.items || []
-    shareDir.value = data.share_dir || ''
-  } catch {
-    /* 忽略 */
-  }
 }
 
 async function loadSnapshots() {
@@ -1320,71 +1238,6 @@ async function removeUser(row: User) {
     await loadUsers()
   } catch (e) {
     if (e !== 'cancel') ElMessage.error((e as Error).message)
-  }
-}
-
-async function createBackup() {
-  let note = ''
-  try {
-    const r = await ElMessageBox.prompt('给这次备份写个备注（可留空）', '立即备份', { inputValue: '' })
-    note = r.value
-  } catch {
-    return
-  }
-  try {
-    await api.post('/backups', { note })
-    ElMessage.success('备份已完成')
-    await loadBackups()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
-}
-
-async function restore(row: BackupRecord) {
-  try {
-    await ElMessageBox.confirm(
-      `还原将用备份「${row.filename}」覆盖当前的全部连接、设备、系统设置与账号（含管理员密码），现有配置会被替换。确认继续？`,
-      '还原备份',
-      { type: 'warning' },
-    )
-    const res = await api.post<{ restored_interfaces: number }>(`/backups/${row.id}/restore`)
-    ElMessage.success(`已还原 ${res.restored_interfaces} 条连接`)
-    await loadAll()
-  } catch (e) {
-    if (e !== 'cancel') ElMessage.error((e as Error).message)
-  }
-}
-
-async function removeBackup(row: BackupRecord) {
-  try {
-    await ElMessageBox.confirm(`确认删除备份「${row.filename}」？`, '删除备份', { type: 'warning' })
-    await api.del(`/backups/${row.id}`)
-    await loadBackups()
-  } catch (e) {
-    if (e !== 'cancel') ElMessage.error((e as Error).message)
-  }
-}
-
-function downloadBackup(row: BackupRecord) {
-  download(`/backups/${row.id}/download`)
-}
-
-function openImportBackup() {
-  backupFileInput.value?.click()
-}
-
-async function onImportFile(e: Event) {
-  const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
-  input.value = ''
-  if (!file) return
-  try {
-    const text = await file.text()
-    await postRaw(`/backups/import?filename=${encodeURIComponent(file.name)}`, text)
-    ElMessage.success('备份已导入，可在列表中选择「还原」')
-    await loadBackups()
-  } catch (err) {
-    ElMessage.error((err as Error).message)
   }
 }
 

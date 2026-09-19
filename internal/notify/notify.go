@@ -55,6 +55,11 @@ const (
 	KindApplyFailed = "apply_failed"
 	// KindNetHealed 本应用发现并清理了自己的残留网络设置。
 	KindNetHealed = "net_healed"
+	// KindBackupFailed 计划备份执行失败（写不进目标目录、目标目录不可写等）。
+	//
+	// 备份失败特别值得推送：它不痛不痒，界面不看就发现不了，
+	// 而等到需要备份那天才发现「已经三个月没备份成功」，代价太大。
+	KindBackupFailed = "backup_failed"
 	// KindTest 测试消息，由用户在界面上主动触发。
 	KindTest = "test"
 )
@@ -190,6 +195,8 @@ func Kinds() []KindInfo {
 			Detail: "配置写入内核失败时推送；持续失败每 30 分钟提醒一次，不会刷屏"},
 		{Kind: KindNetHealed, Group: GroupSystem, Label: "残留网络自愈", Level: "warn",
 			Detail: "本应用发现并清理了自己遗留的路由或规则时推送（通常出现在升级、异常退出之后）"},
+		{Kind: KindBackupFailed, Group: GroupSystem, Label: "计划备份失败", Level: "warn",
+			Detail: "计划备份没写成功时推送（目标目录不可写、磁盘满、目录被删等）；同一天只推一次"},
 	}
 }
 
