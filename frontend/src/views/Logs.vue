@@ -178,6 +178,13 @@
           />
         </div>
       </el-tab-pane>
+
+      <!-- 流量报表：谁用了多少、什么时候用的，以及导出明细。
+           用 v-if 而非常驻渲染：页签没打开就不必请求数据；图表也不该在隐藏的容器里初始化 ——
+           隐藏容器宽度为 0，ECharts 会照着这个尺寸画出一块空白画布，之后怎么切回来都是空的。 -->
+      <el-tab-pane label="流量报表" name="traffic">
+        <TrafficReport v-if="tab === 'traffic'" />
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
@@ -189,6 +196,7 @@ import { Search, CircleCheck } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import type { AuditEntry, LogEntry } from '@/api/types'
 import ItemCard from '@/components/ItemCard.vue'
+import TrafficReport from '@/components/TrafficReport.vue'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { formatTime } from '@/utils/format'
 

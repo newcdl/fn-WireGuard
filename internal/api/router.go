@@ -162,6 +162,12 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.Get("/audit/verify", s.handleVerifyAudit)
 		r.Get("/logs", s.handleListLogs)
 
+		// 流量报表：查看对所有登录用户开放（和日志、审计一致）；
+		// 改保留天数会改变数据留存策略并影响磁盘占用，按系统设置对待。
+		r.Get("/traffic/report", s.handleTrafficReport)
+		r.Get("/traffic/export", s.handleTrafficExport)
+		r.With(requirePerm(model.PermUserManage)).Put("/traffic/retention", s.handleSetTrafficRetention)
+
 		// 设置
 		r.Get("/settings", s.handleGetSettings)
 		r.With(requirePerm(model.PermUserManage)).Put("/settings", s.handleUpdateSettings)

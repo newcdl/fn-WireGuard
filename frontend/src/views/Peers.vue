@@ -91,6 +91,29 @@
             ↓{{ formatBytes(row.rx_bytes) }} ↑{{ formatBytes(row.tx_bytes) }}
           </template>
         </el-table-column>
+        <el-table-column label="本月用量" width="170">
+          <template #default="{ row }">
+            <!-- 有额度才画进度条：不限额的设备显示一个「用了多少」就够了，
+                 加一条永远不动的空进度条只会让人以为设置没生效。 -->
+            <template v-if="usage[row.id]">
+              <span :class="{ 'fnwg-over-quota': overQuota(row.id) }">
+                {{ formatBytes(usage[row.id].month_tx_bytes) }}
+              </span>
+              <span v-if="usage[row.id].quota_tx > 0" class="fnwg-hint">
+                / {{ formatBytes(usage[row.id].quota_tx) }}
+              </span>
+              <el-progress
+                v-if="usage[row.id].quota_tx > 0"
+                :percentage="usagePercent(row.id)"
+                :status="overQuota(row.id) ? 'exception' : undefined"
+                :show-text="false"
+                :stroke-width="6"
+                style="margin-top: 2px"
+              />
+            </template>
+            <span v-else class="fnwg-hint">-</span>
+          </template>
+        </el-table-column>
         <el-table-column label="有效期" width="90">
           <template #default="{ row }">
             <span v-if="!row.expire_at">长期</span>
@@ -499,7 +522,14 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh, ArrowDown, Reading, Upload } from '@element-plus/icons-vue'
 import QRCode from 'qrcode'
 import { api } from '@/api/client'
-import type { PeerConfigResult, PeerImportResult, PeerImportRow, WgInterface, WgPeer } from '@/api/types'
+import type {
+  PeerConfigResult,
+  PeerImportResult,
+  PeerImportRow,
+  TrafficReport,
+  WgInterface,
+  WgPeer,
+} from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
@@ -534,6 +564,9 @@ void interfaceFields
 const interfaces = ref<WgInterface[]>([])
 const peers = ref<WgPeer[]>([])
 const loading = ref(false)
+
+/** 每台设备的本月发送量与额度，来自流量报表（见 loadUsage）。 */
+const usage = ref<Record<number, { month_tx_bytes: number; quota_tx: number }>>({})
 const saving = ref(false)
 const selectedIds = ref<number[]>([])
 const ifaceFilter = ref<number | undefined>(undefined)
@@ -657,6 +690,43 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // 用量单独取一次（设备列表接口不带它，而它来自按小时的记账明细）。
+  // 放在 load 的末尾：设备的新增、删除、改额度都会经过 load，
+  // 于是「本月用量」自动跟着刷新，不必在每个操作里各记一次。
+  void loadUsage()
+}
+
+/**
+ * 取每台设备的本月发送量与额度。
+ *
+ * 报表接口的区间参数给 1 天：这里只要「本月」这一个数（它按自然月单独累计，
+ * 与区间无关），逐日明细不必带回来。
+ */
+async function loadUsage() {
+  try {
+    const rep = await api.get<TrafficReport>('/traffic/report?days=1')
+    const map: Record<number, { month_tx_bytes: number; quota_tx: number }> = {}
+    for (const p of rep.peers || []) {
+      map[p.peer_id] = { month_tx_bytes: p.month_tx_bytes, quota_tx: p.quota_tx }
+    }
+    usage.value = map
+  } catch {
+    // 用量取不到不该影响设备管理：这一列留空即可，删掉设备、改配置照样能做
+    usage.value = {}
+  }
+}
+
+/** 本月用量占额度的百分比（没有额度时返回 0，不显示进度条）。 */
+function usagePercent(id: number) {
+  const u = usage.value[id]
+  if (!u || !u.quota_tx) return 0
+  return Math.min(100, Math.round((u.month_tx_bytes / u.quota_tx) * 100))
+}
+
+/** 是否已经用满额度 —— 用满就会触发自动停用，这一列必须能一眼看出来。 */
+function overQuota(id: number) {
+  const u = usage.value[id]
+  return !!u && u.quota_tx > 0 && u.month_tx_bytes >= u.quota_tx
 }
 
 function onSelectionChange(rows: WgPeer[]) {
@@ -946,5 +1016,10 @@ watch(
 .fnwg-warn {
   color: var(--el-color-warning);
   font-size: 12px;
+}
+
+/* 本月用量已经触到额度上限：用满就会被自动停用，这一眼必须看得出来 */
+.fnwg-over-quota {
+  color: var(--el-color-danger);
 }
 </style>

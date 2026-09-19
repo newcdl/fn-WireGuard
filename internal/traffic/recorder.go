@@ -10,8 +10,11 @@ package traffic
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"fnwg/internal/model"
@@ -157,12 +160,46 @@ func (r *Recorder) Sample(ctx context.Context) error {
 
 // Retention 返回聚合数据的保留时长：优先取设置项，非法或缺失时用默认值。
 func (r *Recorder) Retention(ctx context.Context) time.Duration {
-	raw := r.store.GetSetting(ctx, SettingRetentionDays, "")
-	days, err := strconv.Atoi(raw)
-	if err != nil || days < MinRetentionDays || days > MaxRetentionDays {
-		return r.retention
+	if days := parseRetentionDays(r.store.GetSetting(ctx, SettingRetentionDays, "")); days > 0 {
+		return time.Duration(days) * 24 * time.Hour
 	}
-	return time.Duration(days) * 24 * time.Hour
+	return r.retention
+}
+
+// RetentionDays 返回当前生效的保留天数（与 Recorder.Retention 同一口径）。
+//
+// 单独开这个函数是因为读它的人不止采样器：报表页要显示「保留多久、最早一条是什么时候」。
+// 两处各读一遍设置、各写一套回落规则，就会出现「设置说 30 天、报表说 90 天」这种
+// 谁也说不清哪个对的分歧。
+func RetentionDays(ctx context.Context, st *store.Store) int {
+	if days := parseRetentionDays(st.GetSetting(ctx, SettingRetentionDays, "")); days > 0 {
+		return days
+	}
+	return int(defaultRetention / (24 * time.Hour))
+}
+
+// ErrInvalidRetention 表示保留天数不在允许范围内。
+//
+// 单独给一个哨兵错误，是为了让 HTTP 层能区分「用户填错了」与「服务出错」：
+// 前者应当回 400 并把人话说明白，后者才是 500。都按 500 处理的话，
+// 用户填了个 0 会看到「服务器错误」，只会去找别的地方排查。
+var ErrInvalidRetention = errors.New("保留天数超出允许范围")
+
+// ValidateRetentionDays 校验保留天数是否在允许区间内。
+func ValidateRetentionDays(days int) error {
+	if days < MinRetentionDays || days > MaxRetentionDays {
+		return fmt.Errorf("%w：需要在 %d 到 %d 天之间", ErrInvalidRetention, MinRetentionDays, MaxRetentionDays)
+	}
+	return nil
+}
+
+// parseRetentionDays 解析设置里的保留天数；非法或越界返回 0，由调用方决定回落值。
+func parseRetentionDays(raw string) int {
+	days, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || days < MinRetentionDays || days > MaxRetentionDays {
+		return 0
+	}
+	return days
 }
 
 // prune 清理过期的小时记录，最多每天做一次（清理是整表扫描，没必要每轮都做）。

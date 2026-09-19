@@ -457,3 +457,43 @@ export interface PeerImportResult {
   failed: number
   items: PeerImportItem[]
 }
+
+/** 某一天（服务器本地时区的自然日）的流量合计 */
+export interface TrafficDay {
+  day: string
+  rx_bytes: number
+  tx_bytes: number
+}
+
+/** 流量报表里的一台设备 */
+export interface TrafficPeerRow {
+  peer_id: number
+  name: string
+  interface_id: number
+  interface_name: string
+  enabled: boolean
+  /** 被自动停用的原因：quota（用量超限）/ expire（已到期），空表示不是自动停用 */
+  disabled_reason?: string
+  expire_at?: string | null
+  /** 每月的发送额度（0 表示不限） */
+  quota_tx: number
+  month_rx_bytes: number
+  month_tx_bytes: number
+  rx_bytes: number
+  tx_bytes: number
+  daily: TrafficDay[]
+}
+
+/** 流量报表：区间汇总 + 逐日明细 + 保留策略 */
+export interface TrafficReport {
+  days: number
+  from: string
+  to: string
+  peers: TrafficPeerRow[]
+  daily: TrafficDay[]
+  rx_bytes: number
+  tx_bytes: number
+  retention_days: number
+  hour_rows: number
+  oldest?: string | null
+}
