@@ -280,7 +280,9 @@ body {
 }
 
 .fnwg-qr img {
-  width: 220px;
+  /* 240 → 280：二维码里装的是整份配置，模块数不少（EC 级 H 更密），
+     屏幕上给足像素才扫得动；再小一点手机上要凑很近才认。 */
+  width: 280px;
   max-width: 70vw;
   height: auto;
   background: #fff;

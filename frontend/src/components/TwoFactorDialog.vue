@@ -174,7 +174,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import QRCode from 'qrcode'
+import { styledQrDataUrl } from '@/utils/qr'
 import { api } from '@/api/client'
 import type { TOTPSetup, TOTPStatus, TrustedDevice } from '@/api/types'
 import { formatTime } from '@/utils/format'
@@ -289,7 +289,8 @@ async function startBind() {
   try {
     const out = await api.post<TOTPSetup>('/auth/totp/setup', { password: password.value })
     secret.value = out.secret
-    qr.value = await QRCode.toDataURL(out.uri, { margin: 1, width: 320 })
+    // 与设备配置码同一套样式（圆点 + 中心图标）：绑定码内容短、模块少，余量比设备码还大
+    qr.value = await styledQrDataUrl(out.uri, 320)
     code.value = ''
     step.value = 'bind'
   } catch (e) {

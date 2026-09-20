@@ -520,7 +520,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh, ArrowDown, Reading, Upload } from '@element-plus/icons-vue'
-import QRCode from 'qrcode'
+import { styledQrDataUrl } from '@/utils/qr'
 import { api } from '@/api/client'
 import type {
   PeerConfigResult,
@@ -836,7 +836,9 @@ async function submit() {
 async function loadConfig(row: WgPeer) {
   const res = await api.get<PeerConfigResult>(`/peers/${row.id}/config`)
   cfg.value = res
-  qrDataUrl.value = await QRCode.toDataURL(res.qr_payload || res.conf, { margin: 1, width: 480 })
+  // 样式化的二维码：深色模块画成圆点、中心放应用图标（见 utils/qr.ts 里那几条不能省的约束）
+  // 720：整份配置的模块数不少，内联尺寸给大一点，位图导出/放大时更稳
+  qrDataUrl.value = await styledQrDataUrl(res.qr_payload || res.conf, 720)
   // 生成配置等于把最新设置交付给了设备，服务端已记下这次交付；
   // 立刻刷新列表，让「需重新扫码」标记当场消失（否则要等下次手动刷新）。
   if (row.config_stale) await load()

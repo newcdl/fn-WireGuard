@@ -4,6 +4,7 @@
 package totp
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +126,9 @@ func TestGenerateSecretAndURI(t *testing.T) {
 		"algorithm=SHA1",
 		"digits=6",
 		"period=30",
+		// 图标：少数验证器会用它，其余按规范忽略；地址必须公网可达且不可变
+		"image=",
+		url.QueryEscape(IconURL),
 	} {
 		if !strings.Contains(uri, want) {
 			t.Errorf("otpauth 链接缺少 %q: %s", want, uri)
