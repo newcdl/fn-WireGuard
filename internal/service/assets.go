@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"fnwg/internal/model"
+	"fnwg/internal/notify"
 )
 
 // 内网资产台账：把「拓扑图当下看到什么」沉淀成「家里长期有哪些设备」。
@@ -35,6 +36,18 @@ type LANAsset struct {
 	SeenDays  int       `json:"seen_days"`
 	// Known 为真表示用户已经把「新设备」确认过了，不再重复提醒。
 	Known bool `json:"known,omitempty"`
+}
+
+// assetsNotify 是通知投递入口，由代理进程在装配时注入（见 SetAssetsNotifier）。
+//
+// 为什么用注入而不是让 service 直接持有投递器：投递器归属于收敛引擎（它有自己的 goroutine 队列），
+// 而界面进程也会装配一个 Service、却不需要投递。没被注入时，新设备提醒仍然写日志与审计、界面上仍打标记，
+// 只是不推送 —— 功能降级而不是失效。
+var assetsNotify func(ctx context.Context, ev notify.Event)
+
+// SetAssetsNotifier 注入通知投递器（代理进程装配时调用一次）。
+func SetAssetsNotifier(f func(ctx context.Context, ev notify.Event)) {
+	assetsNotify = f
 }
 
 // LANAssets 读取台账（按最近出现排序，新的在前）。
@@ -147,6 +160,16 @@ func (s *Service) recordAssets(ctx context.Context) {
 	}
 	who := strings.Join(ips, "、")
 	s.Log.Warn("发现新的内网设备", "devices", who)
+	if assetsNotify != nil {
+		assetsNotify(ctx, notify.Event{
+			Kind:  notify.KindNewDevice,
+			Title: "发现新的内网设备",
+			Body: "内网里出现了从未见过的设备（" + who + "）。" +
+				"如果是自家设备，可在「系统维护 → 内网资产」里把它标为已知，之后不再提醒；" +
+				"如果完全不认识，建议检查一下无线密码与访客网络。",
+			At: now,
+		})
+	}
 	_ = s.Store.AddLog(ctx, "warn", "assets", "发现新的内网设备", who)
 	_ = s.Store.AddAudit(ctx, &model.AuditEntry{
 		Action: "assets.new", TargetType: "asset", TargetID: who, Result: "ok",

@@ -647,6 +647,9 @@ func (e *Engine) notifyInterface(ctx context.Context, changes []ifacePresence, n
 }
 
 // Status 返回最近一次状态快照。
+// Notifier 暴露投递器，供进程装配时把它交给服务（新设备提醒等服务侧事件需要它）。
+func (e *Engine) Notifier() *notify.Sender { return e.notifier }
+
 func (e *Engine) Status() model.Status {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

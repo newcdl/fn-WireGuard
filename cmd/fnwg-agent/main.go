@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"fnwg/internal/notify"
 	"io"
 	"log/slog"
 	"os"
@@ -131,6 +132,9 @@ func main() {
 	// 这些事实都在这一侧；界面只读报告，不自己判一遍（免得两边口径不一致）。
 	local := core.NewLocal(engine)
 	engine.SetInspector(service.New(st, local, logger, cfg.Version))
+	// 新设备提醒要走通知投递：把引擎的投递器交给服务
+	// （界面进程也会装配一个 Service，它不需要投递，所以用注入而不是让 service 直接持有）
+	service.SetAssetsNotifier(func(ctx context.Context, ev notify.Event) { engine.Notifier().Notify(ctx, ev) })
 
 	// 采样与收敛循环：进程启动即执行一次全量收敛，实现重启自恢复。
 	go engine.Run(ctx)

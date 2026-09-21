@@ -66,6 +66,10 @@ const (
 	// 直到真的需要它那天才发现早就失效了 —— 正是最值得主动说一声的故障。
 	// 只推错误级结论：警告（如「疑似残留网卡」）不推，免得每天一条同样的提醒被屏蔽。
 	KindInspectProblem = "inspect_problem"
+	// KindNewDevice 内网里出现了从未见过的设备（跟随巡检采集时判定）。
+	//
+	// 与巡检问题同属「安静地发生」那一类：家里多了一台陌生设备，不主动说一声就不会有人发现。
+	KindNewDevice = "new_device"
 	// KindTest 测试消息，由用户在界面上主动触发。
 	KindTest = "test"
 )
@@ -206,6 +210,9 @@ func Kinds() []KindInfo {
 		{Kind: KindInspectProblem, Group: GroupSystem, Label: "巡检发现问题", Level: "warn",
 			Detail: "定期巡检查出「需要处理」的问题时推送（连接没工作、上网路线异常、计划备份失败等）；" +
 				"只是「待确认」的提示不推送，避免刷屏"},
+		{Kind: KindNewDevice, Group: GroupSystem, Label: "新设备入网", Level: "warn",
+			Detail: "内网里出现从未见过的设备时推送（跟随巡检采集判定）；" +
+				"确认过它是自家设备后，可在「系统维护 → 内网资产」里标为已知，之后不再提醒"},
 	}
 }
 
