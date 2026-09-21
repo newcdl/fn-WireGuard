@@ -169,6 +169,20 @@
           </div>
         </div>
 
+      </div>
+
+      <!--
+        全览小地图与图例放在画布下方同一行。
+        小地图原来浮在画布右上角，会盖住那里的节点（它只是「全览」、不参与交互，
+        浮着没有任何好处）—— 挪出画布最省事也最不容易出错：画布里的东西再也不会被它挡住。
+      -->
+      <div class="fnwg-topo-below">
+        <!-- 图例：颜色对应节点种类，线型对应连线状态 -->
+        <div class="fnwg-topo-legend">
+          <span v-for="l in legend" :key="l.text"><i :style="{ background: l.color }" />{{ l.text }}</span>
+          <span><i class="fnwg-topo-legend-line flow" />绿色流动 + 箭头 = 正在传数据（越快越急）</span>
+          <span><i class="fnwg-topo-legend-line off" />灰色虚线 = 空闲 / 已停用</span>
+        </div>
         <div class="fnwg-topo-mini">
           <svg :viewBox="`0 0 ${mini.w} ${mini.h}`">
             <line v-for="(l, i) in mini.lines" :key="i" :x1="l.x1" :y1="l.y1" :x2="l.x2" :y2="l.y2" class="fnwg-topo-mini-line" />
@@ -184,13 +198,6 @@
           </svg>
           <span>全览</span>
         </div>
-      </div>
-
-      <!-- 图例：颜色对应节点种类，线型对应连线状态（原来在图下面就有这一排） -->
-      <div class="fnwg-topo-legend">
-        <span v-for="l in legend" :key="l.text"><i :style="{ background: l.color }" />{{ l.text }}</span>
-        <span><i class="fnwg-topo-legend-line flow" />绿色流动 + 箭头 = 正在传数据（越快越急）</span>
-        <span><i class="fnwg-topo-legend-line off" />灰色虚线 = 空闲 / 已停用</span>
       </div>
 
       <div class="fnwg-topo-notes">
@@ -226,8 +233,11 @@ const positions = ref<Record<string, { x: number; y: number }>>({})
 const selected = ref<string | null>(null)
 const menu = ref<{ x: number; y: number; label: string; items: { text: string; icon: object; act: () => void }[] } | null>(null)
 
-// 与 ECharts 版分开存：两个引擎的布局方式与手工位置互不影响
-const STORE_KEY = 'fnwg.topology.view'
+// 与 ECharts 版分开存：两个引擎的布局方式与手工位置互不影响。
+// 手机与桌面也分开存：两边的布局半径不同，共用一份坐标会出现「同一张图在另一块屏幕上挤成一团」。
+function storeKey(): string {
+  return isMobile.value ? 'fnwg.topology.view.mobile' : 'fnwg.topology.view'
+}
 
 /**
  * 画布高度：设备多的时候固定高度会把卡片挤成一团（用户反馈「高度不够」），
@@ -398,8 +408,10 @@ function sizeOf(n: TopologyNode): { w: number; h: number } {
 /** 位置：与 ECharts 版同样的三套布局（方位可复现）。 */
 function computePositions(g: TopologyGraph, m: 'radial' | 'circular' | 'force'): Record<string, { x: number; y: number }> {
   const narrow = isMobile.value
-  const R1 = narrow ? 190 : 250
-  const R2 = narrow ? 320 : 470
+  // 窄屏半径要压得够狠：手机画布只有 390px 宽，半径大一点，自动适应就把整张图缩到字读不出。
+  // 以「能读」为准反推 —— 内容宽度约 460（节点卡片本身就有 120 宽），k 才落在 0.7 以上。
+  const R1 = narrow ? 96 : 250
+  const R2 = narrow ? 168 : 470
   const out: Record<string, { x: number; y: number }> = {}
   const nas = g.nodes.find((n) => n.kind === 'nas')
   if (nas) out[nas.id] = { x: 0, y: 0 }
@@ -460,6 +472,7 @@ function computePositions(g: TopologyGraph, m: 'radial' | 'circular' | 'force'):
 
 /** 「自由」布局：从放射出发做力导向松弛（固定初值 + 固定迭代 = 结果可复现）。 */
 function relax(g: TopologyGraph, init: Record<string, { x: number; y: number }>): Record<string, { x: number; y: number }> {
+  const narrow = isMobile.value
   const ids = Object.keys(init)
   const pos = ids.map((id) => ({ id, ...init[id] }))
   const idx = new Map(ids.map((id, i) => [id, i]))
@@ -503,7 +516,7 @@ function relax(g: TopologyGraph, init: Record<string, { x: number; y: number }>)
     }
     for (let i = 0; i < pos.length; i++) {
       if (depth[i] === 0) continue
-      const want = depth[i] === 1 ? 260 : 470
+      const want = depth[i] === 1 ? (narrow ? 110 : 260) : narrow ? 190 : 470
       const d = Math.sqrt(pos[i].x ** 2 + pos[i].y ** 2) || 1
       const k = ((want - d) / d) * 0.12 * cool
       pos[i].x += pos[i].x * k
@@ -579,8 +592,22 @@ function edgeStyle(e: any): { color: string; width: number; lineDash: number[] }
   return { color: '#cbd5e1', width: 1.4, lineDash: [6, 6] }
 }
 
-const configs: any = {
-  view: { panEnabled: true, zoomEnabled: true, minZoom: 0.2, maxZoom: 4, autoFit: true },
+const configs: any = computed(() => ({
+  view: {
+    panEnabled: true,
+    zoomEnabled: true,
+    minZoomLevel: 0.2,
+    maxZoomLevel: 4,
+    // 打开时自动把内容装进画布（原来写的 autoFit 不是这个库的字段，等于没开）
+    autoPanAndZoomOnLoad: 'fit-content',
+    // 库只按节点「点」算包围盒，不知道我们用 SVG 自绘的卡片有多大 —— 边距必须按卡片尺寸给足，
+    // 否则贴着边缘的卡片会被画布裁掉（库默认只有 8%，这次线上表现就是最下面那张被切）。
+    // 手机上只留一点：把一千多像素宽的内容硬塞进 390px 会让字缩到读不出，
+    // 不如让用户拖动看 —— 字号能读比「一屏看全」重要。
+    fitContentMargin: isMobile.value
+      ? { top: 34, right: 22, bottom: 34, left: 22 }
+      : { top: '9%', right: '19%', bottom: '9%', left: '19%' },
+  },
   node: { selectable: true, draggable: true, normal: { type: 'circle', radius: 0 }, label: { visible: false } },
   edge: {
     normal: {
@@ -592,7 +619,7 @@ const configs: any = {
     hover: { width: 3, color: '#409eff' },
     selectable: true,
   },
-}
+}))
 
 
 /** 全览小地图：只画节点与连线（不画视野方框，见文件顶部说明）。 */
@@ -834,14 +861,14 @@ function syncFromDOM(): void {
 
 function saveView(): void {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({ mode: mode.value, positions: positions.value }))
+    localStorage.setItem(storeKey(), JSON.stringify({ mode: mode.value, positions: positions.value }))
   } catch {
     /* 存不下不影响使用 */
   }
 }
 function loadView(): void {
   try {
-    const raw = localStorage.getItem(STORE_KEY)
+    const raw = localStorage.getItem(storeKey())
     if (!raw) return
     const v = JSON.parse(raw)
     if (v?.mode === 'radial' || v?.mode === 'circular' || v?.mode === 'force') mode.value = v.mode
@@ -1096,6 +1123,15 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 767px) {
+  .fnwg-topo-below {
+    flex-direction: column-reverse;
+  }
+
+  .fnwg-topo-mini {
+    flex: 0 0 auto;
+    width: 100%;
+  }
+
   .fnwg-topo :deep(.fnwg-card-head) {
     flex-direction: column;
   }
@@ -1118,11 +1154,18 @@ onBeforeUnmount(() => {
   width: 100%;
 }
 
+.fnwg-topo-below {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 8px;
+}
+
 .fnwg-topo-legend {
   display: flex;
+  flex: 1;
   flex-wrap: wrap;
   gap: 6px 16px;
-  margin-top: 6px;
   font-size: 12px;
   color: var(--el-text-color-secondary);
 }
@@ -1235,9 +1278,8 @@ onBeforeUnmount(() => {
 }
 
 .fnwg-topo-mini {
-  position: absolute;
-  right: 6px;
-  top: 6px;
+  position: relative;
+  flex: 0 0 170px;
   width: 170px;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: var(--fnwg-radius);
