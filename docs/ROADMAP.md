@@ -877,10 +877,12 @@ P2-3 快照回滚    （独立，但 P3 报表可复用其快照数据）
      拖动时关闭过渡动画（每帧 300ms 补间会明显发涩）；canvas 开启 `useDirtyRect` 增量绘制。
 - **窄屏适配**：手机上卡片收窄、各档半径收紧、每多一台设备外推的幅度减半 ——
   节点标签字号是固定 px，窄屏上圆画得太大就会互相压住。
-- **为什么最后没有换库**（调研过 AntV G6 / v-network-graph / relzation-graph / vis-network / Cytoscape.js，均 MIT）：
+- **引擎选型（先做 ECharts 版、后换成 v-network-graph）**（调研过 AntV G6 / v-network-graph / relzation-graph / vis-network / Cytoscape.js，均 MIT）：
   体积都远大于现有 ECharts 份额（G6 v5 gzip 381 KB，还拖进 html2canvas 与 gl-matrix；本机实测 ECharts 包
   已经占了前端 3 MB 里的 1 MB），而 G6 v5 已**移除 minimap 与右键菜单插件**、且不支持虚线相位动画
-  （会丢掉「数据流动」这个效果）。结论：**留在 ECharts 上把能力补齐**，七项全有、零新增依赖、观感与项目一致。
+  （会丢掉「数据流动」这个效果）。于是**先在 ECharts 上做出一版**（七项能力都齐、零新增依赖，也验证过观感）。
+  后来按用户要求换成 **v-network-graph** 做对比：平移/缩放手感更稳（自带触摸与 autoFit），逐边样式可用「配置项传函数」实现、视野能从 `g.v-ng-viewport` 的 matrix 读回、拖动位置能从节点组回读落盘 ——
+  三项本以为要另外补的能力都做成了，因此**最终选定 v-network-graph**，落选的 ECharts 版已删除。
 - **验证中还修掉一个真 bug**：滚轮/拖动改变视野时 ECharts 只改内部状态，缩略图的「正在看哪一块」
   会停在原地（只有按按钮时才对）——补上 `dataZoom` 事件把窗口读回来（缩略图视窗框与图标位置都跟着走）。
 - 用例：`TestBuildLANDevices`（8 条邻居记录 → 只剩 2 条，含去重与排序）、`TestBuildLANDevicesWithoutSubnets`、
