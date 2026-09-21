@@ -794,6 +794,8 @@ func (s *Service) RunInspectNow(ctx context.Context, userID int64, username, src
 // 而它同时要落到报告里给用户看 —— 与计划备份同一条理由：原因放进结果，
 // 比让调用方事后再查一遍更不容易漏。
 func (s *Service) runInspect(ctx context.Context, plan InspectPlan, now time.Time, manual bool, a Actor) *InspectReport {
+	// 顺带把内网设备入账：台账与「多久巡检一次」保持一致，不另外加定时器
+	s.recordAssets(ctx)
 	items := judgeInspect(s.inspectFacts(ctx))
 	rep := &InspectReport{At: now, Manual: manual, Items: items}
 	rep.Errors, rep.Warnings, rep.Passed = countReport(items)

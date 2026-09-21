@@ -89,6 +89,9 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.Get("/topology", s.handleTopology)
 		// 设备类型：图上那台设备是什么（按 IP 记），清单与设置各一个接口
 		r.Get("/device-kinds", s.handleDeviceKinds)
+		// 内网资产台账：把邻居表观测沉淀下来，看「家里长期有哪些设备」
+		r.Get("/assets", s.handleAssets)
+		r.With(requirePerm(model.PermIfaceWrite)).Post("/assets/known", s.handleMarkAsset)
 		r.With(requirePerm(model.PermIfaceWrite)).Post("/device-kind", s.handleSetDeviceKind)
 		r.Get("/health", s.handleHealth)
 

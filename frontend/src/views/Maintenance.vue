@@ -246,6 +246,9 @@
         <!-- 分组五：配置漂移巡检。判定在服务端（只有一份实现），这里只展示报告与计划。 -->
         <InspectPanel />
 
+    <!-- 内网资产台账：与巡检并列（采集也跟随巡检） -->
+    <AssetPanel />
+
       </el-tab-pane>
 
       <!-- 运行环境：后台能力 + 疑似残留网卡清理 -->
@@ -347,6 +350,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import type { ForeignInterface } from '@/api/types'
+import AssetPanel from '@/components/AssetPanel.vue'
 import InspectPanel from '@/components/InspectPanel.vue'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useBreakpoint } from '@/composables/useBreakpoint'
