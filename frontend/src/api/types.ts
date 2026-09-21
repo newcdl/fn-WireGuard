@@ -659,6 +659,10 @@ export interface TopologyNode {
   sublabel?: string
   /** ok / warn / off */
   status: string
+  /** 「内网域名」里登记的备注（没登记则为空） */
+  note?: string
+  /** 用户配置的设备类型（空 = 按名称自动判断） */
+  device_kind?: string
   details: { key: string; value: string }[]
 }
 

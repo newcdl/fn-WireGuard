@@ -1,26 +1,36 @@
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 <!-- Copyright (C) 2026 小柿子 <newxsz@163.com> -->
 
+<!--
+  网络拓扑（v-network-graph 版）。
+  与 ECharts 版共用同一份 /topology 数据、同样的卡片与图标观感，用来看「换个库手感是否更好」。
+
+  这一版刻意保持精简，几处已知差异会显示在卡片下方的说明里（不藏起来）：
+    · 连线不做逐边的状态/速率配色（v-network-graph 的样式是全局配置；逐边配色要另想办法）；
+    · 缩略图只作全览用（这个库没有暴露视野状态，因此画不出「当前看的是哪一块」的方框）；
+    · 拖动位置记不住（拖动由库自己管，落盘需要拿到它的位置回调，待确认）。
+  （曾经用 ECharts 做过一版并对比过手感，最终选定这个库；落选的那一版已删除。）
+-->
 <template>
   <div class="fnwg-card fnwg-topo">
     <div class="fnwg-card-head">
       <div>
         <strong>网络拓扑</strong>
         <span class="fnwg-card-desc">
-          以本机 NAS 为中心：左侧是它所在的内网与内网里的设备，右侧是连上隧道的设备与另一台 NAS。
-          拖动空白处平移、滚轮缩放、直接拖节点可换位置（会记住）；单击看整条链路，双击跳到对应页面，右键有更多操作。
+          左侧内网、右侧隧道与对端 NAS；拖空白平移、滚轮缩放，单击看链路、双击跳转、右键更多。
         </span>
       </div>
       <div class="fnwg-topo-actions">
+        <el-tag v-if="graph" size="small" type="info" effect="plain">{{ atLabel }}</el-tag>
         <el-radio-group v-model="mode" size="small" @change="onModeChange">
           <el-radio-button value="radial">放射</el-radio-button>
           <el-radio-button value="circular">环状</el-radio-button>
           <el-radio-button value="force">自由</el-radio-button>
         </el-radio-group>
         <el-button-group>
-          <el-button size="small" :icon="ZoomIn" title="放大" @click="zoomBy(1 / 1.3)" />
-          <el-button size="small" :icon="ZoomOut" title="缩小" @click="zoomBy(1.3)" />
-          <el-button size="small" :icon="Aim" title="适应窗口" @click="fitView" />
+          <el-button size="small" :icon="ZoomIn" title="放大" @click="gref?.zoomIn()" />
+          <el-button size="small" :icon="ZoomOut" title="缩小" @click="gref?.zoomOut()" />
+          <el-button size="small" :icon="Aim" title="适应窗口" @click="gref?.fitToContents()" />
         </el-button-group>
         <el-button size="small" :icon="Picture" title="导出图片" @click="exportPNG">导出</el-button>
         <el-button size="small" :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
@@ -30,37 +40,162 @@
     <div v-if="!graph" class="fnwg-hint">正在读取拓扑…</div>
 
     <template v-else>
-      <div class="fnwg-topo-wrap">
-        <div ref="chartEl" class="fnwg-topo-canvas" :style="{ height: canvasHeight }"></div>
+      <!--
+        交互全部放在 DOM 这一层（捕获阶段）：这个库的节点事件载荷字段与我们猜的不一致，
+        而它渲染出来的 SVG 就在我们手里 —— 直接用 data-node 找节点最稳，不受它的事件定义影响。
+      -->
+      <div
+        ref="wrapEl"
+        class="fnwg-topo-wrap"
+        @click.capture="onWrapClick"
+        @dblclick.capture="onWrapDbl"
+        @contextmenu.capture="onWrapMenu"
+        @mousemove="onWrapMove"
+        @mouseleave="hover = null"
+      >
+        <VNetworkGraph
+          ref="gref"
+          class="fnwg-vng"
+          :nodes="vngNodes"
+          :edges="vngEdges"
+          :layouts="{ nodes: pos }"
+          :configs="configs"
+          :selected-nodes="selected ? [selected] : []"
+          :style="{ height: canvasHeight }"
+        >
+          <!-- 节点：用 SVG 自绘卡片（图标 + 名称 + 地址），与 ECharts 版观感一致 -->
+          <template #override-node="{ nodeId }">
+            <g :data-node="nodeId" :transform="`translate(${-sizeOf(nodeOf(nodeId)).w / 2}, ${-sizeOf(nodeOf(nodeId)).h / 2})`">
+              <rect
+                :width="sizeOf(nodeOf(nodeId)).w"
+                :height="sizeOf(nodeOf(nodeId)).h"
+                rx="9"
+                :fill="nodeOf(nodeId).kind === 'nas' ? colorOf(nodeOf(nodeId)) : ink.card"
+                :stroke="colorOf(nodeOf(nodeId))"
+                :stroke-width="nodeOf(nodeId).kind === 'nas' ? 2.5 : 1.5"
+                :stroke-dasharray="nodeOf(nodeId).kind === 'foreign' ? '4 3' : undefined"
+                :opacity="dimmed(nodeId) ? 0.25 : 1"
+              />
+              <image
+                :href="iconURI(iconOf(nodeOf(nodeId)), nodeOf(nodeId).kind === 'nas' ? '#ffffff' : colorOf(nodeOf(nodeId)))"
+                x="10"
+                :y="sizeOf(nodeOf(nodeId)).h / 2 - 9"
+                width="18"
+                height="18"
+                :opacity="dimmed(nodeId) ? 0.25 : 1"
+              />
+              <text
+                x="34"
+                :y="sizeOf(nodeOf(nodeId)).h / 2 - 3"
+                font-size="12.5"
+                :font-weight="nodeOf(nodeId).kind === 'nas' ? 'bold' : 'normal'"
+                :fill="nodeOf(nodeId).kind === 'nas' ? '#ffffff' : ink.text"
+                :opacity="dimmed(nodeId) ? 0.3 : 1"
+              >
+                {{ nodeOf(nodeId).label }}
+              </text>
+              <text
+                v-if="nodeOf(nodeId).note"
+                x="34"
+                :y="sizeOf(nodeOf(nodeId)).h / 2 + 27"
+                font-size="10.5"
+                :fill="nodeOf(nodeId).kind === 'nas' ? 'rgba(255,255,255,0.7)' : ink.dim"
+                :opacity="dimmed(nodeId) ? 0.3 : 1"
+              >
+                {{ nodeOf(nodeId).note }}
+              </text>
+              <text
+                v-if="nodeOf(nodeId).sublabel"
+                x="34"
+                :y="sizeOf(nodeOf(nodeId)).h / 2 + 13"
+                font-size="11"
+                :fill="nodeOf(nodeId).kind === 'nas' ? 'rgba(255,255,255,0.85)' : ink.dim"
+                :opacity="dimmed(nodeId) ? 0.3 : 1"
+              >
+                {{ nodeOf(nodeId).sublabel }}
+              </text>
+            </g>
+          </template>
+        </VNetworkGraph>
 
-        <!-- 缩略图：设备多起来、又缩放平移过之后，用来看「现在看的是哪一块」，也可以直接点它跳过去 -->
-        <div class="fnwg-topo-mini" :title="'全览：点击或拖动可快速定位'">
-          <svg :viewBox="`0 0 ${mini.w} ${mini.h}`" @mousedown="onMiniJump" @mousemove="onMiniDrag" @mouseup="miniDragging = false">
-            <line v-for="(l, i) in mini.lines" :key="i" :x1="l.x1" :y1="l.y1" :x2="l.x2" :y2="l.y2" class="fnwg-topo-mini-line" />
-            <circle v-for="n in mini.nodes" :key="n.id" :cx="n.cx" :cy="n.cy" r="2.6" :class="`k-${n.kind}`" />
-            <rect :x="mini.view.x" :y="mini.view.y" :width="mini.view.w" :height="mini.view.h" class="fnwg-topo-mini-view" />
-          </svg>
-          <span>全览</span>
+        <!-- 悬停：跟着鼠标给出这台设备的完整信息（与原来那版同一套字段） -->
+        <div v-if="hover" class="fnwg-topo-tip" :style="{ left: hover.x + 'px', top: hover.y + 'px' }">
+          <strong>{{ hover.node.label }}</strong>
+          <span v-if="hover.node.sublabel" class="fnwg-topo-tip-sub">{{ hover.node.sublabel }}</span>
+          <div v-for="kv in detailRows(hover.node)" :key="kv.key" class="fnwg-topo-tip-row">
+            <span class="fnwg-topo-tip-key">{{ kv.key }}</span>
+            <span class="fnwg-topo-tip-val">{{ kv.value }}</span>
+          </div>
+          <div class="fnwg-topo-tip-foot">单击固定这条信息 · 双击跳转 · 右键更多 · 可拖动</div>
         </div>
 
-        <!-- 右键菜单：用页面自己的样式，和 Element Plus 观感一致 -->
+        <!-- 点击：把信息固定在左下角（手机上也能用，悬停不好使） -->
+        <div v-if="pinned" class="fnwg-topo-panel">
+          <div class="fnwg-topo-panel-head">
+            <strong>{{ pinned.label }}</strong>
+            <a class="fnwg-topo-link" @click="pinned = null">关闭</a>
+          </div>
+          <div v-for="kv in detailRows(pinned)" :key="kv.key" class="fnwg-topo-tip-row">
+            <span class="fnwg-topo-tip-key">{{ kv.key }}</span>
+            <span class="fnwg-topo-tip-val">{{ kv.value }}</span>
+          </div>
+          <div v-if="pinned.kind === 'host'" class="fnwg-topo-kind">
+            <span>设备类型</span>
+            <el-select
+              :model-value="pinned.device_kind || ''"
+              size="small"
+              placeholder="按名称自动判断"
+              clearable
+              style="width: 150px"
+              @change="setKind"
+            >
+              <el-option v-for="o in kindOptions" :key="o.value" :label="o.label" :value="o.value" />
+            </el-select>
+          </div>
+
+          <div class="fnwg-topo-panel-foot">
+            <el-button size="small" @click="jumpTo(pinned)">去对应页面</el-button>
+            <el-button size="small" @click="copy((pinned.details.find((d) => d.key === 'IP 地址') || {}).value || pinned.label, '地址')">
+              复制地址
+            </el-button>
+          </div>
+        </div>
+
+        <!-- 右键菜单（与原来那版同一套动作） -->
         <div v-if="menu" class="fnwg-topo-menu" :style="{ left: menu.x + 'px', top: menu.y + 'px' }">
           <div class="fnwg-topo-menu-head">{{ menu.label }}</div>
-          <div v-for="(it, i) in menu.items" :key="i" class="fnwg-topo-menu-item" @click="runMenu(it)">
+          <div v-for="(it, i) in menu.items" :key="i" class="fnwg-topo-menu-item" @click="it.act()">
             <el-icon><component :is="it.icon" /></el-icon>{{ it.text }}
           </div>
         </div>
+
+        <div class="fnwg-topo-mini">
+          <svg :viewBox="`0 0 ${mini.w} ${mini.h}`">
+            <line v-for="(l, i) in mini.lines" :key="i" :x1="l.x1" :y1="l.y1" :x2="l.x2" :y2="l.y2" class="fnwg-topo-mini-line" />
+            <circle v-for="n in mini.nodes" :key="n.id" :cx="n.cx" :cy="n.cy" r="2.6" :class="`k-${n.kind}`" />
+            <rect
+              v-if="mini.view"
+              :x="mini.view.x"
+              :y="mini.view.y"
+              :width="mini.view.w"
+              :height="mini.view.h"
+              class="fnwg-topo-mini-view"
+            />
+          </svg>
+          <span>全览</span>
+        </div>
       </div>
 
+      <!-- 图例：颜色对应节点种类，线型对应连线状态（原来在图下面就有这一排） -->
       <div class="fnwg-topo-legend">
         <span v-for="l in legend" :key="l.text"><i :style="{ background: l.color }" />{{ l.text }}</span>
-        <span><i class="fnwg-topo-legend-line flow" />箭头流动 = 正在传数据（越快越急）</span>
-        <span><i class="fnwg-topo-legend-line off" />虚线 = 已停用 / 未连接</span>
+        <span><i class="fnwg-topo-legend-line flow" />绿色流动 + 箭头 = 正在传数据（越快越急）</span>
+        <span><i class="fnwg-topo-legend-line off" />灰色虚线 = 空闲 / 已停用</span>
       </div>
+
       <div class="fnwg-topo-notes">
         <div v-if="selected" class="fnwg-hint">
-          · 正在看「{{ selectedLabel }}」这条链路：相关的连线与设备高亮，点空白处取消。
-          <a class="fnwg-topo-link" @click="clearSelection">取消高亮</a>
+          · 正在看「{{ selectedLabel }}」这条链路。 <a class="fnwg-topo-link" @click="selected = null">取消高亮</a>
         </div>
         <div class="fnwg-hint">· 节点图标按名字判断设备类型（路由 / 电脑 / 手机 / 打印机…）：给设备在「内网域名」里起个名字，图标会更准。</div>
         <div v-for="(n, i) in graph.notes" :key="i" class="fnwg-hint">· {{ n }}</div>
@@ -70,47 +205,81 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import * as echarts from 'echarts'
 import { ElMessage } from 'element-plus'
 import { Aim, CopyDocument, Link, Picture, Refresh, Setting, View, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
+import { VNetworkGraph } from 'v-network-graph'
 import { api } from '@/api/client'
 import type { TopologyGraph, TopologyNode } from '@/api/types'
 import { useBreakpoint } from '@/composables/useBreakpoint'
-import { formatRate, formatTime } from '@/utils/format'
 
 const { isMobile } = useBreakpoint()
 const router = useRouter()
 
 const graph = ref<TopologyGraph | null>(null)
 const loading = ref(false)
-const chartEl = ref<HTMLElement | null>(null)
-let chart: echarts.ECharts | null = null
-
-/** 布局方式：放射（默认）/ 环状 / 自由（力导向松弛）。 */
-type Mode = 'radial' | 'circular' | 'force'
-const mode = ref<Mode>('radial')
-/** 节点位置：用户拖过之后就以这里为准（按节点 id 记住，刷新页面还在原处）。 */
+const wrapEl = ref<HTMLElement | null>(null)
+const gref = ref<any>(null)
+const mode = ref<'radial' | 'circular' | 'force'>('radial')
 const positions = ref<Record<string, { x: number; y: number }>>({})
-/** 当前高亮的节点（点一下看整条链路）。 */
 const selected = ref<string | null>(null)
-/** 右键菜单（屏幕坐标 + 该节点可做的事）。 */
-const menu = ref<{ x: number; y: number; label: string; items: MenuItem[] } | null>(null)
-/** 缩放窗口（百分比）。自己记着，重画后不会跳回全览。 */
-const zoom = ref({ x: { start: 0, end: 100 }, y: { start: 0, end: 100 } })
+const menu = ref<{ x: number; y: number; label: string; items: { text: string; icon: object; act: () => void }[] } | null>(null)
 
-interface MenuItem {
-  text: string
-  icon: object
-  act: () => void
-}
-
+// 与 ECharts 版分开存：两个引擎的布局方式与手工位置互不影响
 const STORE_KEY = 'fnwg.topology.view'
 
-const atLabel = computed(() => (graph.value ? `更新于 ${formatTime(graph.value.at)}` : ''))
-const canvasHeight = computed(() => (isMobile.value ? '440px' : '560px'))
+/**
+ * 画布高度：设备多的时候固定高度会把卡片挤成一团（用户反馈「高度不够」），
+ * 因此按节点数给高度，并设上下限（太高会让图例与说明被推到屏幕外）。
+ */
+const canvasHeight = computed(() => {
+  const n = graph.value?.nodes.length || 0
+  const base = isMobile.value ? 440 : 500
+  const per = isMobile.value ? 28 : 30
+  return `${Math.min(isMobile.value ? 680 : 780, Math.max(base, n * per))}px`
+})
+
+const atLabel = computed(() => (graph.value ? `更新于 ${graph.value.at}` : ''))
 const selectedLabel = computed(() => graph.value?.nodes.find((n) => n.id === selected.value)?.label || '')
+/** 悬停提示（跟随鼠标）与「点击固定」的详情面板。 */
+const hover = ref<{ x: number; y: number; node: TopologyNode } | null>(null)
+const pinned = ref<TopologyNode | null>(null)
+
+const legend = computed(() => [
+  { text: '本机 NAS（蓝，实心）', color: KIND_COLOR.nas },
+  { text: '内网网段 / 对端内网（青）', color: KIND_COLOR.lan },
+  { text: '另一台 NAS（紫）', color: KIND_COLOR.site },
+  { text: '设备：绿=在线或可达', color: STATUS_COLOR.ok },
+  { text: '设备：橙=离线或待确认', color: STATUS_COLOR.warn },
+  { text: '设备：灰=已停用或未知', color: STATUS_COLOR.off },
+  { text: '疑似残留网卡（橙虚线框）', color: KIND_COLOR.foreign },
+])
+
+const TYPE_LABEL: Record<string, string> = {
+  server: 'NAS / 服务器',
+  network: '网段',
+  router: '路由器 / 无线',
+  laptop: '电脑（笔记本）',
+  monitor: '电脑（默认图标）',
+  phone: '手机 / 平板',
+  printer: '打印机',
+  tv: '电视 / 盒子',
+  warning: '疑似残留网卡',
+}
+
+/** 详情行：第一行是「类型」（按名称判断，写明依据），其余用服务端给的字段。 */
+function detailRows(n: TopologyNode): { key: string; value: string }[] {
+  const isHost = n.kind === 'host' || n.kind === 'device'
+  const configured = n.device_kind ? kindLabel(n.device_kind) : ''
+  const typeText = configured
+    ? configured + '（已配置）'
+    : (TYPE_LABEL[iconOf(n)] || '设备') + (isHost ? '（按名称判断）' : '')
+  const rows = [{ key: '类型', value: typeText }, ...n.details]
+  // 「内网域名」里登记的备注：名字之外还常需要一句人能看懂的说明
+  if (n.note) rows.splice(2, 0, { key: '备注', value: n.note })
+  return rows
+}
 
 const KIND_COLOR: Record<string, string> = {
   nas: '#409eff',
@@ -124,12 +293,7 @@ const KIND_COLOR: Record<string, string> = {
 const STATUS_COLOR: Record<string, string> = { ok: '#22c55e', warn: '#f59e0b', off: '#94a3b8' }
 const STATUS_DRIVEN = new Set(['host', 'device'])
 
-/**
- * 节点图标：简单的几何图形（单一颜色，由节点的状态色填充）。
- *
- * 为什么用内联 SVG 而不是图标字体/图片文件：图标要跟着状态变色、要能进导出的 PNG，
- * 内联 SVG 转 data URI 后既能按节点着色，也不额外增加任何依赖或字体加载。
- */
+/** 图标（与 ECharts 版同一套；抽成共用模块留待选定引擎后处理）。 */
 const ICON_PATHS: Record<string, string> = {
   server:
     '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/>' +
@@ -140,10 +304,6 @@ const ICON_PATHS: Record<string, string> = {
   router:
     '<rect x="3" y="13" width="18" height="7" rx="2"/><path d="M8 13V8M16 13V8" stroke-width="1.7"/>' +
     '<path d="M9.4 8.2a3.8 3.8 0 0 1 5.2 0" fill="none" stroke-width="1.7"/>',
-  switch:
-    '<rect x="2.5" y="7" width="19" height="10" rx="2"/><rect x="5" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/>' +
-    '<rect x="8.6" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/><rect x="12.2" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/>' +
-    '<rect x="15.8" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/>',
   laptop:
     '<rect x="4" y="5" width="16" height="10" rx="1.5"/><rect x="6" y="7" width="12" height="6" rx="1" fill-opacity="0.35"/>' +
     '<path d="M2.5 17.5h19l-1.2 2.3a1 1 0 0 1-.9.5H4.6a1 1 0 0 1-.9-.5z"/>',
@@ -159,6 +319,10 @@ const ICON_PATHS: Record<string, string> = {
   tv:
     '<rect x="2.5" y="5" width="19" height="12.5" rx="2"/><rect x="4.5" y="7" width="15" height="8.5" rx="1" fill-opacity="0.35"/>' +
     '<path d="M9.2 20h5.6l-.8-2.5H10z"/>',
+  switch:
+    '<rect x="2.5" y="7" width="19" height="10" rx="2"/><rect x="5" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/>' +
+    '<rect x="8.6" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/><rect x="12.2" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/>' +
+    '<rect x="15.8" y="10" width="2.4" height="4" rx="0.6" fill-opacity="0.4"/>',
   camera:
     '<rect x="2.5" y="6.5" width="14" height="11" rx="2.5"/><circle cx="9.5" cy="12" r="3" fill-opacity="0.35"/>' +
     '<path d="M17.2 12l4.3-2.8v5.6z"/>',
@@ -169,140 +333,92 @@ const ICON_PATHS: Record<string, string> = {
     '<path d="M12 3.2l9.2 16.2a1.6 1.6 0 0 1-1.4 2.4H4.2A1.6 1.6 0 0 1 2.8 19.4z"/>' +
     '<rect x="11" y="9.4" width="2" height="6" rx="1" fill-opacity="0.45"/><circle cx="12" cy="18" r="1.1" fill-opacity="0.45"/>',
 }
-
 const iconCache = new Map<string, string>()
-
-/** 把图标转成按颜色着色的 data URI（同色同图只生成一次）。 */
 function iconURI(name: string, color: string): string {
-  const key = name + color
-  const hit = iconCache.get(key)
+  const k = name + color
+  const hit = iconCache.get(k)
   if (hit) return hit
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="${color}" stroke="${color}">` +
     `${ICON_PATHS[name] || ICON_PATHS.monitor}</svg>`
   const uri = 'data:image/svg+xml,' + encodeURIComponent(svg)
-  iconCache.set(key, uri)
+  iconCache.set(k, uri)
   return uri
 }
-
-/** 名称关键词 → 图标：用户给设备起过名字，图标就能比默认的更准。 */
 const NAME_RULES: [RegExp, string][] = [
   [/nas|存储|群晖|威联通|synology|qnap|极空间|绿联|服务器|server/i, 'server'],
   [/路由|router|网关|gateway|无线|wifi|mesh/i, 'router'],
-  [/交换机|switch|hub/i, 'switch'],
   [/打印|printer|扫描/i, 'printer'],
-  [/手机|phone|iphone|android|安卓|redmi|oppo|vivo|荣耀|一加/i, 'phone'],
-  [/平板|pad|tablet|ipad/i, 'phone'],
-  [/电脑|pc|mac|book|笔记本|台式|desktop|thinkpad/i, 'laptop'],
+  [/手机|phone|iphone|android|安卓|pad|tablet|ipad/i, 'phone'],
   [/电视|tv|盒子|机顶盒|投影/i, 'tv'],
-  [/摄像|camera|监控|nvr|ipc/i, 'camera'],
-  [/音响|音箱|speaker|homepod|echo|小爱|天猫/i, 'speaker'],
+  [/电脑|pc|mac|book|笔记本|台式|desktop/i, 'laptop'],
 ]
-
-/** 决定一个节点用哪个图标：先看种类，再看名称关键词，最后给默认图标。 */
 function iconOf(n: TopologyNode): string {
   if (n.kind === 'nas' || n.kind === 'site') return 'server'
   if (n.kind === 'lan' || n.kind === 'site-lan') return 'network'
   if (n.kind === 'foreign') return 'warning'
+  // 用户配过类型就按它画：猜是兜底，用户说了算才是准的
+  if (n.device_kind) {
+    const map: Record<string, string> = {
+      router: 'router', switch: 'switch', server: 'server', computer: 'monitor',
+      phone: 'phone', printer: 'printer', tv: 'tv', camera: 'camera', speaker: 'speaker', other: 'monitor',
+    }
+    return map[n.device_kind] || 'monitor'
+  }
   const text = `${n.label} ${n.sublabel || ''}`
   for (const [re, icon] of NAME_RULES) if (re.test(text)) return icon
   return 'monitor'
 }
 
-const TYPE_LABEL: Record<string, string> = {
-  server: 'NAS / 服务器',
-  network: '网段',
-  router: '路由器 / 无线',
-  switch: '交换机',
-  laptop: '电脑（笔记本）',
-  monitor: '电脑（默认图标）',
-  phone: '手机 / 平板',
-  printer: '打印机',
-  tv: '电视 / 盒子',
-  camera: '摄像头',
-  speaker: '音箱',
-  warning: '疑似残留网卡',
+const ink = { text: '#303133', dim: '#909399', line: '#dcdfe6', card: '#ffffff' }
+/** 「在传数据」的连线用这个颜色（见 edgeStyle 与 applyFlow，两处必须是同一个值）。 */
+const FLOW_COLOR = '#22c55e'
+
+function nodeOf(id: string): TopologyNode {
+  return graph.value?.nodes.find((n) => n.id === id) || { id, kind: 'host', label: id, status: 'off', details: [] }
 }
-
-const legend = computed(() => [
-  { text: '本机 NAS', color: KIND_COLOR.nas },
-  { text: '内网网段', color: KIND_COLOR.lan },
-  { text: '内网设备（绿=可达、橙=待确认、灰=未知）', color: STATUS_COLOR.ok },
-  { text: '隧道设备', color: KIND_COLOR.device },
-  { text: '另一台 NAS 及其内网', color: KIND_COLOR.site },
-  { text: '疑似残留网卡', color: KIND_COLOR.foreign },
-])
-
-// ------------------------------------------------------------------ 位置计算
-
-interface Placed {
-  node: TopologyNode
-  x: number
-  y: number
-  w: number
-  h: number
-  color: string
-}
-
-const rad = (deg: number) => (deg * Math.PI) / 180
-
-/** 卡片宽度按文字长度估：中文按 13px、西文按 7.2px 算，够准且不会为它引入测量逻辑。 */
-function textWidth(s: string): number {
-  let w = 0
-  for (const ch of s) w += /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(ch) ? 13 : 7.2
-  return w
-}
-
-/** 节点卡片的尺寸：两行字（名称 + 地址）撑起来的固定卡片，比纯圆圈好读。 */
-function sizeOf(n: TopologyNode): [number, number] {
-  // 估宽留足余量（不同字体的实际宽度会有出入，估窄了文字会溢出到卡片外面）
-  const widest = Math.max(...(n.sublabel ? [n.label, n.sublabel] : [n.label]).map(textWidth))
-  // 高度也留余量：两行字（名称 + 地址）在内侧垂直居中，卡矮了第二行会被切掉一截
-  if (n.kind === 'nas') return [Math.min(260, Math.max(170, widest * 1.08 + 56)), 60]
-  return [Math.min(isMobile.value ? 200 : 240, Math.max(isMobile.value ? 118 : 128, widest * 1.08 + 44)), n.sublabel ? 52 : 34]
-}
-
 function colorOf(n: TopologyNode): string {
   return STATUS_DRIVEN.has(n.kind) ? STATUS_COLOR[n.status] || STATUS_COLOR.off : KIND_COLOR[n.kind] || STATUS_COLOR.off
 }
+/** 卡片尺寸：与 ECharts 版同一套估算口径。 */
+function sizeOf(n: TopologyNode): { w: number; h: number } {
+  const width = (s: string) => {
+    let w = 0
+    for (const ch of s) w += /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(ch) ? 13 : 7.2
+    return w
+  }
+  const lines = n.sublabel ? [n.label, n.sublabel] : [n.label]
+  const widest = Math.max(...lines.map(width))
+  const cap = n.kind === 'nas' ? 260 : isMobile.value ? 200 : 240
+  const min = n.kind === 'nas' ? 170 : isMobile.value ? 118 : 128
+  const h = n.note ? 66 : n.sublabel ? 52 : 34
+  return { w: Math.min(cap, Math.max(min, widest * 1.08 + (n.kind === 'nas' ? 56 : 44))), h }
+}
 
-/**
- * 算出每个节点的坐标。
- *
- * 三种布局都由我们自己算（不用力导向库）：位置**可复现**是硬要求 ——
- * 同一个网络每次打开方位一致，用户才能靠位置认东西；「自由」布局也从放射布局出发松弛，
- * 因此同样输入必然得到同样结果。
- *
- * 左右分家的约定不变：内网在左半圆、隧道与对端在右半圆（两类东西语义不同，
- * 混成一圈会让人以为「内网设备」和「连上来的设备」是一回事）。
- */
-function computePositions(g: TopologyGraph, m: Mode): Record<string, { x: number; y: number }> {
+/** 位置：与 ECharts 版同样的三套布局（方位可复现）。 */
+function computePositions(g: TopologyGraph, m: 'radial' | 'circular' | 'force'): Record<string, { x: number; y: number }> {
   const narrow = isMobile.value
   const R1 = narrow ? 190 : 250
   const R2 = narrow ? 320 : 470
   const out: Record<string, { x: number; y: number }> = {}
   const nas = g.nodes.find((n) => n.kind === 'nas')
   if (nas) out[nas.id] = { x: 0, y: 0 }
-
+  const rad = (d: number) => (d * Math.PI) / 180
   const childrenOf = (id: string) =>
     g.links.filter((l) => l.from === id).map((l) => g.nodes.find((n) => n.id === l.to)).filter(Boolean) as TopologyNode[]
   const lans = g.nodes.filter((n) => n.kind === 'lan')
   const sites = g.nodes.filter((n) => n.kind === 'site')
   const devices = g.nodes.filter((n) => n.kind === 'device')
   const foreign = g.nodes.filter((n) => n.kind === 'foreign')
-
-  const placeArc = (list: TopologyNode[], center: number, spread: number, radius: number) => {
+  const arc = (list: TopologyNode[], center: number, spread: number, radius: number) => {
     list.forEach((n, i) => {
       const t = list.length === 1 ? 0.5 : i / (list.length - 1)
       const a = rad(center - spread / 2 + spread * t)
       out[n.id] = { x: radius * Math.cos(a), y: radius * Math.sin(a) }
     })
   }
-  const rightSide = [...sites, ...devices]
-
   if (m === 'circular') {
-    // 环状：中心节点一圈均匀铺开，设备再往外一圈
-    const ring1 = [...lans, ...rightSide, ...foreign]
+    const ring1 = [...lans, ...sites, ...devices, ...foreign]
     ring1.forEach((n, i) => {
       const a = rad((360 / Math.max(1, ring1.length)) * i - 90)
       out[n.id] = { x: R1 * Math.cos(a), y: R1 * Math.sin(a) }
@@ -320,36 +436,29 @@ function computePositions(g: TopologyGraph, m: Mode): Record<string, { x: number
       })
     }
   } else {
-    // 放射（默认）与自由的初始状态：左半圆内网、右半圆隧道
-    placeArc(lans, 180, 100, R1)
-    placeArc(rightSide, 0, Math.min(150, Math.max(60, rightSide.length * 20)), R1)
-    placeArc(foreign, 270, 60, R1)
+    arc(lans, 180, 100, R1)
+    const right = [...sites, ...devices]
+    arc(right, 0, Math.min(150, Math.max(60, right.length * 20)), R1)
+    arc(foreign, 270, 60, R1)
     for (const parent of [...lans, ...sites]) {
       const kids = childrenOf(parent.id)
       const at = out[parent.id]
       if (!kids.length || !at) continue
-      const base = Math.atan2(at.y, at.x)
+      const baseAngle = (Math.atan2(at.y, at.x) * 180) / Math.PI
       const spread = Math.min(140, Math.max(30, kids.length * 16))
       const radius = R2 + Math.max(0, kids.length - 5) * (narrow ? 10 : 16)
       kids.forEach((n, i) => {
         const t = kids.length === 1 ? 0.5 : i / (kids.length - 1)
-        const a = rad(base * (180 / Math.PI) - spread / 2 + spread * t)
+        const a = rad(baseAngle - spread / 2 + spread * t)
         out[n.id] = { x: radius * Math.cos(a), y: radius * Math.sin(a) }
       })
     }
   }
-
   if (m === 'force') return relax(g, out)
   return out
 }
 
-/**
- * 「自由」布局：从放射布局出发做力导向松弛。
- *
- * 自己写而不是引 d3-force：只有几十个节点，几十行就够；更重要的是**确定性** ——
- * 从固定初值出发、固定迭代次数，同样的网络必然收敛到同样的形状，不会每次开图都换一个样子。
- * 中心节点固定不动（它必须是图的心脏）。
- */
+/** 「自由」布局：从放射出发做力导向松弛（固定初值 + 固定迭代 = 结果可复现）。 */
 function relax(g: TopologyGraph, init: Record<string, { x: number; y: number }>): Record<string, { x: number; y: number }> {
   const ids = Object.keys(init)
   const pos = ids.map((id) => ({ id, ...init[id] }))
@@ -358,15 +467,12 @@ function relax(g: TopologyGraph, init: Record<string, { x: number; y: number }>)
   const links = g.links
     .map((l) => ({ a: idx.get(l.from), b: idx.get(l.to) }))
     .filter((l) => l.a !== undefined && l.b !== undefined) as { a: number; b: number }[]
-  const level = (i: number) => {
-    const n = g.nodes.find((x) => x.id === ids[i])
-    return n?.kind === 'nas' ? 0 : n?.kind === 'lan' || n?.kind === 'site' ? 1 : 2
-  }
-  const depths = ids.map((_, i) => level(i))
-
+  const depth = ids.map((id) => {
+    const k = g.nodes.find((x) => x.id === id)?.kind
+    return k === 'nas' ? 0 : k === 'lan' || k === 'site' ? 1 : 2
+  })
   for (let step = 0; step < 320; step++) {
     const cool = 1 - step / 320
-    // 斥力：所有节点互相推开（同类中的远端节点推得弱一些，避免整图炸开）
     for (let i = 0; i < pos.length; i++) {
       for (let j = i + 1; j < pos.length; j++) {
         let dx = pos[j].x - pos[i].x
@@ -379,31 +485,26 @@ function relax(g: TopologyGraph, init: Record<string, { x: number; y: number }>)
         }
         const d = Math.sqrt(d2)
         const rep = (90000 / d2) * cool
-        const ux = dx / d
-        const uy = dy / d
-        pos[i].x -= ux * rep
-        pos[i].y -= uy * rep
-        pos[j].x += ux * rep
-        pos[j].y += uy * rep
+        pos[i].x -= (dx / d) * rep
+        pos[i].y -= (dy / d) * rep
+        pos[j].x += (dx / d) * rep
+        pos[j].y += (dy / d) * rep
       }
     }
-    // 引力：连线把两端拉近；另外把「同一层的节点」往各自该在的半径上拉，保持左右分家的可读性
     for (const l of links) {
       const dx = pos[l.b].x - pos[l.a].x
       const dy = pos[l.b].y - pos[l.a].y
       const d = Math.sqrt(dx * dx + dy * dy) || 1
       const pull = (d - 200) * 0.045 * cool
-      const ux = dx / d
-      const uy = dy / d
-      pos[l.a].x += ux * pull
-      pos[l.a].y += uy * pull
-      pos[l.b].x -= ux * pull
-      pos[l.b].y -= uy * pull
+      pos[l.a].x += (dx / d) * pull
+      pos[l.a].y += (dy / d) * pull
+      pos[l.b].x -= (dx / d) * pull
+      pos[l.b].y -= (dy / d) * pull
     }
     for (let i = 0; i < pos.length; i++) {
-      if (depths[i] === 0) continue
-      const want = depths[i] === 1 ? 260 : 470
-      const d = Math.sqrt(pos[i].x * pos[i].x + pos[i].y * pos[i].y) || 1
+      if (depth[i] === 0) continue
+      const want = depth[i] === 1 ? 260 : 470
+      const d = Math.sqrt(pos[i].x ** 2 + pos[i].y ** 2) || 1
       const k = ((want - d) / d) * 0.12 * cool
       pos[i].x += pos[i].x * k
       pos[i].y += pos[i].y * k
@@ -419,516 +520,325 @@ function relax(g: TopologyGraph, init: Record<string, { x: number; y: number }>)
   return out
 }
 
-/** 每次要画的节点与连线（把「布局」「用户拖动」「高亮」三件事合到一起）。 */
-const scene = computed(() => {
+const pos = computed(() => {
   const g = graph.value
-  if (!g) return null
+  if (!g) return {}
   const base = computePositions(g, mode.value)
-  const placed: Placed[] = []
-  for (const n of g.nodes) {
-    const p = positions.value[n.id] || base[n.id]
-    if (!p) continue
-    const [w, h] = sizeOf(n)
-    placed.push({ node: n, x: p.x, y: p.y, w, h, color: colorOf(n) })
-  }
-  const byId = new Map(placed.map((p) => [p.node.id, p]))
-  const neighbors = new Set<string>()
-  const edges: { from: string; to: string; status: string; rate: number; label?: string }[] = []
-  for (const l of g.links) {
-    if (!byId.has(l.from) || !byId.has(l.to)) continue
-    edges.push({ from: l.from, to: l.to, status: l.status, rate: l.rate || 0, label: l.label })
-  }
-  if (selected.value) {
-    neighbors.add(selected.value)
-    for (const e of edges) {
-      if (e.from === selected.value) neighbors.add(e.to)
-      if (e.to === selected.value) neighbors.add(e.from)
-    }
-  }
-  const xs = placed.map((p) => p.x)
-  const ys = placed.map((p) => p.y)
-  const pad = isMobile.value ? 200 : 240
-  const bounds: [number, number, number, number] = [
-    Math.min(...xs) - pad,
-    Math.max(...xs) + pad,
-    Math.min(...ys) - (isMobile.value ? 110 : 130),
-    Math.max(...ys) + (isMobile.value ? 110 : 130),
-  ]
-  return { placed, byId, edges, neighbors, bounds }
+  const merged: Record<string, { x: number; y: number }> = {}
+  for (const n of g.nodes) merged[n.id] = positions.value[n.id] || base[n.id] || { x: 0, y: 0 }
+  return merged
 })
 
-// ------------------------------------------------------------------ 画图
+const vngNodes = computed(() => {
+  const out: Record<string, { name: string }> = {}
+  for (const n of graph.value?.nodes || []) out[n.id] = { name: n.label }
+  return out
+})
 
-function chartInk() {
-  const cs = getComputedStyle(document.documentElement)
-  const read = (name: string, fallback: string) => cs.getPropertyValue(name).trim() || fallback
-  return {
-    text: read('--el-text-color-primary', '#303133'),
-    dim: read('--el-text-color-secondary', '#909399'),
-    line: read('--el-border-color', '#dcdfe6'),
-    card: read('--fnwg-card', '#ffffff'),
+const vngEdges = computed(() => {
+  const out: Record<string, { source: string; target: string }> = {}
+  linkOf.clear()
+  for (const l of graph.value?.links || []) {
+    out[`${l.from}>${l.to}`] = { source: l.from, target: l.to }
+    linkOf.set(`${l.from}>${l.to}`, { status: l.status, rate: l.rate || 0 })
   }
-}
+  return out
+})
 
-function escapeHTML(s: string): string {
-  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] as string)
-}
-
-/** 悬停卡：节点给完整信息；连线给「谁连谁 + 当前速率」。 */
-function tipHTML(data: any): string {
-  const ink = chartInk()
-  const row = (k: string, v: string) =>
-    `<div style="display:flex;gap:8px;margin-top:4px"><span style="flex:0 0 66px;color:${ink.dim}">${k}</span>` +
-    `<span style="flex:1;word-break:break-word">${escapeHTML(v)}</span></div>`
-  if (data.__edge) {
-    const e = data.__edge
-    return (
-      `<div style="font-size:13px"><strong>${escapeHTML(e.fromLabel)} → ${escapeHTML(e.toLabel)}</strong></div>` +
-      row('连接', e.label || '内网') +
-      row('状态', e.status === 'ok' ? '正常' : e.status === 'warn' ? '待确认 / 离线' : '已停用') +
-      row('速率', e.rate > 0 ? formatRate(e.rate) : '当前没有流量')
-    )
+/** 高亮：选中节点及其邻居保持清晰，其余淡出。 */
+const related = computed(() => {
+  const set = new Set<string>()
+  const g = graph.value
+  if (!g || !selected.value) return set
+  set.add(selected.value)
+  for (const l of g.links) {
+    if (l.from === selected.value) set.add(l.to)
+    if (l.to === selected.value) set.add(l.from)
   }
-  const n = data.__node as TopologyNode
-  return (
-    `<div style="font-size:13px"><strong>${escapeHTML(n.label)}</strong>` +
-    (n.sublabel ? `<span style="color:${ink.dim}">　${escapeHTML(n.sublabel)}</span>` : '') +
-    '</div>' +
-    row('类型', TYPE_LABEL[iconOf(n)] + (['host', 'device'].includes(n.kind) ? '（按名称判断）' : '')) +
-    n.details.map((d) => row(d.key, d.value)).join('') +
-    `<div style="margin-top:6px;color:${ink.dim};font-size:11.5px">单击看链路 · 双击跳转 · 右键更多 · 可拖动</div>`
-  )
+  return set
+})
+function dimmed(id: string): boolean {
+  return selected.value !== null && !related.value.has(id)
 }
 
-function buildOption(): echarts.EChartsOption {
-  const ink = chartInk()
-  const s = scene.value!
-  const dim = (id: string) => selected.value !== null && !s.neighbors.has(id)
 
-  const nodes = s.placed.map((p) => {
-    const n = p.node
-    const isNas = n.kind === 'nas'
-    const faded = dim(n.id)
+/** 边 → 状态/速率（按 source>target 查回我们自己的连线数据）。 */
+const linkOf = new Map<string, { status: string; rate: number }>()
+
+/**
+ * 一条线的画法：只有「在传数据」的线才流动（按速率分档决定粗细），空闲与已停用的线静止。
+ * 这是补上的第一项 —— 该库没有逐边样式的现成开关，但配置项支持传函数（CallableValue）。
+ */
+function edgeStyle(e: any): { color: string; width: number; lineDash: number[] } {
+  const l = linkOf.get(`${e?.source}>${e?.target}`)
+  if (!l || (l.status !== 'ok' && l.status !== 'warn')) return { color: '#94a3b8', width: 1.2, lineDash: [3, 4] }
+  if (l.rate >= 1024 * 1024) return { color: FLOW_COLOR, width: 2.6, lineDash: [8, 6] }
+  if (l.rate >= 64 * 1024) return { color: FLOW_COLOR, width: 2.2, lineDash: [8, 6] }
+  if (l.rate > 0) return { color: FLOW_COLOR, width: 1.8, lineDash: [8, 6] }
+  if (l.status === 'warn') return { color: '#f59e0b', width: 1.8, lineDash: [6, 6] }
+  return { color: '#cbd5e1', width: 1.4, lineDash: [6, 6] }
+}
+
+const configs: any = {
+  view: { panEnabled: true, zoomEnabled: true, minZoom: 0.2, maxZoom: 4, autoFit: true },
+  node: { selectable: true, draggable: true, normal: { type: 'circle', radius: 0 }, label: { visible: false } },
+  edge: {
+    normal: {
+      width: (e: any) => edgeStyle(e).width,
+      color: (e: any) => edgeStyle(e).color,
+      lineDash: (e: any) => edgeStyle(e).lineDash,
+      opacity: 0.9,
+    },
+    hover: { width: 3, color: '#409eff' },
+    selectable: true,
+  },
+}
+
+
+/** 全览小地图：只画节点与连线（不画视野方框，见文件顶部说明）。 */
+const mini = computed(() => {
+  const g = graph.value
+  const w = 170
+  const h = 116
+  if (!g)
     return {
-      name: n.id,
-      x: p.x,
-      y: p.y,
-      value: [p.x, p.y],
-      symbol: 'roundRect',
-      symbolSize: [p.w, p.h],
-      itemStyle: {
-        color: isNas ? p.color : ink.card,
-        borderColor: p.color,
-        borderWidth: isNas ? 2.5 : 1.5,
-        borderType: n.kind === 'foreign' ? 'dashed' : 'solid',
-        shadowBlur: faded ? 0 : 8,
-        shadowColor: 'rgba(15, 23, 42, 0.10)',
-        opacity: faded ? 0.25 : 1,
-      },
-      label: {
-        show: true,
-        position: 'inside',
-        align: 'left',
-        padding: [0, 0, 0, isNas ? 16 : 13],
-        formatter: n.sublabel ? `{ico|}{a|${n.label}}\n{pad|}{b|${n.sublabel}}` : `{ico|}{a|${n.label}}`,
-        rich: {
-          ico: {
-            width: 18,
-            height: 18,
-            align: 'center',
-            verticalAlign: 'middle',
-            backgroundColor: { image: iconURI(iconOf(n), isNas ? '#ffffff' : p.color) } as any,
-          },
-          pad: { width: 18, height: 14 },
-          a: { color: isNas ? '#ffffff' : ink.text, fontSize: 12.5, fontWeight: isNas ? 'bold' : 'normal', lineHeight: 16 },
-          b: { color: isNas ? 'rgba(255,255,255,0.85)' : ink.dim, fontSize: 11, lineHeight: 14 },
-        },
-        opacity: faded ? 0.3 : 1,
-      },
-      __node: n,
+      w,
+      h,
+      nodes: [] as Array<{ id: string; cx: number; cy: number; kind: string }>,
+      lines: [] as Array<{ x1: number; y1: number; x2: number; y2: number }>,
+      view: null as null | { x: number; y: number; w: number; h: number },
     }
-  })
-
-  // 连线按速率分档到不同系列：effect.period 只能按系列设，分档后「越快越急」才看得出来
-  const buckets: { key: number; color: string; period: number; width: number; symbol: string }[] = [
-    { key: 0, color: '#409eff', period: 1.1, width: 2.4, symbol: 'arrow' },
-    { key: 1, color: '#409eff', period: 2, width: 2, symbol: 'arrow' },
-    { key: 2, color: '#409eff', period: 3.2, width: 1.8, symbol: 'arrow' },
-    { key: 3, color: '#f59e0b', period: 5, width: 1.8, symbol: 'arrow' },
-    { key: 4, color: ink.line, period: 9, width: 1.4, symbol: 'circle' },
-  ]
-  const bucketOf = (e: { status: string; rate: number }) => {
-    if (e.status !== 'ok' && e.status !== 'warn') return 5
-    if (e.rate >= 1024 * 1024) return 0
-    if (e.rate >= 64 * 1024) return 1
-    if (e.rate > 0) return 2
-    if (e.status === 'warn') return 3
-    return 4
+  const p = pos.value
+  const xs = Object.values(p).map((v) => v.x)
+  const ys = Object.values(p).map((v) => v.y)
+  const pad = 60
+  const [x0, x1, y0, y1] = [Math.min(...xs) - pad, Math.max(...xs) + pad, Math.min(...ys) - pad, Math.max(...ys) + pad]
+  const sx = w / (x1 - x0)
+  const sy = h / (y1 - y0)
+  const px = (x: number) => (x - x0) * sx
+  const py = (y: number) => h - (y - y0) * sy
+  // 视野方框：把屏幕可见范围换算回世界坐标，再映射到缩略图上
+  let box: null | { x: number; y: number; w: number; h: number } = null
+  const v = view.value
+  const svgEl = wrapEl.value?.querySelector('svg')
+  if (v && svgEl && svgEl.clientWidth > 0) {
+    const x0w = -v.tx / v.k
+    const x1w = (svgEl.clientWidth - v.tx) / v.k
+    const y1w = -v.ty / v.k
+    const y0w = (svgEl.clientHeight - v.ty) / v.k
+    box = { x: px(x0w), y: py(y1w), w: Math.max(6, (x1w - x0w) * sx), h: Math.max(6, (y1w - y0w) * sy) }
   }
-  // draggable 关掉：拖动由我们自己接管（见 bindChartEvents），位置要能被记住与保存
-  const nodSeries: any = { type: 'graph', coordinateSystem: 'cartesian2d', layout: 'none', draggable: false, roam: false, z: 5, data: nodes, edges: [] }
-  const series: any[] = [nodSeries]
-  for (const b of buckets) {
-    const data = s.edges
-      .filter((e) => bucketOf(e) === b.key)
-      .map((e) => {
-        const a = s.byId.get(e.from)!
-        const c = s.byId.get(e.to)!
-        const faded = selected.value !== null && !(s.neighbors.has(e.from) && s.neighbors.has(e.to))
-        return {
-          coords: [
-            [a.x, a.y],
-            [c.x, c.y],
-          ],
-          lineStyle: { opacity: faded ? 0.15 : 0.8 },
-          __edge: { ...e, fromLabel: a.node.label, toLabel: c.node.label },
-        }
-      })
-    if (!data.length) continue
-    series.push({
-      type: 'lines',
-      coordinateSystem: 'cartesian2d',
-      polyline: false,
-      z: 2,
-      silent: false,
-      data,
-      lineStyle: { color: b.color, width: b.width, opacity: 0.8, curveness: 0, type: b.key >= 4 ? 'dashed' : 'solid' },
-      // 只有「在传数据」的线才跑动画：空闲线也动会让人误以为在传输，而且是卡顿主因之一
-      effect: b.key <= 2 ? { show: true, period: b.period, trailLength: 0.3, symbol: b.symbol, symbolSize: 6, color: b.color } : undefined,
-    })
-  }
-  const offEdges = s.edges
-    .filter((e) => bucketOf(e) === 5)
-    .map((e) => {
-      const a = s.byId.get(e.from)!
-      const c = s.byId.get(e.to)!
-      return {
-        coords: [
-          [a.x, a.y],
-          [c.x, c.y],
-        ],
-        __edge: { ...e, fromLabel: a.node.label, toLabel: c.node.label },
-      }
-    })
-  if (offEdges.length) {
-    series.push({
-      type: 'lines',
-      coordinateSystem: 'cartesian2d',
-      lineStyle: { color: '#94a3b8', width: 1.2, type: 'dashed', opacity: 0.7 },
-      data: offEdges,
-    })
-  }
-
   return {
-    animation: true,
-    animationDuration: 320,
-    grid: { left: 6, right: 6, top: 6, bottom: 6 },
-    xAxis: { type: 'value', min: s.bounds[0], max: s.bounds[1], show: false },
-    yAxis: { type: 'value', min: s.bounds[2], max: s.bounds[3], show: false },
-    dataZoom: [
-      {
-        type: 'inside',
-        xAxisIndex: 0,
-        filterMode: 'none',
-        zoomOnMouseWheel: true,
-        moveOnMouseWheel: false,
-        // 平移交给我们自己处理：让 dataZoom 也跟着鼠标拖，就会和「拖动节点」打架
-        moveOnMouseMove: false,
-        start: zoom.value.x.start,
-        end: zoom.value.x.end,
-      },
-      {
-        type: 'inside',
-        yAxisIndex: 0,
-        filterMode: 'none',
-        zoomOnMouseWheel: true,
-        moveOnMouseWheel: false,
-        moveOnMouseMove: false,
-        start: zoom.value.y.start,
-        end: zoom.value.y.end,
-      },
-    ],
-    tooltip: { trigger: 'item', confine: true, className: 'fnwg-topo-tip', padding: [8, 10], formatter: (p: any) => tipHTML(p.data || {}) },
-    series,
+    w,
+    h,
+    view: box,
+    nodes: g.nodes.map((n) => ({ id: n.id, cx: px(p[n.id]?.x || 0), cy: py(p[n.id]?.y || 0), kind: n.kind })),
+    lines: g.links.map((l) => ({ x1: px(p[l.from]?.x || 0), y1: py(p[l.from]?.y || 0), x2: px(p[l.to]?.x || 0), y2: py(p[l.to]?.y || 0) })),
   }
-}
+})
 
-let paintPending = false
-/** paint 合并同一帧里的多次重画（拖动节点时每帧最多画一次）。 */
-function paint(): void {
-  if (paintPending) return
-  paintPending = true
-  requestAnimationFrame(() => {
-    paintPending = false
-    if (!chart || !graph.value) return
-    const option = buildOption()
-    // 拖动时关掉过渡动画：每帧都做一次 300ms 补间，手一拖就明显发涩
-    if (dragging) option.animation = false
-    // 用增量合并而不是整图 replace：后者重建全部系列与容器，是「卡」的主要来源
-    chart.setOption(option)
-  })
-}
-
-// ------------------------------------------------------------------ 交互
-
-/** 拖动节点：ECharts 的 graph 系列在 cartesian2d 下自带拖动支持有限，这里自己接管，保证位置可控可存。 */
-let dragging: { id: string; moved: boolean } | null = null
-/** 空白处拖动平移的状态（与节点拖动分开，避免两个动作抢鼠标）。 */
-let panning: { x: number; y: number } | null = null
-
-function bindChartEvents(): void {
-  if (!chart) return
-  chart.off('mousedown')
-  chart.off('dblclick')
-  chart.off('contextmenu')
-  chart.on('mousedown', (p: any) => {
-    if (!p.data?.__node) return
-    dragging = { id: p.data.__node.id, moved: false }
-    // 按下时把当前布局固化成底稿：拖动只覆盖被拖的那一个，其余节点保持原样，
-    // 也避免每帧重算布局。之后位置就一直以用户摆的为准。
-    if (mode.value !== 'force' && Object.keys(positions.value).length === 0) {
-      positions.value = computePositions(graph.value!, mode.value)
-    }
-  })
-  // 空白处按住拖动 = 平移画布（节点上的拖动则是移动节点，两者互不干扰）
-  chart.getZr().off('mousedown')
-  chart.getZr().on('mousedown', (e: any) => {
-    if (!e.target && chart) panning = { x: e.offsetX, y: e.offsetY }
-  })
-  chart.getZr().off('mousemove')
-  chart.getZr().on('mousemove', (e: any) => {
-    if (panning && chart) {
-      const w = chart.getWidth() || 1
-      const h = chart.getHeight() || 1
-      const spanX = zoom.value.x.end - zoom.value.x.start
-      const spanY = zoom.value.y.end - zoom.value.y.start
-      const dx = ((panning.x - e.offsetX) / w) * spanX
-      const dy = ((e.offsetY - panning.y) / h) * spanY
-      zoom.value = {
-        x: window100(zoom.value.x.start + spanX / 2 + dx, spanX),
-        y: window100(zoom.value.y.start + spanY / 2 + dy, spanY),
-      }
-      panning = { x: e.offsetX, y: e.offsetY }
-      applyZoom()
-      return
-    }
-    if (!dragging || !chart) return
-    const pt = chart.convertFromPixel({ seriesIndex: 0 }, [e.offsetX, e.offsetY]) as number[]
-    if (!pt || pt.length < 2 || Number.isNaN(pt[0])) return
-    dragging.moved = true
-    positions.value = { ...positions.value, [dragging.id]: { x: Math.round(pt[0]), y: Math.round(pt[1]) } }
-  })
-  chart.getZr().off('mouseup')
-  chart.getZr().on('mouseup', () => {
-    if (dragging?.moved) saveView()
-    dragging = null
-    panning = null
-  })
-  // 滚轮/拖动改视野时 ECharts 只改内部状态：把窗口读回来，缩略图的「正在看哪一块」才能跟上
-  chart.on('dataZoom', () => {
-    const dz = ((chart?.getOption() as any)?.dataZoom || []) as any[]
-    const at = (i: number, k: 'start' | 'end') => {
-      const v = dz[i]?.[k]
-      return typeof v === 'number' ? v : k === 'start' ? 0 : 100
-    }
-    zoom.value = { x: { start: at(0, 'start'), end: at(0, 'end') }, y: { start: at(1, 'start'), end: at(1, 'end') } }
-  })
-  chart.on('dblclick', (p: any) => {
-    const n = p.data?.__node as TopologyNode | undefined
-    if (n) jumpTo(n)
-  })
-  chart.on('contextmenu', (p: any) => {
-    const n = p.data?.__node as TopologyNode | undefined
-    const ev = p.event?.event as MouseEvent | undefined
-    if (!n || !ev) return
-    ev.preventDefault()
-    const box = chartEl.value?.getBoundingClientRect()
-    menu.value = {
-      x: (ev.clientX || 0) - (box?.left || 0),
-      y: (ev.clientY || 0) - (box?.top || 0),
-      label: n.label,
-      items: menuFor(n),
-    }
-  })
-  // 点空白处：关菜单 + 取消高亮（点在节点上由下面的 click 处理）
-  chart.getZr().on('click', (e: any) => {
-    menu.value = null
-    if (!e.target) clearSelection()
-  })
-  chart.on('click', (p: any) => {
-    const n = p.data?.__node as TopologyNode | undefined
-    if (n) selected.value = selected.value === n.id ? null : n.id
-    saveView()
-  })
-}
-
-function clearSelection(): void {
-  if (selected.value) {
-    selected.value = null
-    paint()
-  }
-}
-
-/** 布局切换：换布局就丢掉手工位置（否则新布局看不出来）。 */
+/**
+ * 换布局：必须把「回读/手工」的位置清掉。
+ * 回读是每 1.5 秒把当前所有节点位置记下来（为了记住拖动），它会覆盖新布局算出来的坐标 ——
+ * 清掉之后，新布局立即生效，随后的回读又以新布局为基准（这就是此前「切布局没反应」的原因）。
+ */
 function onModeChange(): void {
   positions.value = {}
   saveView()
-  paint()
 }
 
-/** window100 把「以 center 为中心、跨 span 的窗口」夹在 0~100 之内。 */
-function window100(center: number, span: number): { start: number; end: number } {
-  let s = center - span / 2
-  if (s < 0) s = 0
-  if (s + span > 100) s = 100 - span
-  return { start: s, end: s + span }
-}
-
-/** applyZoom 把当前窗口下发给两个 dataZoom（横、纵各一个，分开才能用缩略图双向定位）。 */
-function applyZoom(): void {
-  chart?.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, start: zoom.value.x.start, end: zoom.value.x.end })
-  chart?.dispatchAction({ type: 'dataZoom', dataZoomIndex: 1, start: zoom.value.y.start, end: zoom.value.y.end })
-}
-
-function zoomBy(factor: number): void {
-  const span = Math.min(100, Math.max(8, (zoom.value.x.end - zoom.value.x.start) * factor))
-  zoom.value = {
-    x: window100((zoom.value.x.start + zoom.value.x.end) / 2, span),
-    y: window100((zoom.value.y.start + zoom.value.y.end) / 2, span),
+/** 从事件目标往上找带 data-node 的卡片 —— 这就是「鼠标在哪台设备上」。 */
+function nodeIdFrom(target: EventTarget | null): string {
+  let el = target as Element | null
+  while (el && el !== wrapEl.value) {
+    const id = el.getAttribute?.('data-node')
+    if (id) return id
+    el = el.parentElement
   }
-  applyZoom()
+  return ''
 }
 
-function fitView(): void {
-  zoom.value = { x: { start: 0, end: 100 }, y: { start: 0, end: 100 } }
-  applyZoom()
+/** 提示卡的位置：跟着鼠标，但不越出画布。 */
+function tipPos(ev: MouseEvent): { x: number; y: number } {
+  const box = wrapEl.value?.getBoundingClientRect()
+  return {
+    x: Math.min(Math.max(8, (ev.clientX || 0) - (box?.left || 0) + 14), Math.max(8, (box?.width || 800) - 336)),
+    y: Math.min(Math.max(8, (ev.clientY || 0) - (box?.top || 0) + 12), Math.max(8, (box?.height || 600) - 240)),
+  }
 }
 
-/** 双击跳转：把图上的东西和页面里的东西对应起来，省得自己去翻。 */
+/** 单击：高亮这条链路，并把详细信息固定在左下角（手机上悬停不好使，详情得有地方看）。 */
+// 事件是否落在浮层（详情卡 / 右键菜单 / 缩略图）里。必须排除：详情卡就在画布容器内，
+// 若把卡里的点击也当成「点到空白」，一碰卡里的下拉就会把卡片关掉。
+function inOverlay(target: EventTarget | null): boolean {
+  const el = target as Element | null
+  return !!el?.closest?.('.fnwg-topo-panel, .fnwg-topo-menu, .fnwg-topo-mini')
+}
+
+function onWrapClick(ev: MouseEvent): void {
+  if (inOverlay(ev.target)) return
+  const id = nodeIdFrom(ev.target)
+  if (!id) {
+    selected.value = null
+    pinned.value = null
+    menu.value = null
+    return
+  }
+  const on = selected.value !== id
+  selected.value = on ? id : null
+  pinned.value = on ? nodeOf(id) : null
+  menu.value = null
+}
+
+/** 双击：跳到这台设备/这条连接对应的页面。 */
+function onWrapDbl(ev: MouseEvent): void {
+  if (inOverlay(ev.target)) return
+  const id = nodeIdFrom(ev.target)
+  if (id) jumpTo(nodeOf(id))
+}
+
+/** 右键：给出可做的事（只看、只复制，不改网络）。 */
+function onWrapMenu(ev: MouseEvent): void {
+  if (inOverlay(ev.target)) return
+  const id = nodeIdFrom(ev.target)
+  if (!id) return
+  ev.preventDefault()
+  menu.value = { ...tipPos(ev), label: nodeOf(id).label, items: menuFor(nodeOf(id)) }
+}
+
+/** 悬停：跟着鼠标给出完整信息。 */
+function onWrapMove(ev: MouseEvent): void {
+  if (inOverlay(ev.target)) {
+    hover.value = null
+    return
+  }
+  const id = nodeIdFrom(ev.target)
+  hover.value = id ? { ...tipPos(ev), node: nodeOf(id) } : null
+}
+
 function jumpTo(n: TopologyNode): void {
   if (n.kind === 'device' || n.kind === 'site') return void router.push({ name: 'peers' })
   if (n.kind === 'lan' || n.kind === 'site-lan') return void router.push({ name: 'interfaces' })
   if (n.kind === 'foreign') return void router.push({ name: 'maintenance' })
-  void router.push({ name: 'settings' }) // 内网设备：去「系统设置 → 内网域名」给它起名字
+  void router.push({ name: 'settings' })
 }
 
 function copy(text: string, what: string): void {
+  menu.value = null
   navigator.clipboard
     ?.writeText(text)
     .then(() => ElMessage.success(`${what}已复制`))
     .catch(() => ElMessage.warning('复制失败，请手动选择'))
-  menu.value = null
 }
 
-/** 右键菜单：只做「看一眼、复制一下、跳过去」这类安全动作，不改网络。 */
-function menuFor(n: TopologyNode): MenuItem[] {
+function menuFor(n: TopologyNode): { text: string; icon: object; act: () => void }[] {
   const detail = (k: string) => n.details.find((d) => d.key === k)?.value || ''
-  const items: MenuItem[] = []
   if (n.kind === 'host') {
     const ip = detail('IP 地址') || n.label
-    items.push({ text: '复制 IP 地址', icon: CopyDocument, act: () => copy(ip, 'IP 地址') })
-    items.push({ text: '在浏览器打开', icon: Link, act: () => window.open(`http://${ip}`, '_blank') })
-    items.push({ text: '去「内网域名」给它起名字', icon: Setting, act: () => { menu.value = null; void router.push({ name: 'settings' }) } })
-  } else if (n.kind === 'device' || n.kind === 'site') {
-    items.push({ text: '查看设备配置', icon: View, act: () => { menu.value = null; void router.push({ name: 'peers' }) } })
-    items.push({ text: '复制隧道地址', icon: CopyDocument, act: () => copy(detail('隧道地址'), '隧道地址') })
-    if (n.kind === 'site') items.push({ text: '复制对端内网网段', icon: CopyDocument, act: () => copy(detail('对端内网'), '网段') })
-  } else if (n.kind === 'lan' || n.kind === 'site-lan') {
-    items.push({ text: '复制网段', icon: CopyDocument, act: () => copy(n.label, '网段') })
-    items.push({ text: '查看连接', icon: View, act: () => { menu.value = null; void router.push({ name: 'interfaces' }) } })
-  } else if (n.kind === 'foreign') {
-    items.push({ text: '去「系统维护」处理', icon: Setting, act: () => { menu.value = null; void router.push({ name: 'maintenance' }) } })
-    items.push({ text: '复制网卡名', icon: CopyDocument, act: () => copy(n.label, '网卡名') })
-  } else {
-    items.push({ text: '复制内网网段', icon: CopyDocument, act: () => copy(detail('内网网段'), '网段') })
-    items.push({ text: '查看连接', icon: View, act: () => { menu.value = null; void router.push({ name: 'interfaces' }) } })
+    return [
+      { text: '复制 IP 地址', icon: CopyDocument, act: () => copy(ip, 'IP 地址') },
+      { text: '在浏览器打开', icon: Link, act: () => { menu.value = null; window.open(`http://${ip}`, '_blank') } },
+      { text: '去「内网域名」给它起名字', icon: Setting, act: () => { menu.value = null; void router.push({ name: 'settings' }) } },
+    ]
   }
-  return items
+  if (n.kind === 'device' || n.kind === 'site') {
+    return [
+      { text: '查看设备配置', icon: View, act: () => { menu.value = null; void router.push({ name: 'peers' }) } },
+      { text: '复制隧道地址', icon: CopyDocument, act: () => copy(detail('隧道地址'), '隧道地址') },
+    ]
+  }
+  if (n.kind === 'foreign') {
+    return [{ text: '去「系统维护」处理', icon: Setting, act: () => { menu.value = null; void router.push({ name: 'maintenance' }) } }]
+  }
+  return [{ text: '复制网段', icon: CopyDocument, act: () => copy(n.label, '网段') }]
 }
 
-function runMenu(it: MenuItem): void {
-  it.act()
-}
-
-/** 导出图片：把当前视图（含高亮状态）存成 PNG，方便发给别人看。 */
-function exportPNG(): void {
-  if (!chart) return
-  const url = chart.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: chartInk().card })
+/** 导出 PNG：把这个 SVG 序列化后画进 canvas（节点都是 SVG，导出不会有白块）。 */
+async function exportPNG(): Promise<void> {
+  const svg = wrapEl.value?.querySelector('svg')
+  if (!svg) return
+  const w = svg.clientWidth || 1200
+  const h = svg.clientHeight || 600
+  const clone = svg.cloneNode(true) as SVGElement
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+  clone.setAttribute('width', String(w))
+  clone.setAttribute('height', String(h))
+  const xml = new XMLSerializer().serializeToString(clone)
+  const img = new Image()
+  try {
+    await new Promise<void>((res, rej) => {
+      img.onload = () => res()
+      img.onerror = () => rej(new Error('转图片失败'))
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(xml)
+    })
+  } catch {
+    ElMessage.warning('导出失败：请重试或截图保存')
+    return
+  }
+  const canvas = document.createElement('canvas')
+  canvas.width = w * 2
+  canvas.height = h * 2
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.fillStyle = ink.card
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
   const a = document.createElement('a')
-  a.href = url
+  a.href = canvas.toDataURL('image/png')
   a.download = `网络拓扑-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.png`
   a.click()
   ElMessage.success('已导出图片')
 }
 
-// ------------------------------------------------------------------ 缩略图
+/**
+ * 视野与节点位置回读。
+ *
+ * 为什么要从 DOM 读：该库把「拖动节点后的位置」与「平移缩放状态」都放在它自己内部，没有对外事件，
+ * 它的可调用配置只用于样式。好在它渲染的就是 SVG —— 每个节点外面那层 g 的 transform 就是它的世界坐标，
+ * 视野那层的 transform 就是平移与缩放。读回来即可落盘位置、并在缩略图上画出「正在看哪一块」。
+ */
+const view = ref<{ k: number; tx: number; ty: number } | null>(null)
+let tickTimer: number | undefined
 
-const miniDragging = ref(false)
-
-/** 缩略图：把当前布局缩到一个小方框里，并画出「正在看的是哪一块」。 */
-const mini = computed(() => {
-  const s = scene.value
-  const w = 170
-  const h = 116
-  if (!s) return { w, h, nodes: [] as any[], lines: [] as any[], view: { x: 0, y: 0, w: 0, h: 0 } }
-  const [x0, x1, y0, y1] = s.bounds
-  const sx = w / (x1 - x0)
-  const sy = h / (y1 - y0)
-  const px = (x: number) => (x - x0) * sx
-  const py = (y: number) => h - (y - y0) * sy
-  const nodes = s.placed.map((p) => ({ id: p.node.id, cx: px(p.x), cy: py(p.y), kind: p.node.kind }))
-  const lines = s.edges.map((e) => {
-    const a = s.byId.get(e.from)!
-    const b = s.byId.get(e.to)!
-    return { x1: px(a.x), y1: py(a.y), x2: px(b.x), y2: py(b.y) }
+function syncFromDOM(): void {
+  const root = wrapEl.value?.querySelector('svg')
+  if (!root) return
+  const next: Record<string, { x: number; y: number }> = { ...positions.value }
+  let moved = false
+  // 节点位置：从我们自绘的卡片往上找一层（那一层是库给节点用的 g，它的 transform 就是世界坐标）
+  root.querySelectorAll('g[data-node]').forEach((card) => {
+    const id = card.getAttribute('data-node') || ''
+    const m = /translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)/.exec(card.parentElement?.getAttribute('transform') || '')
+    if (!id || !m) return
+    const x = Math.round(+m[1])
+    const y = Math.round(+m[2])
+    const prev = next[id]
+    if (!prev || Math.abs(prev.x - x) > 1 || Math.abs(prev.y - y) > 1) {
+      next[id] = { x, y }
+      moved = true
+    }
   })
-  // 当前可见窗口：把 dataZoom 的百分比换算回数据坐标（x、y 两轴各自线性映射）
-  const vx0 = x0 + ((x1 - x0) * zoom.value.x.start) / 100
-  const vx1 = x0 + ((x1 - x0) * zoom.value.x.end) / 100
-  const vy0 = y0 + ((y1 - y0) * zoom.value.y.start) / 100
-  const vy1 = y0 + ((y1 - y0) * zoom.value.y.end) / 100
-  const view = {
-    x: px(vx0),
-    y: py(vy1),
-    w: Math.max(6, (vx1 - vx0) * sx),
-    h: Math.max(6, (vy1 - vy0) * sy),
+  if (moved) positions.value = next
+  // 视野：这个库把平移缩放放在 g.v-ng-viewport 上，格式是 matrix(k,0,0,k,tx,ty)
+  // （世界坐标 → 屏幕坐标 = 世界 * k + t，与缩略图的换算同一套）
+  const vp = root.querySelector('g.v-ng-viewport') || root.querySelector('g[transform]')
+  const t = vp?.getAttribute('transform') || ''
+  const mx = /matrix\(\s*(-?[\d.eE+-]+)[ ,]+(-?[\d.eE+-]+)[ ,]+(-?[\d.eE+-]+)[ ,]+(-?[\d.eE+-]+)[ ,]+(-?[\d.eE+-]+)[ ,]+(-?[\d.eE+-]+)\s*\)/.exec(t)
+  if (mx) {
+    view.value = { k: +mx[1] || 1, tx: +mx[5], ty: +mx[6] }
+  } else {
+    const tr = /translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)\s*scale\(\s*([\d.]+)\s*\)/.exec(t)
+    if (tr) view.value = { tx: +tr[1], ty: +tr[2], k: +tr[3] || 1 }
   }
-  return { w, h, nodes, lines, view }
-})
-
-/** 在缩略图上点击/拖动：把视野移到那一点（等于「拖动对照」的另一半）。 */
-function onMiniJump(e: MouseEvent): void {
-  miniDragging.value = true
-  jumpMini(e)
 }
-
-function onMiniDrag(e: MouseEvent): void {
-  if (miniDragging.value) jumpMini(e)
-}
-
-function jumpMini(e: MouseEvent): void {
-  const s = scene.value
-  const el = e.currentTarget as SVGElement
-  if (!s || !el) return
-  const box = el.getBoundingClientRect()
-  const fx = (e.clientX - box.left) / box.width
-  const fy = 1 - (e.clientY - box.top) / box.height
-  const spanX = zoom.value.x.end - zoom.value.x.start
-  const spanY = zoom.value.y.end - zoom.value.y.start
-  zoom.value = { x: window100(fx * 100, spanX), y: window100(fy * 100, spanY) }
-  applyZoom()
-}
-
-// ------------------------------------------------------------------ 存取与生命周期
 
 function saveView(): void {
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify({ mode: mode.value, positions: positions.value }))
   } catch {
-    /* 存不下就算了：位置只是便利，不该影响使用 */
+    /* 存不下不影响使用 */
   }
 }
-
 function loadView(): void {
   try {
     const raw = localStorage.getItem(STORE_KEY)
@@ -937,7 +847,26 @@ function loadView(): void {
     if (v?.mode === 'radial' || v?.mode === 'circular' || v?.mode === 'force') mode.value = v.mode
     if (v?.positions && typeof v.positions === 'object') positions.value = v.positions
   } catch {
-    /* 坏了就用默认布局 */
+    /* 坏了用默认布局 */
+  }
+}
+
+const kindOptions = ref<{ value: string; label: string }[]>([])
+
+function kindLabel(v: string): string {
+  return kindOptions.value.find((o) => o.value === v)?.label || v
+}
+
+/** 保存设备类型：选完立即生效（刷新拓扑），图标随即按配置绘制。 */
+async function setKind(kind: string): Promise<void> {
+  const ip = pinned.value?.details.find((d) => d.key === 'IP 地址')?.value || ''
+  if (!ip) return
+  try {
+    await api.post('/device-kind', { ip, kind })
+    ElMessage.success(kind ? `已记为「${kindLabel(kind)}」` : '已改回按名称自动判断')
+    await load()
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '保存失败')
   }
 }
 
@@ -945,13 +874,12 @@ async function load(): Promise<void> {
   loading.value = true
   try {
     graph.value = await api.get<TopologyGraph>('/topology')
-    await nextTick()
-    if (!chart && chartEl.value) {
-      chart = echarts.init(chartEl.value, null, { useDirtyRect: true })
-      bindChartEvents()
+    if (!kindOptions.value.length) {
+      const res = await api.get<{ options: { value: string; label: string }[] }>('/device-kinds')
+      kindOptions.value = res?.options || []
     }
-    paint()
-    chart?.resize()
+    // 重新加载后详情卡指向的是旧对象，按 id 重新绑定，下拉里的值才跟得上
+    if (pinned.value) pinned.value = nodeOf(pinned.value.id)
   } catch (e) {
     ElMessage.error((e as Error)?.message || '读取拓扑失败')
   } finally {
@@ -959,33 +887,191 @@ async function load(): Promise<void> {
   }
 }
 
-function onResize(): void {
-  chart?.resize()
+/**
+ * 流动动画：自己用 requestAnimationFrame 直接改边上的 strokeDashoffset。
+ *
+ * 为什么不用 CSS 动画/属性选择器：这个库每次重绘都会重建或覆盖边的样式，
+ * 注入的 animation 会被清掉（线上表现就是「看着不动」）。直接写属性最稳。
+ *
+ * 口径：**有流量的线走得快**（一眼看出在传数据）、**空闲/待确认的线慢慢走**（表示线是通的），
+ * 已停用的线完全静止。这样「在动」与「动得快」分得清，也不会因为一时没流量就完全看不出效果。
+ */
+let raf = 0
+/** 每条有流量的边上放几个箭头。 */
+const ARROWS_PER_EDGE = 3
+/** 边 → 它上面那几个箭头（按元素记，重绘后失效的不影响）。 */
+const arrowMap = new WeakMap<SVGPathElement, SVGUseElement[]>()
+const SVG_NS = 'http://www.w3.org/2000/svg'
+
+/** 箭头字形（只建一次）。 */
+function ensureArrowGlyph(root: Element): void {
+  if (root.querySelector('#fnwg-flow-arrow')) return
+  const defs = root.querySelector('defs') || root.insertBefore(document.createElementNS(SVG_NS, 'defs'), root.firstChild)
+  const g = document.createElementNS(SVG_NS, 'g')
+  g.setAttribute('id', 'fnwg-flow-arrow')
+  const head = document.createElementNS(SVG_NS, 'path')
+  head.setAttribute('d', 'M 0 -4.5 L 9 0 L 0 4.5 z')
+  head.setAttribute('fill', FLOW_COLOR)
+  g.appendChild(head)
+  defs.appendChild(g)
 }
 
-watch(scene, () => paint())
-watch(isMobile, async () => {
-  await nextTick()
-  paint()
-  chart?.resize()
-})
+/** 箭头承载层：放在最上面，且不吃鼠标事件（不挡拖动与点击）。 */
+function flowLayer(root: Element): SVGGElement {
+  let layer = root.querySelector('#fnwg-flow-layer') as SVGGElement | null
+  if (!layer) {
+    layer = document.createElementNS(SVG_NS, 'g') as SVGGElement
+    layer.setAttribute('id', 'fnwg-flow-layer')
+    layer.setAttribute('pointer-events', 'none')
+    // 必须放进这个库自己的视野层：箭头坐标取自路径的世界坐标，
+    // 挂在根节点上不会跟着平移缩放走 —— 表现就是「箭头错位」。
+    const vp = root.querySelector('g.v-ng-viewport')
+    const host = vp || root
+    host.insertBefore(layer, host.firstChild)
+  }
+  return layer
+}
+
+/**
+ * 保证 SVG 里有一个绿色箭头标记（只建一次）。
+ * 用 marker 而不是自己画三角形：挂在边的 marker-end 上，方向自然就是「从 A 到 B」，
+ * 也随线的粗细自动缩放。
+ */
+function ensureArrow(root: Element): void {
+  if (root.querySelector('#fnwg-topo-arrow')) return
+  const ns = 'http://www.w3.org/2000/svg'
+  const defs = root.querySelector('defs') || root.insertBefore(document.createElementNS(ns, 'defs'), root.firstChild)
+  const marker = document.createElementNS(ns, 'marker')
+  marker.setAttribute('id', 'fnwg-topo-arrow')
+  marker.setAttribute('viewBox', '0 0 10 10')
+  marker.setAttribute('refX', '9')
+  marker.setAttribute('refY', '5')
+  marker.setAttribute('markerWidth', '6')
+  marker.setAttribute('markerHeight', '6')
+  marker.setAttribute('orient', 'auto')
+  const head = document.createElementNS(ns, 'path')
+  head.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z')
+  head.setAttribute('fill', FLOW_COLOR)
+  marker.appendChild(head)
+  defs.appendChild(marker)
+}
+
+/**
+ * 把每个设备卡片提到同级最后（SVG 的叠放顺序由 DOM 顺序决定，没有 z-index）。
+ *
+ * 要求是「线永远在设备下面」：库把连线与节点分层渲染，重绘后顺序还可能变，
+ * 所以这里定期把节点组重新挪到末尾 —— 卡片始终压在线上面，选中高亮、变暗时也一样。
+ */
+function raiseNodes(): void {
+  const root = wrapEl.value?.querySelector('svg')
+  if (!root) return
+  const parents = new Set<Element>()
+  root.querySelectorAll('g[data-node]').forEach((card) => {
+    const holder = card.parentElement
+    if (holder?.parentElement) parents.add(holder.parentElement)
+  })
+  parents.forEach((parent) => {
+    parent.querySelectorAll(':scope > g').forEach((g) => {
+      if (g.querySelector('g[data-node]')) parent.appendChild(g)
+    })
+  })
+}
+
+function flowTick(): void {
+  const root = wrapEl.value?.querySelector('svg')
+  if (root) {
+    const t = performance.now()
+    ensureArrowGlyph(root)
+    hideStaleArrows(root)
+    root.querySelectorAll('path').forEach((node) => {
+      const el = node as SVGPathElement
+      const stroke = el.getAttribute('stroke') || ''
+      const fast = stroke === FLOW_COLOR
+      const slow = stroke === '#cbd5e1' || stroke === '#f59e0b'
+      if (!fast && !slow) return
+      if (!el.getAttribute('stroke-dasharray')) el.setAttribute('stroke-dasharray', fast ? '10 6' : '6 9')
+      if (fast) {
+        // 有流量的线：线本身静止（虚线只是样式），靠**沿线跑动的绿色箭头**表达流动与方向
+        el.setAttribute('stroke-dashoffset', '0')
+        driveArrows(el, t)
+      } else {
+        // 空闲/待确认：慢慢走的虚线（表示线是通的），不带箭头
+        const period = 4200
+        el.setAttribute('stroke-dashoffset', String(Math.round(((t % period) / period) * 15)))
+      }
+    })
+  }
+  raf = requestAnimationFrame(flowTick)
+}
+
+/**
+ * 让一条边上的箭头沿线跑起来。
+ *
+ * 用 SVG 自己的 getPointAtLength/getTotalLength 取点，再按切线角度旋转 ——
+ * 这样箭头严格贴着线走（包括直连与曲线），方向就是「从源到目的」。
+ */
+function driveArrows(el: SVGPathElement, t: number): void {
+  const root = wrapEl.value?.querySelector('svg')
+  if (!root) return
+  const layer = flowLayer(root)
+  let uses = arrowMap.get(el)
+  if (!uses || uses.some((u) => !u.isConnected)) {
+    uses = Array.from({ length: ARROWS_PER_EDGE }, () => {
+      const u = document.createElementNS(SVG_NS, 'use') as SVGUseElement
+      u.setAttribute('href', '#fnwg-flow-arrow')
+      layer.appendChild(u)
+      return u
+    })
+    arrowMap.set(el, uses)
+  }
+  const len = el.getTotalLength()
+  if (!len) return
+  const cycle = 2200 // 一个箭头跑完全程的毫秒数
+  const base = ((t % cycle) / cycle) * len
+  uses.forEach((u, i) => {
+    const pos = (base + (i * len) / ARROWS_PER_EDGE) % len
+    const p1 = el.getPointAtLength(pos)
+    const p2 = el.getPointAtLength(Math.min(len, pos + 1.5))
+    const ang = (Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180) / Math.PI
+    u.setAttribute('transform', `translate(${p1.x.toFixed(1)},${p1.y.toFixed(1)}) rotate(${ang.toFixed(1)})`)
+    u.removeAttribute('display')
+  })
+}
+
+/** 不再有流量的边：把它的箭头收起来（元素留着复用，省得每帧重建）。 */
+function hideStaleArrows(root: Element): void {
+  root.querySelectorAll('path').forEach((node) => {
+    const el = node as SVGPathElement
+    if (el.getAttribute('stroke') === FLOW_COLOR) return
+    const uses = arrowMap.get(el)
+    if (uses) uses.forEach((u) => u.setAttribute('display', 'none'))
+  })
+}
+
+function closeMenu(): void {
+  menu.value = null
+}
 
 onMounted(() => {
   loadView()
   load()
-  window.addEventListener('resize', onResize)
   window.addEventListener('click', closeMenu)
+
+  // 每 1.5 秒轻量回读一次：拖动与平移不会发事件，只能这样拿（开销很小）
+  tickTimer = window.setInterval(() => {
+    syncFromDOM()
+    raiseNodes()
+    saveView()
+  }, 1500)
+  raf = requestAnimationFrame(flowTick)
 })
 
-function closeMenu(): void {
-  if (menu.value) menu.value = null
-}
-
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', onResize)
   window.removeEventListener('click', closeMenu)
-  chart?.dispose()
-  chart = null
+  if (tickTimer) window.clearInterval(tickTimer)
+  if (raf) cancelAnimationFrame(raf)
+  syncFromDOM()
+  saveView()
 })
 </script>
 
@@ -995,18 +1081,159 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  margin-left: auto;
+  justify-content: flex-end;
 }
+.fnwg-topo :deep(.fnwg-card-head) {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.fnwg-topo :deep(.fnwg-card-head > div:first-child) {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 767px) {
+  .fnwg-topo :deep(.fnwg-card-head) {
+    flex-direction: column;
+  }
+
+  .fnwg-topo-actions {
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+}
+
 
 .fnwg-topo-wrap {
   position: relative;
   width: 100%;
 }
 
-.fnwg-topo-canvas {
+   这段样式在运行时注入（见 onMounted 里的 FLOW_CSS）：属性选择器里带 # 会让 SFC 的 CSS 解析器报错，
+
+.fnwg-vng {
   width: 100%;
 }
 
-/* 缩略图：右下角压一层，不挡主图的操作（pointer-events 只在自身） */
+.fnwg-topo-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.fnwg-topo-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fnwg-topo-legend i {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.fnwg-topo-legend-line {
+  display: inline-block;
+  width: 26px;
+  height: 0;
+  border-top: 2px solid #22c55e;
+}
+
+.fnwg-topo-legend-line.off {
+  border-top-style: dashed;
+  border-top-color: #94a3b8;
+}
+
+.fnwg-topo-tip {
+  position: absolute;
+  z-index: 11;
+  max-width: 320px;
+  padding: 8px 10px;
+  border: 1px solid var(--el-border-color);
+  border-radius: var(--fnwg-radius);
+  background: var(--fnwg-card);
+  box-shadow: var(--el-box-shadow-light);
+  font-size: 12.5px;
+  line-height: 1.7;
+  pointer-events: none;
+}
+
+.fnwg-topo-tip-sub {
+  display: block;
+  color: var(--el-text-color-secondary);
+  font-size: 11.5px;
+}
+
+.fnwg-topo-tip-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 3px;
+}
+
+.fnwg-topo-tip-key {
+  flex: 0 0 66px;
+  color: var(--el-text-color-secondary);
+}
+
+.fnwg-topo-tip-val {
+  flex: 1;
+  word-break: break-word;
+}
+
+.fnwg-topo-tip-foot {
+  margin-top: 6px;
+  color: var(--el-text-color-secondary);
+  font-size: 11.5px;
+}
+
+.fnwg-topo-panel {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  z-index: 11;
+  width: 300px;
+  max-height: 60%;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--el-border-color);
+  border-radius: var(--fnwg-radius);
+  background: var(--fnwg-card);
+  box-shadow: var(--el-box-shadow-light);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.fnwg-topo-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.fnwg-topo-kind {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--el-text-color-secondary);
+}
+
+.fnwg-topo-panel-foot {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .fnwg-topo-mini {
   position: absolute;
   right: 6px;
@@ -1017,7 +1244,6 @@ onBeforeUnmount(() => {
   background: var(--fnwg-card);
   box-shadow: var(--el-box-shadow-light);
   opacity: 0.92;
-  cursor: crosshair;
 }
 
 .fnwg-topo-mini svg {
@@ -1034,6 +1260,12 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
 }
 
+.fnwg-topo-mini-view {
+  fill: rgba(64, 158, 255, 0.12);
+  stroke: var(--el-color-primary);
+  stroke-width: 1;
+}
+
 .fnwg-topo-mini-line {
   stroke: var(--el-border-color-lighter);
   stroke-width: 0.8;
@@ -1043,7 +1275,8 @@ onBeforeUnmount(() => {
   fill: var(--el-text-color-disabled);
 }
 
-.fnwg-topo-mini circle.k-nas {
+.fnwg-topo-mini circle.k-nas,
+.fnwg-topo-mini circle.k-device {
   fill: #409eff;
 }
 
@@ -1064,12 +1297,6 @@ onBeforeUnmount(() => {
   fill: #f59e0b;
 }
 
-.fnwg-topo-mini-view {
-  fill: rgba(64, 158, 255, 0.12);
-  stroke: var(--el-color-primary);
-  stroke-width: 1;
-}
-
 .fnwg-topo-menu {
   position: absolute;
   z-index: 12;
@@ -1087,10 +1314,6 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
   border-bottom: 1px solid var(--el-border-color-lighter);
   margin-bottom: 4px;
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .fnwg-topo-menu-item {
@@ -1108,41 +1331,6 @@ onBeforeUnmount(() => {
   color: var(--el-color-primary);
 }
 
-.fnwg-topo-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 16px;
-  margin-top: 4px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-
-.fnwg-topo-legend span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-/* 图例里的「点」是 HTML 元素，要用背景色画（早前误用了 SVG 的 fill，于是颜色没渲染出来） */
-.fnwg-topo-legend i {
-  display: inline-block;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-}
-
-.fnwg-topo-legend-line {
-  display: inline-block;
-  width: 26px;
-  height: 0;
-  border-top: 2px solid #409eff;
-}
-
-.fnwg-topo-legend-line.off {
-  border-top-style: dashed;
-  border-top-color: #94a3b8;
-}
-
 .fnwg-topo-notes {
   margin-top: 8px;
 }
@@ -1150,16 +1338,5 @@ onBeforeUnmount(() => {
 .fnwg-topo-link {
   color: var(--el-color-primary);
   cursor: pointer;
-}
-
-/* ECharts 的悬停卡挂在图表容器里，用 :deep 才能套上本组件的样式 */
-.fnwg-topo :deep(.fnwg-topo-tip) {
-  border: 1px solid var(--el-border-color);
-  border-radius: var(--fnwg-radius);
-  background: var(--fnwg-card);
-  box-shadow: var(--el-box-shadow-light);
-  font-size: 12.5px;
-  line-height: 1.7;
-  max-width: 340px;
 }
 </style>

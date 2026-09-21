@@ -40,12 +40,16 @@ type TopologyKV struct {
 
 // TopologyNode 是拓扑图上的一个节点。
 type TopologyNode struct {
-	ID       string       `json:"id"`
-	Kind     string       `json:"kind"`
-	Label    string       `json:"label"`
-	Sublabel string       `json:"sublabel,omitempty"`
-	Status   string       `json:"status"`
-	Details  []TopologyKV `json:"details"`
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Label    string `json:"label"`
+	Sublabel string `json:"sublabel,omitempty"`
+	Status   string `json:"status"`
+	// Note 是「内网域名」里登记的备注（没登记为空）。
+	Note string `json:"note,omitempty"`
+	// DeviceKind 是用户明确配置的设备类型（空 = 按名称自动判断）。
+	DeviceKind string       `json:"device_kind,omitempty"`
+	Details    []TopologyKV `json:"details"`
 }
 
 // TopologyLink 是两个节点之间的连线。
@@ -98,6 +102,10 @@ type topologyFacts struct {
 	// DNSNames 是「内网域名」里登记过的 IP → 名字；图上优先显示它，
 	// 否则显示内核邻居表里没有名字的地址（并提示可以自己去登记一个）。
 	DNSNames map[string]string
+	// DNSNotes 是同一批记录的备注：用户登记时写的说明（例如「客厅的电视」）。
+	DNSNotes map[string]string
+	// Kinds 是用户明确配置的「IP → 设备类型」（见 SetDeviceKind）。
+	Kinds map[string]string
 }
 
 func topoID(kind string, parts ...string) string {
@@ -182,7 +190,9 @@ func buildTopology(f topologyFacts) TopologyGraph {
 		}
 		add(TopologyNode{
 			ID: topoID(TopoNodeHost, d.IP), Kind: TopoNodeHost, Label: label, Sublabel: sub,
-			Status: topoHostStatus(d.State),
+			Status:     topoHostStatus(d.State),
+			Note:       f.DNSNotes[d.IP],
+			DeviceKind: f.Kinds[d.IP],
 			Details: []TopologyKV{
 				{Key: "IP 地址", Value: d.IP},
 				{Key: "名称", Value: topoOr(name, "未登记（可在「系统设置 → 内网域名」里给它起个名字）")},
@@ -493,7 +503,7 @@ func topoOr(v, fallback string) string {
 // 任何一路取数失败都不该让整张图消失：能画多少画多少，并在说明里写清哪一部分没读到 ——
 // 一张空白的拓扑图比一张「缺一块但有说明」的更没用。
 func (s *Service) Topology(ctx context.Context) *TopologyGraph {
-	f := topologyFacts{DNSNames: map[string]string{}}
+	f := topologyFacts{DNSNames: map[string]string{}, DNSNotes: map[string]string{}, Kinds: map[string]string{}}
 
 	if name, err := os.Hostname(); err == nil {
 		f.HostName = strings.TrimSpace(name)
@@ -527,9 +537,11 @@ func (s *Service) Topology(ctx context.Context) *TopologyGraph {
 		for _, r := range recs {
 			if ip := strings.TrimSpace(r.IP); ip != "" {
 				f.DNSNames[ip] = strings.TrimSpace(r.Name)
+				f.DNSNotes[ip] = strings.TrimSpace(r.Note)
 			}
 		}
 	}
+	f.Kinds = s.DeviceKinds(ctx)
 	g := buildTopology(f)
 	return &g
 }

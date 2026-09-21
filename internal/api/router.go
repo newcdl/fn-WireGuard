@@ -87,6 +87,9 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.Get("/overview", s.handleOverview)
 		// 网络拓扑（只读）：以本机为中心，含内网设备、隧道设备与对端 NAS。
 		r.Get("/topology", s.handleTopology)
+		// 设备类型：图上那台设备是什么（按 IP 记），清单与设置各一个接口
+		r.Get("/device-kinds", s.handleDeviceKinds)
+		r.With(requirePerm(model.PermIfaceWrite)).Post("/device-kind", s.handleSetDeviceKind)
 		r.Get("/health", s.handleHealth)
 
 		// NAS 系统网络自检与修复（只处理本应用造成的残留，不触碰系统设置）

@@ -335,6 +335,20 @@
           <el-table-column prop="name" label="主机名" min-width="160" />
           <el-table-column prop="ip" label="指向的地址" min-width="140" />
           <el-table-column prop="note" label="备注" min-width="140" />
+          <el-table-column label="设备类型" width="180">
+            <template #default="{ row }">
+              <el-select
+                :model-value="kindMap[row.ip] || ''"
+                size="small"
+                placeholder="自动判断"
+                clearable
+                @visible-change="loadKinds"
+                @change="(v: string) => setKind(row.ip, v)"
+              >
+                <el-option v-for="o in kindOptions" :key="o.value" :label="o.label" :value="o.value" />
+              </el-select>
+            </template>
+          </el-table-column>
           <el-table-column label="操作" width="140">
             <template #default="{ row }">
               <el-button v-if="session.can('iface.write')" link type="primary" @click="openDNSRecord(row)">
@@ -708,6 +722,39 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+
+/**
+ * 设备类型：让用户明确指定「这台机器是什么」，拓扑图上的图标就不再靠名字猜。
+ * 与拓扑图详情卡里的下拉是同一份数据（按 IP 存），两边任一处设置都会同步。
+ * 选项在打开下拉时才取（这里是设置页，不必为它多占一次首屏请求）。
+ */
+const kindOptions = ref<{ value: string; label: string }[]>([])
+const kindMap = ref<Record<string, string>>({})
+
+async function loadKinds(): Promise<void> {
+  if (kindOptions.value.length) return
+  try {
+    const res = await api.get<{ options: { value: string; label: string }[]; records: { ip: string; kind: string }[] }>(
+      '/device-kinds',
+    )
+    kindOptions.value = res?.options || []
+    const m: Record<string, string> = {}
+    for (const r of res?.records || []) m[r.ip] = r.kind
+    kindMap.value = m
+  } catch {
+    /* 取不到就暂时不给选，不影响域名列表本身 */
+  }
+}
+
+async function setKind(ip: string, kind: string): Promise<void> {
+  try {
+    await api.post('/device-kind', { ip, kind })
+    kindMap.value = { ...kindMap.value, [ip]: kind }
+    ElMessage.success(kind ? '设备类型已保存' : '已改回按名称自动判断')
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '保存失败')
+  }
+}
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Reading, Refresh, Document } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
