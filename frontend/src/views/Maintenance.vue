@@ -249,6 +249,17 @@
     <!-- 内网资产台账：与巡检并列（采集也跟随巡检） -->
     <AssetPanel />
 
+    <!-- 一键诊断包：把现场打成一个文件，出问题时不必来回截图 -->
+    <div class="fnwg-card" style="margin-top: 12px">
+      <div class="fnwg-card-head">
+        <div>
+          <strong>排查问题</strong>
+          <span class="fnwg-card-desc">把体检、巡检、拓扑、资产、连接与设备、运行记录与审计打成一个 tar 下载（浏览器端打包，不上传）。</span>
+        </div>
+        <DiagnosticsButton />
+      </div>
+    </div>
+
       </el-tab-pane>
 
       <!-- 运行环境：后台能力 + 疑似残留网卡清理 -->
@@ -351,6 +362,7 @@ import { Refresh, Search } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import type { ForeignInterface } from '@/api/types'
 import AssetPanel from '@/components/AssetPanel.vue'
+import DiagnosticsButton from '@/components/DiagnosticsButton.vue'
 import InspectPanel from '@/components/InspectPanel.vue'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useBreakpoint } from '@/composables/useBreakpoint'
