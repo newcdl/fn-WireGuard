@@ -306,7 +306,7 @@ func buildTopology(f topologyFacts) TopologyGraph {
 	}
 
 	// ⑤ 说明：图上画了什么、哪些看不到
-	g.Notes = append(g.Notes, "内网设备来自 NAS 的内核邻居表：只显示**最近和 NAS 通信过**的机器，不是全网扫描的结果。")
+	g.Notes = append(g.Notes, "内网设备来自 NAS 的内核邻居表：只显示「最近和 NAS 通信过」的机器，不是全网扫描的结果。")
 	if known < len(devices) {
 		g.Notes = append(g.Notes, "想让设备显示名字：到「系统设置 → 内网域名」给它登记一条记录即可。")
 	}
