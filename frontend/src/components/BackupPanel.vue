@@ -88,7 +88,10 @@
       <div v-else-if="!filtered.length" class="fnwg-empty">没有符合条件的备份，换个关键词或来源试试。</div>
 
       <template v-else>
-        <el-table v-if="!isMobile" :data="filtered" size="small" style="width: 100%">
+        <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+        <ViewSwitch v-model="viewMode" />
+
+        <el-table v-if="isTable" :data="filtered" size="small" style="width: 100%">
           <el-table-column label="来源" width="110">
             <template #default="{ row }">
               <el-tag v-if="row.source === 'local'" size="small" effect="plain">本机</el-tag>
@@ -147,6 +150,7 @@
         </el-table>
 
         <div v-else>
+          <div class="fnwg-card-grid">
           <ItemCard v-for="row in filtered" :key="row.key" :title="row.name">
             <template #extra>
               <el-tag v-if="row.source === 'local'" size="small" effect="plain">本机</el-tag>
@@ -177,6 +181,7 @@
               <el-button v-if="can && row.source === 'local'" size="small" @click="removeRow(row)">删除</el-button>
             </template>
           </ItemCard>
+          </div>
         </div>
 
         <div v-if="hasPlanRow" class="fnwg-hint" style="margin-top: 8px">
@@ -363,6 +368,11 @@ import { backupFields as B } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { useSession } from '@/stores/session'
 import { formatBytes, formatTime } from '@/utils/format'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
+
+// 表格 / 卡片视图：由用户决定并记住
+const { mode: viewMode, isTable } = useViewMode('backup-plans')
 
 const session = useSession()
 const { isMobile } = useBreakpoint()

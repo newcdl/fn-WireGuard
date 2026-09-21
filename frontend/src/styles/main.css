@@ -25,6 +25,37 @@ body,
   padding: 0;
 }
 
+/*
+ * Element 给下拉组件写死了 `vertical-align: top`，而同一排的普通按钮是按基线对齐的 ——
+ * 界面上的表现是「一排操作里那个『更多』比旁边的高一点点」（用户反馈）。
+ * 统一成居中，全应用所有「一排按钮 + 下拉」的地方一起对齐。
+ */
+.el-dropdown {
+  vertical-align: middle;
+}
+
+/*
+ * 卡片视图的网格：卡片本身比表格窄，一条一行在电脑上会浪费大半个屏幕 ——
+ * 因此按可用宽度自动分列（每列至少 340px，放得下就多来一列），手机上仍是一条一行。
+ * 用 auto-fill 而不是写死列数：侧边栏收起/展开、窗口缩放都能自己适应。
+ */
+.fnwg-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+}
+
+/* 网格靠 gap 控间距，卡片自己的下边距会叠成两倍空隙 */
+.fnwg-card-grid .fnwg-item-card {
+  margin-bottom: 0;
+}
+
+@media (max-width: 767px) {
+  .fnwg-card-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 body {
   background: var(--fnwg-bg);
   font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;

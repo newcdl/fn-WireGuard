@@ -18,6 +18,7 @@
           <el-radio-button value="new">新设备</el-radio-button>
           <el-radio-button value="stale">久未出现</el-radio-button>
         </el-radio-group>
+        <ViewSwitch v-model="viewMode" />
         <el-button size="small" :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
       </div>
     </div>
@@ -26,7 +27,8 @@
       台账还是空的：它会跟着巡检记录（可在「配置漂移巡检」里设成每天或每周执行一次）。
     </div>
 
-    <el-table v-else :data="rows" size="small" empty-text="没有符合条件的设备">
+    <!-- 表格视图（原来只有这一种） -->
+    <el-table v-else-if="isTable" :data="rows" size="small" empty-text="没有符合条件的设备">
       <el-table-column label="名称 / 地址" min-width="180">
         <template #default="{ row }">
           <div>{{ row.name || row.ip }}</div>
@@ -56,6 +58,42 @@
         </template>
       </el-table-column>
     </el-table>
+
+    <!-- 卡片视图：与表格显示同样的字段；一条一块，确认新设备时不用左右看 -->
+    <div v-else v-loading="loading">
+      <div class="fnwg-card-grid">
+      <ItemCard
+        v-for="row in rows"
+        :key="row.ip"
+        :title="row.name || row.ip"
+        :status="isNew(row) ? 'warn' : row.known ? 'ok' : 'off'"
+      >
+        <template #extra>
+          <el-tag v-if="isNew(row)" size="small" type="warning" effect="plain">新设备</el-tag>
+          <span v-else-if="row.known" class="fnwg-asset-sub">已知</span>
+          <span v-else class="fnwg-asset-sub">—</span>
+        </template>
+        <div class="fnwg-kv">
+          <span class="fnwg-kv-key">地址</span>
+          <span class="fnwg-kv-val fnwg-mono">{{ row.name ? row.ip : '未登记名称' }}</span>
+        </div>
+        <div class="fnwg-kv">
+          <span class="fnwg-kv-key">MAC</span>
+          <span class="fnwg-kv-val fnwg-mono">{{ row.mac || '未知' }}</span>
+        </div>
+        <div class="fnwg-kv">
+          <span class="fnwg-kv-key">出现情况</span>
+          <span class="fnwg-kv-val">
+            首次 {{ day(row.first_seen) }} · 最近 {{ day(row.last_seen) }}，共 {{ row.seen_days }} 天出现过
+          </span>
+        </div>
+        <template #actions>
+          <el-button v-if="isNew(row)" size="small" @click="mark(row, true)">标为已知</el-button>
+          <el-button v-else-if="row.known" size="small" text @click="mark(row, false)">取消已知</el-button>
+        </template>
+      </ItemCard>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -64,6 +102,9 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
+import ItemCard from '@/components/ItemCard.vue'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
 
 interface Asset {
   ip: string
@@ -78,6 +119,9 @@ interface Asset {
 
 const assets = ref<Asset[]>([])
 const loading = ref(false)
+// 表格 / 卡片视图：由用户决定并记住
+const { mode: viewMode, isTable } = useViewMode('assets')
+
 const filter = ref<'all' | 'new' | 'stale'>('all')
 
 const STALE_DAYS = 7

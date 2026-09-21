@@ -31,11 +31,12 @@
       <el-button :icon="Refresh" @click="load">刷新</el-button>
       <el-button :icon="Reading" @click="helpVisible = true">配置说明</el-button>
       <div style="flex: 1"></div>
+      <ViewSwitch v-model="viewMode" />
       <el-tag size="small" type="info" effect="plain">在线 {{ onlineCount }} / 共 {{ filtered.length }} 台</el-tag>
     </div>
 
     <!-- 桌面端：表格 -->
-    <div v-if="!isMobile" class="fnwg-card">
+    <div v-if="isTable" class="fnwg-card">
       <el-table
         :data="filtered"
         v-loading="loading"
@@ -141,6 +142,7 @@
         <span style="font-size: 12px; opacity: 0.65">已选 {{ selectedIds.length }} 台</span>
       </div>
 
+      <div class="fnwg-card-grid">
       <ItemCard
         v-for="row in filtered"
         :key="row.id"
@@ -183,6 +185,7 @@
           <el-button v-if="session.can('peer.write')" size="small" @click="remove(row)">删除</el-button>
         </template>
       </ItemCard>
+      </div>
       <div v-if="!filtered.length && !loading" class="fnwg-empty">还没有设备，点击上方「添加设备」开始</div>
     </div>
 
@@ -566,6 +569,8 @@ import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
 import ScenarioPicker from '@/components/ScenarioPicker.vue'
 import {
   allHelpGroups,
@@ -583,6 +588,8 @@ import { copyText } from '@/utils/clipboard'
 const route = useRoute()
 const session = useSession()
 const { isMobile, drawerSize, dialogWidth } = useBreakpoint()
+// 表格 / 卡片视图：由用户决定并记住
+const { mode: viewMode, isTable } = useViewMode('peers')
 
 // 复用全局已拉取的自检结果：只为了拿到探测到的家里网段，
 // 让「自定义可访问范围」可以直接点选，而不是凭记忆手写 IP。

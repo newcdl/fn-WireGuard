@@ -15,11 +15,12 @@
         与另一台 NAS 互联
       </el-button>
       <div style="flex: 1"></div>
+      <ViewSwitch v-model="viewMode" />
       <el-tag size="small" type="info" effect="plain">共 {{ list.length }} 条连接</el-tag>
     </div>
 
-    <!-- 桌面端：表格 -->
-    <div v-if="!isMobile" class="fnwg-card">
+    <!-- 表格视图（原来只在桌面端显示，现在由右上角的切换决定） -->
+    <div v-if="isTable" class="fnwg-card">
       <el-table :data="list" v-loading="loading" empty-text="还没有连接，点击「新建连接」开始">
         <el-table-column label="连接" width="140">
           <template #default="{ row }">
@@ -110,6 +111,7 @@
 
     <!-- 移动端：卡片列表 -->
     <div v-else v-loading="loading">
+      <div class="fnwg-card-grid">
       <ItemCard
         v-for="row in list"
         :key="row.id"
@@ -190,6 +192,7 @@
           </el-dropdown>
         </template>
       </ItemCard>
+      </div>
       <div v-if="!list.length && !loading" class="fnwg-empty">还没有连接，点击上方「新建连接」开始</div>
     </div>
 
@@ -393,6 +396,8 @@ import InterconnectDialog from '@/components/InterconnectDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
 import ScenarioPicker from '@/components/ScenarioPicker.vue'
 import { allHelpGroups, interfaceFields, interfacePresets } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
@@ -407,6 +412,8 @@ const router = useRouter()
 const session = useSession()
 const realtime = useRealtime()
 const { isMobile, drawerSize, dialogWidth } = useBreakpoint()
+// 表格 / 卡片视图：由用户决定并记住（默认仍是手机卡片、桌面表格，与改动前一致）
+const { mode: viewMode, isTable } = useViewMode('interfaces')
 
 const F = interfaceFields
 const helpGroups = allHelpGroups

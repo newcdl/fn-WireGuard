@@ -105,6 +105,8 @@ const emit = defineEmits<{ (e: 'toggle'): void }>()
   border-top: 1px dashed var(--el-border-color-lighter);
   display: flex;
   flex-wrap: wrap;
+  /* 垂直居中：行里除了按钮还有下拉（自带 top 对齐），不居中的话下拉会显得比按钮高 */
+  align-items: center;
   gap: 4px;
 }
 

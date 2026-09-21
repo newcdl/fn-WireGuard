@@ -33,7 +33,10 @@
     </div>
 
     <!-- 按设备 -->
-    <div v-if="!isMobile" class="fnwg-card">
+    <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+    <ViewSwitch v-model="viewMode" />
+
+    <div v-if="isTable" class="fnwg-card">
       <el-table :data="report?.peers || []" v-loading="loading" size="small" empty-text="还没有设备">
         <el-table-column prop="name" label="设备" min-width="120" show-overflow-tooltip />
         <el-table-column prop="interface_name" label="连接" width="100" show-overflow-tooltip />
@@ -80,6 +83,7 @@
 
     <!-- 移动端卡片 -->
     <div v-else v-loading="loading">
+      <div class="fnwg-card-grid">
       <ItemCard
         v-for="row in report?.peers || []"
         :key="row.peer_id"
@@ -104,6 +108,7 @@
           <span class="fnwg-kv-val">{{ formatBytes(row.rx_bytes) }} / {{ formatBytes(row.tx_bytes) }}</span>
         </div>
       </ItemCard>
+      </div>
       <div v-if="!(report?.peers || []).length" class="fnwg-empty">还没有设备</div>
     </div>
 
@@ -140,6 +145,11 @@ import { useBreakpoint } from '@/composables/useBreakpoint'
 import { useTheme } from '@/composables/useTheme'
 import { useSession } from '@/stores/session'
 import { daysLeft, formatBytes, formatTime } from '@/utils/format'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
+
+// 表格 / 卡片视图：由用户决定并记住
+const { mode: viewMode, isTable } = useViewMode('traffic-daily')
 
 const { isMobile } = useBreakpoint()
 const { isDark } = useTheme()

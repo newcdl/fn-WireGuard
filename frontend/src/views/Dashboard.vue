@@ -132,7 +132,10 @@
         </div>
       </div>
 
-      <el-table v-if="!isMobile" :data="overview?.interfaces || []" size="small">
+      <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+      <ViewSwitch v-model="linksViewMode" />
+
+      <el-table v-if="linksIsTable" :data="overview?.interfaces || []" size="small">
         <el-table-column label="连接" width="120">
           <template #default="{ row }">
             <span :class="['fnwg-dot', row.up ? 'ok' : 'down']" />{{ row.name }}
@@ -161,6 +164,7 @@
       </el-table>
 
       <template v-else>
+        <div class="fnwg-card-grid">
         <ItemCard
           v-for="it in overview?.interfaces || []"
           :key="it.id"
@@ -185,6 +189,7 @@
             <span class="fnwg-kv-val">↓ {{ formatRate(it.rx_rate) }}　↑ {{ formatRate(it.tx_rate) }}</span>
           </div>
         </ItemCard>
+        </div>
         <div v-if="!(overview?.interfaces || []).length" class="fnwg-empty">还没有任何连接</div>
       </template>
     </div>
@@ -198,7 +203,10 @@
               <span class="fnwg-card-desc">按累计流量排序，可快速发现异常占用</span>
             </div>
           </div>
-          <el-table v-if="!isMobile" :data="overview?.top_peers || []" size="small">
+          <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+          <ViewSwitch v-model="peersViewMode" />
+
+          <el-table v-if="peersIsTable" :data="overview?.top_peers || []" size="small">
             <el-table-column prop="name" label="设备" min-width="120" show-overflow-tooltip />
             <el-table-column label="接收" width="100">
               <template #default="{ row }">{{ formatBytes(row.rx_bytes) }}</template>
@@ -211,6 +219,7 @@
             </el-table-column>
           </el-table>
           <template v-else>
+            <div class="fnwg-card-grid">
             <ItemCard
               v-for="p in overview?.top_peers || []"
               :key="p.id"
@@ -226,6 +235,7 @@
                 <span class="fnwg-kv-val">{{ timeAgo(p.last_handshake) }}</span>
               </div>
             </ItemCard>
+            </div>
             <div v-if="!(overview?.top_peers || []).length" class="fnwg-empty">暂无设备</div>
           </template>
         </div>
@@ -253,6 +263,7 @@
             </el-table-column>
           </el-table>
           <template v-else>
+            <div class="fnwg-card-grid">
             <ItemCard
               v-for="p in overview?.recent_handshakes || []"
               :key="p.id"
@@ -268,6 +279,7 @@
                 <span class="fnwg-kv-val">{{ timeAgo(p.last_handshake) }}</span>
               </div>
             </ItemCard>
+            </div>
             <div v-if="!(overview?.recent_handshakes || []).length" class="fnwg-empty">暂时没有设备在线</div>
           </template>
         </div>
@@ -300,6 +312,12 @@ import { useTheme } from '@/composables/useTheme'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes, formatRate, timeAgo } from '@/utils/format'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
+
+// 表格 / 卡片视图：由用户决定并记住（两个列表各用一个键）
+const { mode: linksViewMode, isTable: linksIsTable } = useViewMode('dashboard-links')
+const { mode: peersViewMode, isTable: peersIsTable } = useViewMode('dashboard-peers')
 
 const router = useRouter()
 const realtime = useRealtime()

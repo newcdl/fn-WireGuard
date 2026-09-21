@@ -184,7 +184,10 @@
           <el-button type="primary" :icon="Plus" @click="openUserDialog">新建账号</el-button>
         </div>
 
-        <div v-if="!isMobile" class="fnwg-card">
+        <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+        <ViewSwitch v-model="usersViewMode" />
+
+        <div v-if="usersIsTable" class="fnwg-card">
           <el-table :data="users" size="small" empty-text="暂无账号">
             <el-table-column label="登录账号" min-width="200">
               <template #default="{ row }">
@@ -232,6 +235,7 @@
         </div>
 
         <div v-else>
+          <div class="fnwg-card-grid">
           <ItemCard
             v-for="row in users"
             :key="row.id"
@@ -263,6 +267,7 @@
               <el-button size="small" @click="removeUser(row)">删除</el-button>
             </template>
           </ItemCard>
+          </div>
         </div>
       </el-tab-pane>
 
@@ -328,10 +333,11 @@
           </el-button>
           <el-button :icon="Refresh" @click="loadDNS">刷新</el-button>
           <div style="flex: 1"></div>
+          <ViewSwitch v-model="dnsViewMode" />
           <span class="fnwg-hint">共 {{ dnsRecords.length }} 条</span>
         </div>
 
-        <el-table :data="dnsRecords" size="small" empty-text="还没有域名记录">
+        <el-table v-if="dnsIsTable" :data="dnsRecords" size="small" empty-text="还没有域名记录">
           <el-table-column prop="name" label="主机名" min-width="160" />
           <el-table-column prop="ip" label="指向的地址" min-width="140" />
           <el-table-column prop="note" label="备注" min-width="140" />
@@ -360,6 +366,48 @@
             </template>
           </el-table-column>
         </el-table>
+
+        <!-- 卡片视图：与表格显示同样的字段与操作；一条域名一块，手机上不用左右滚 -->
+        <div v-else class="fnwg-card-grid">
+          <ItemCard v-for="row in dnsRecords" :key="row.name + row.ip" :title="row.name">
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">指向的地址</span>
+              <span class="fnwg-kv-val fnwg-mono">{{ row.ip }}</span>
+            </div>
+            <div v-if="row.note" class="fnwg-kv">
+              <span class="fnwg-kv-key">备注</span>
+              <span class="fnwg-kv-val">{{ row.note }}</span>
+            </div>
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">设备类型</span>
+              <span class="fnwg-kv-val">
+                <el-select
+                  :model-value="kindMap[row.ip] || ''"
+                  size="small"
+                  placeholder="自动判断"
+                  clearable
+                  style="width: 140px"
+                  @visible-change="loadKinds"
+                  @change="(v: string) => setKind(row.ip, v)"
+                >
+                  <el-option v-for="o in kindOptions" :key="o.value" :label="o.label" :value="o.value" />
+                </el-select>
+              </span>
+            </div>
+            <template #actions>
+              <el-button v-if="session.can('iface.write')" size="small" @click="openDNSRecord(row)">编辑</el-button>
+              <el-button
+                v-if="session.can('iface.write')"
+                size="small"
+                type="danger"
+                plain
+                @click="removeDNSRecord(row)"
+              >
+                删除
+              </el-button>
+            </template>
+          </ItemCard>
+        </div>
 
         <!-- 新增 / 编辑域名 -->
         <el-dialog v-model="dnsVisible" :title="dnsForm.id ? '编辑域名' : '添加域名'" :width="dialogWidth || '460px'">
@@ -418,7 +466,10 @@
           <span class="fnwg-hint">共 {{ snapshots.length }} 份 · 保留上限 {{ snapshotKeep }} 份</span>
         </div>
 
-        <div v-if="!isMobile" class="fnwg-card">
+        <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+        <ViewSwitch v-model="snapshotsViewMode" />
+
+        <div v-if="snapshotsIsTable" class="fnwg-card">
           <el-table :data="snapshots" size="small" empty-text="还没有配置快照，改动一次配置就会自动生成">
             <el-table-column prop="filename" label="快照文件" min-width="240" />
             <el-table-column label="大小" width="100">
@@ -443,6 +494,7 @@
         </div>
 
         <div v-else>
+          <div class="fnwg-card-grid">
           <ItemCard v-for="row in snapshots" :key="row.id" :title="row.filename">
             <template #extra>
               <el-tag size="small" type="info" effect="plain">配置快照</el-tag>
@@ -467,6 +519,7 @@
               </el-button>
             </template>
           </ItemCard>
+          </div>
           <div v-if="!snapshots.length" class="fnwg-empty">还没有配置快照</div>
         </div>
       </el-tab-pane>
@@ -781,6 +834,13 @@ import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHea
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes, formatTime } from '@/utils/format'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
+
+// 表格 / 卡片视图：由用户决定并记住（每个列表各用一个键）
+const { mode: usersViewMode, isTable: usersIsTable } = useViewMode('settings-users')
+const { mode: snapshotsViewMode, isTable: snapshotsIsTable } = useViewMode('settings-snapshots')
+const { mode: dnsViewMode, isTable: dnsIsTable } = useViewMode('settings-dns')
 
 const session = useSession()
 const realtime = useRealtime()
