@@ -15,6 +15,7 @@ import (
 	"fnwg/internal/wgback"
 	"fnwg/internal/wgconf"
 	"fnwg/internal/wgkey"
+	"sync"
 )
 
 // ListPeers 返回节点列表（interfaceID<=0 表示全部）。敏感字段默认不下发。
@@ -559,11 +560,36 @@ func (s *Service) RevealPeerSecrets(ctx context.Context, id int64, a Actor) (map
 }
 
 // serverEndpoint 解析服务端对外地址。
+// 自动探测到的本机地址要做缓存。
+//
+// 为什么必须缓存：这个地址会进「设备配置指纹」的比对（见 baselineFor / peerConfigFingerprint）。
+// 若每次请求都重新探测，多网卡机器（家里的 NAS 很常见：eth0 与 docker0 / 网桥并存）可能这次选到这张、
+// 下次选到那张，指纹就跟着变 —— 表现是设备列表里「需重新扫码」怎么重新导入都清不掉（用户实际遇到过）。
+// 缓存期内指纹必然一致；地址真的变了（超过缓存期）仍会被识别为需要重新导入，这正是该标记的用途。
+var localIPv4Cache struct {
+	sync.Mutex
+	at  time.Time
+	val string
+}
+
+const localIPv4TTL = 10 * time.Minute
+
+func cachedLocalIPv4() string {
+	localIPv4Cache.Lock()
+	defer localIPv4Cache.Unlock()
+	if !localIPv4Cache.at.IsZero() && time.Since(localIPv4Cache.at) < localIPv4TTL {
+		return localIPv4Cache.val
+	}
+	v := detectLocalIPv4()
+	localIPv4Cache.at, localIPv4Cache.val = time.Now(), v
+	return v
+}
+
 func (s *Service) serverEndpoint(ctx context.Context, it *model.Interface) (string, string) {
 	if v := s.Store.GetSetting(ctx, "server_endpoint", ""); v != "" {
 		return v, ""
 	}
-	ip := detectLocalIPv4()
+	ip := cachedLocalIPv4()
 	if ip == "" {
 		return "", "尚未配置「服务端对外地址」，二维码中的 Endpoint 为空，请到系统设置中填写公网域名或 IP"
 	}
