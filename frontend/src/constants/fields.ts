@@ -219,6 +219,23 @@ export const peerFields: Record<string, FieldMeta> = {
       { title: '从对方设备获取', value: 'Xk3v...（44 位字符）', desc: '在对方设备上执行 wg show 可以看到 Public key 字段。' },
     ],
   },
+  lan_policy: {
+    label: '内网访问范围',
+    hint: '这台设备能访问家里内网的哪些目标；默认随连接',
+    what: '按设备限制这台设备实际能访问的内网目标：随连接（与连接上的「允许设备访问家里内网」一致）、只允许指定目标、或不允许访问内网。',
+    why: '连接上的开关是一刀切的：开了之后这条连接里所有设备都能访问整个内网。给访客、临时设备单独收窄时用它。',
+    effect:
+      '限制落在**服务端的转发规则**上，设备侧改不了 —— 这与「设备上网方式」里的通行范围不同：那份只写在设备配置里，设备可以自己改路由绕过去。',
+    risk: '限制的是「设备访问内网」这个方向；内网里的机器主动访问这台设备不受影响。',
+  },
+  lan_targets: {
+    label: '允许访问的目标',
+    hint: '例如 192.168.1.10、192.168.1.0/24、192.168.1.10:445',
+    what: '逐个列出这台设备可以访问的内网地址、网段或「地址:端口」。',
+    why: '常见用法是只放开 NAS 的某个服务（例如 192.168.1.10:5000），其余一概不通。',
+    effect: '不在列表里的内网目标会被丢弃，设备侧表现为「连不上」。进出方向只有「设备→内网」受此限制。',
+    risk: '不要填 0.0.0.0/0：那等于不做限制；带端口的目标只匹配 TCP / UDP。',
+  },
   allowed_ips: {
     label: '分配给这台设备的内部地址',
     hint: '留空即自动分配（推荐）；一般只需要保留一个 /32 地址，例如 10.10.0.2/32',
@@ -774,6 +791,51 @@ export const inspectFields: Record<string, FieldMeta> = {
   },
 }
 
+/** 多 NAS 互联（站点到站点）相关配置项 */
+export const interconnectFields: Record<string, FieldMeta> = {
+  interconnect_peer_name: {
+    label: '对端名称',
+    hint: '给对方 NAS 起个名字，只用于本机列表里显示',
+    what: '这条互联对端在「我的设备」里显示的名字，例如「老家 NAS」「办公室」。',
+    why: '一台 NAS 可能和多处互联，名字能让你在列表里一眼分清哪条是哪条。',
+  },
+  interconnect_peer_lan: {
+    label: '对端内网网段',
+    hint: '对方那台 NAS 所在局域网的网段，例如 192.168.2.0/24',
+    what: '对方 NAS 背后的局域网网段。本机会把它路由进隧道，并允许这些来源访问本机内网。',
+    why: '这是互联的目的：不填它，隧道虽然通，但对方局域网里的机器访问不了这边。',
+    effect: '填错的表现只是「不通」——所以保存前会校验格式，且不能与两端的其它网段重叠。',
+    risk: '不要填 0.0.0.0/0：那等于把对方的所有上网流量都拉到本机线路上。',
+  },
+  interconnect_peer_endpoint: {
+    label: '对端对外地址',
+    hint: '对方 NAS 的公网域名或 IP 加端口，可留空',
+    what: '本机主动去连对方时使用的地址（host:port）。',
+    why: '两端只要有一端能被访问到，隧道就能建立：留空时由对端来连本机（对端需要有你的对外地址）。',
+    effect: '留空不会报错，只是本机不会主动连对端；若两端都在 NAT 后且都没填，隧道不会自动建立。',
+  },
+  interconnect_local_lan: {
+    label: '本机暴露给对端的网段',
+    hint: '留空则用探测到的本机局域网网段',
+    what: '对端需要访问的、本机这侧的网段。它们会被写进对方那条配置的通行范围。',
+    why: '默认只暴露本机所在的局域网；若你只想让对端访问 NAS 本身，也可以只填隧道网段。',
+  },
+  interconnect_invite: {
+    label: '互联邀请',
+    hint: '交给另一台 NAS 导入的一整段文本',
+    what: '一份自包含的互联配置：对方的隧道地址、对方连接要用的私钥、本机公钥与对外地址、两端的网段。',
+    why: '两端配对需要四处信息都对（隧道地址、双方公钥、准入地址、通行范围），手工填很难不错。',
+    risk: '它含对端连接的私钥，等同于密码：请走安全渠道交给对方，不要发到群里或上传网盘。',
+  },
+  interconnect_import: {
+    label: '导入邀请',
+    hint: '粘贴另一台 NAS 生成的邀请内容',
+    what: '在本机建立与对方对称的连接与对端条目：隧道地址与私钥用邀请里的，本机只补自己的网段。',
+    why: '与「生成邀请」合起来用：一端生成、另一端导入，两边就通了。',
+    effect: '导入前会检查隧道网段冲突、两端内网网段是否相同、公钥是否已被占用，有问题当场拒绝并说明原因。',
+  },
+}
+
 /** 配置说明大全的分组，供各处复用，避免重复维护 */
 export const allHelpGroups = [
   { key: 'iface', title: '我的连接（每条连接相当于一个安全通道）', fields: interfaceFields },
@@ -781,6 +843,7 @@ export const allHelpGroups = [
   { key: 'setting', title: '系统设置', fields: settingFields },
   { key: 'backup', title: '备份与还原', fields: backupFields },
   { key: 'inspect', title: '配置漂移巡检（定期体检）', fields: inspectFields },
+  { key: 'interconnect', title: '多 NAS 互联（两处内网打通）', fields: interconnectFields },
   { key: 'user', title: '账号与权限', fields: userFields },
   { key: 'capability', title: '安全与可靠性机制（装好之后要会用）', fields: capabilityFields },
   { key: 'safety', title: 'NAS 系统网络安全说明', fields: netSafetyFields },

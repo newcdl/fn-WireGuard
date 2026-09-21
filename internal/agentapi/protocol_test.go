@@ -46,6 +46,19 @@ func (s *stubCore) Health(context.Context) (model.Health, error) { return model.
 func (s *stubCore) DeleteInterface(context.Context, string) error {
 	return nil
 }
+
+// LANDevices 返回一组固定事实：往返测试要核对的就是「这些字段能不能原样回来」。
+// 特别覆盖空值（MAC/名称/状态缺省）—— 那条路径最容易在 JSON 标签上出错。
+func (s *stubCore) LANDevices(context.Context) (*model.LANReport, error) {
+	return &model.LANReport{
+		Readable: true,
+		Devices: []model.LANDevice{
+			{IP: "192.168.1.10", MAC: "aa:bb:cc:00:00:10", Name: "书房的电脑", Interface: "eth0", State: "reachable"},
+			{IP: "192.168.1.20", State: "stale"},
+		},
+	}, nil
+}
+
 func (s *stubCore) InspectNetwork(context.Context) (model.NetworkReport, error) {
 	return model.NetworkReport{}, nil
 }
@@ -124,6 +137,21 @@ func TestCoreRoundTrip(t *testing.T) {
 	}
 	if !stub.inspected || stub.userID != 7 || stub.username != "bob" || stub.srcIP != "10.0.0.8" {
 		t.Fatalf("巡检的执行者信息没传过去：%v %d/%s/%s", stub.inspected, stub.userID, stub.username, stub.srcIP)
+	}
+
+	// 内网设备清单：字段名与空值都要原样回来（拓扑图靠它画节点）
+	lan, err := c.LANDevices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lan == nil || !lan.Readable || len(lan.Devices) != 2 {
+		t.Fatalf("内网设备清单不对：%+v", lan)
+	}
+	if lan.Devices[0].Name != "书房的电脑" || lan.Devices[0].Interface != "eth0" || lan.Devices[0].State != "reachable" {
+		t.Fatalf("设备字段没原样回来：%+v", lan.Devices[0])
+	}
+	if lan.Devices[1].IP != "192.168.1.20" || lan.Devices[1].MAC != "" || lan.Devices[1].Name != "" {
+		t.Fatalf("空字段也要能原样回来：%+v", lan.Devices[1])
 	}
 
 	// 目标目录实况

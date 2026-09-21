@@ -49,22 +49,26 @@ func (s *Service) GetPeer(ctx context.Context, id int64) (*model.Peer, error) {
 
 // PeerInput 是节点新增/编辑入参。
 type PeerInput struct {
-	InterfaceID      int64      `json:"interface_id"`
-	Name             string     `json:"name"`
-	PublicKey        string     `json:"public_key"`
-	PresharedKey     string     `json:"preshared_key"`
-	ClientPrivateKey string     `json:"client_private_key"`
-	RouteMode        string     `json:"route_mode"`
-	ClientAllowedIPs []string   `json:"client_allowed_ips"`
-	EndpointHost     string     `json:"endpoint_host"`
-	EndpointPort     int        `json:"endpoint_port"`
-	AllowedIPs       []string   `json:"allowed_ips"`
-	Keepalive        int        `json:"persistent_keepalive"`
-	GroupTag         string     `json:"group_tag"`
-	Remark           string     `json:"remark"`
-	QuotaRx          int64      `json:"quota_rx"`
-	QuotaTx          int64      `json:"quota_tx"`
-	ExpireAt         *time.Time `json:"expire_at"`
+	InterfaceID      int64    `json:"interface_id"`
+	Name             string   `json:"name"`
+	PublicKey        string   `json:"public_key"`
+	PresharedKey     string   `json:"preshared_key"`
+	ClientPrivateKey string   `json:"client_private_key"`
+	RouteMode        string   `json:"route_mode"`
+	ClientAllowedIPs []string `json:"client_allowed_ips"`
+	EndpointHost     string   `json:"endpoint_host"`
+	EndpointPort     int      `json:"endpoint_port"`
+	AllowedIPs       []string `json:"allowed_ips"`
+	// LANPolicy / LANTargets 是「这台设备能访问内网的哪些目标」（见 model.Peer.LANPolicy）。
+	// 它们落在服务端的转发规则上，设备侧改不了 —— 与设备侧的通行范围是两件事。
+	LANPolicy  string     `json:"lan_policy"`
+	LANTargets []string   `json:"lan_targets"`
+	Keepalive  int        `json:"persistent_keepalive"`
+	GroupTag   string     `json:"group_tag"`
+	Remark     string     `json:"remark"`
+	QuotaRx    int64      `json:"quota_rx"`
+	QuotaTx    int64      `json:"quota_tx"`
+	ExpireAt   *time.Time `json:"expire_at"`
 	// Enabled 用指针表达「有没有指定」：新建时为 nil 表示按默认（不启用），编辑时为 nil 表示保持原值。
 	// 与连接的入参同理：非指针布尔会让部分更新静默把设备停用。
 	Enabled *bool `json:"enabled"`
@@ -104,6 +108,10 @@ func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model
 	if in.RouteMode == "" {
 		in.RouteMode = model.RouteModeLAN
 	}
+	policy, lanTargets, err := normalizePeerLANAccess(in.LANPolicy, in.LANTargets)
+	if err != nil {
+		return nil, err
+	}
 	p := &model.Peer{
 		InterfaceID:      in.InterfaceID,
 		Name:             strings.TrimSpace(in.Name),
@@ -114,6 +122,8 @@ func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model
 		EndpointHost:     strings.TrimSpace(in.EndpointHost),
 		EndpointPort:     in.EndpointPort,
 		AllowedIPs:       in.AllowedIPs,
+		LANPolicy:        policy,
+		LANTargets:       lanTargets,
 		Keepalive:        in.Keepalive,
 		GroupTag:         in.GroupTag,
 		Remark:           in.Remark,
@@ -274,6 +284,11 @@ func (s *Service) UpdatePeer(ctx context.Context, id int64, in PeerInput, a Acto
 	p.EndpointHost = strings.TrimSpace(in.EndpointHost)
 	p.EndpointPort = in.EndpointPort
 	p.AllowedIPs = in.AllowedIPs
+	policy, lanTargets, err := normalizePeerLANAccess(in.LANPolicy, in.LANTargets)
+	if err != nil {
+		return nil, err
+	}
+	p.LANPolicy, p.LANTargets = policy, lanTargets
 	p.Keepalive = in.Keepalive
 	p.GroupTag = in.GroupTag
 	p.Remark = in.Remark

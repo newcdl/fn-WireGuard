@@ -51,6 +51,12 @@ const (
 // 绝不依赖「位置」或「内容猜测」去删系统的规则。
 var natMarker = []byte("fnwg-nat")
 
+// natMarkerACL 是「按设备限制内网访问目标」规则的标记。
+//
+// 与 natMarker 分开：这两类规则都落在转发链上，且都可能是 accept（白名单）与 drop（拒绝），
+// 只用「是不是丢弃」区分不出来 —— 按标记数才能确认它们各自都还在。
+var natMarkerACL = []byte("fnwg-acl")
+
 func nftConn() (*nftables.Conn, error) {
 	c, err := nftables.New()
 	if err != nil {
@@ -224,6 +230,7 @@ func (b *linuxBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpti
 // 两者分开表达，界面才能说清卡在哪一层。
 func (b *linuxBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool, bool) {
 	sources := []string{}
+	siteSources := []string{}
 	isoSources := []string{}
 	tunnels := []string{}
 	anyLAN := false
@@ -242,12 +249,19 @@ func (b *linuxBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool
 		if s.AllowLAN {
 			anyLAN = true
 			sources = append(sources, subnets...)
+			// 对端站点网段（站点到站点互联）：对端局域网里的主机把包送进来时，
+			// 源地址是**对端局域网网段**，落在本连接隧道网段之外。
+			// 少了这一项，现象就是「隧道通、对端 NAS 自己能访问本机内网，
+			// 但对端局域网里的机器访问不了」—— 最容易漏的一环。
+			siteSources = append(siteSources, peerSiteSubnets(s, subnets)...)
 		}
 	}
 
 	input := NATPlanInput{
 		Enabled:          anyLAN,
 		SourceSubnets:    sources,
+		PeerSubnets:      siteSources,
+		PeerRestrictions: peerRestrictions(specs, tunnels),
 		TunnelInterfaces: b.state.ManagedCopy(),
 		IsolateRequested: anyIsolate,
 		IsolateSubnets:   isoSources,
@@ -511,6 +525,11 @@ func (b *linuxBackend) ensureNATTableLocked(plan NATPlan) error {
 	// 用户看到的就是「隔离开关打开了但设备还能互访」。
 	isoApplied := addIsolationRules(c, tbl, fwd, plan)
 
+	// 按设备的内网访问范围：白名单放行 + 该设备 → 内网的拒绝，
+	// 必须排在下面的网段级放行**之前**，否则那条 `ip saddr <隧道网段> accept` 先匹配上，
+	// 拒绝规则永远轮不到生效 —— 用户看到的就是「限制了却还能访问」。
+	aclApplied := addPeerTargetRules(c, tbl, fwd, plan)
+
 	applied := 0
 	for _, src := range plan.Sources {
 		n, err := parseIPNet(src)
@@ -552,7 +571,7 @@ func (b *linuxBackend) ensureNATTableLocked(plan NATPlan) error {
 			})
 		}
 	}
-	if applied == 0 && isoApplied == 0 {
+	if applied == 0 && isoApplied == 0 && aclApplied == 0 {
 		c.DelTable(tbl)
 		_ = c.Flush()
 		return fmt.Errorf("没有可用的 IPv4 隧道网段")
@@ -602,6 +621,105 @@ func addIsolationRules(c *nftables.Conn, tbl *nftables.Table, chain *nftables.Ch
 		n++
 	}
 	return n
+}
+
+// addPeerTargetRules 写入「按设备限制内网访问目标」的规则，返回实际写入的条数。
+//
+// 两类规则，**顺序不能反**：
+//  1. 白名单放行（restrict 设备允许的目标，可带端口）—— 必须在前面，否则连允许的目标也被挡；
+//  2. 该设备 → 内网各网段的丢弃 —— 把不在白名单里的访问挡掉。
+//
+// 它们排在网段级放行之前（见调用处），因此对 inherit 的设备没有任何影响：
+// 那些设备不在这些规则的源地址里，规则根本匹配不到它们。
+//
+// 用 drop 而不是 reject，与设备间隔离同一理由（见 addIsolationRules）：
+// drop 行为在所有内核版本上一致，也不需要内核在转发路径上生成 ICMP 差错报文。
+func addPeerTargetRules(c *nftables.Conn, tbl *nftables.Table, chain *nftables.Chain, plan NATPlan) int {
+	n := 0
+	for _, r := range plan.PeerAllow {
+		src, err := parseIPNet(r.Src)
+		if err != nil {
+			continue
+		}
+		dst, err := parseIPNet(r.Dst)
+		if err != nil {
+			continue
+		}
+		base := matchSrcIPv4(src)
+		base = append(base, matchDstIPv4(dst)...)
+		if len(base) == 0 {
+			continue
+		}
+		if r.Port <= 0 {
+			c.AddRule(&nftables.Rule{
+				Table:    tbl,
+				Chain:    chain,
+				Exprs:    append(base, &expr.Verdict{Kind: expr.VerdictAccept}),
+				UserData: natMarkerACL,
+			})
+			n++
+			continue
+		}
+		// 带端口的目标：TCP / UDP 各一条（这个字段表达的就是「服务」，两种协议都要放）。
+		for _, proto := range []string{"tcp", "udp"} {
+			dport := matchDport(proto, r.Port)
+			if len(dport) == 0 {
+				continue
+			}
+			ex := append([]expr.Any{}, base...)
+			ex = append(ex, dport...)
+			c.AddRule(&nftables.Rule{
+				Table:    tbl,
+				Chain:    chain,
+				Exprs:    append(ex, &expr.Verdict{Kind: expr.VerdictAccept}),
+				UserData: natMarkerACL,
+			})
+			n++
+		}
+	}
+	for _, pair := range plan.PeerDeny {
+		src, err := parseIPNet(pair[0])
+		if err != nil {
+			continue
+		}
+		dst, err := parseIPNet(pair[1])
+		if err != nil {
+			continue
+		}
+		ex := matchSrcIPv4(src)
+		ex = append(ex, matchDstIPv4(dst)...)
+		if len(ex) == 0 {
+			continue
+		}
+		c.AddRule(&nftables.Rule{
+			Table:    tbl,
+			Chain:    chain,
+			Exprs:    append(ex, &expr.Verdict{Kind: expr.VerdictDrop}),
+			UserData: natMarkerACL,
+		})
+		n++
+	}
+	return n
+}
+
+// matchDport 生成「meta l4proto <proto> <proto> dport <port>」的匹配表达式。
+//
+// 与源/目标匹配同一口径，只写 IPv4 的传输层匹配：带端口的目标因此只对 IPv4 生效。
+// 返回空切片表示没法表达（端口非法），调用方应跳过该条，而不是写出半条规则。
+func matchDport(proto string, port int) []expr.Any {
+	if port <= 0 || port > 65535 {
+		return nil
+	}
+	num := byte(6) // tcp
+	if proto == "udp" {
+		num = 17
+	}
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{num}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{byte(port >> 8), byte(port & 0xff)}},
+	}
 }
 
 const ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
@@ -877,7 +995,41 @@ func (b *linuxBackend) rulesPresent(plan NATPlan) bool {
 			return false
 		}
 	}
+	// 按设备的内网访问规则：有则必须能数到（同样可能被别的工具清理掉）。
+	// 它们不带「丢弃」语义（白名单就是 accept），因此按标记数，而不是按判定类型数。
+	if len(plan.PeerAllow) > 0 || len(plan.PeerDeny) > 0 {
+		if n, err := b.aclRuleCount(); err != nil || n == 0 {
+			return false
+		}
+	}
 	return true
+}
+
+// aclRuleCount 返回转发链里带 acl 标记的规则条数（按设备的内网访问规则）。
+func (b *linuxBackend) aclRuleCount() (int, error) {
+	c, err := nftConn()
+	if err != nil {
+		return 0, err
+	}
+	t, err := findNATTable(c)
+	if err != nil || t == nil {
+		return 0, err
+	}
+	ch, err := c.ListChain(t, natForwardChain)
+	if err != nil || ch == nil {
+		return 0, err
+	}
+	rules, err := c.GetRules(t, ch)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range rules {
+		if string(r.UserData) == string(natMarkerACL) {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // isoRuleCount 返回专用表转发链里「丢弃」类规则的条数，

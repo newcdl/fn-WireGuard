@@ -265,6 +265,9 @@ func (e *Engine) Desired(ctx context.Context) ([]model.InterfaceSpec, error) {
 				Endpoint:     p.EndpointString(),
 				AllowedIPs:   p.AllowedIPs,
 				Keepalive:    p.Keepalive,
+				// 按设备限制内网访问目标：策略与目标要进期望态，数据面才判得了。
+				LANPolicy:  p.LANPolicy,
+				LANTargets: p.LANTargets,
 			})
 		}
 		specs = append(specs, spec)
@@ -319,6 +322,11 @@ func (e *Engine) DeleteInterface(ctx context.Context, name string) error {
 	}
 	e.log.Info("已删除接口", "name", name)
 	return nil
+}
+
+// LANDevices 读内网里的设备清单（只读，来自内核邻居表）。
+func (e *Engine) LANDevices(ctx context.Context) (*model.LANReport, error) {
+	return e.back.LANDevices(ctx)
 }
 
 // InspectNetwork 网络自检（只读），用于界面展示与排障。

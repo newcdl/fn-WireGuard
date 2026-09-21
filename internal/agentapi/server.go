@@ -172,6 +172,14 @@ func (s *Server) dispatch(conn net.Conn, req *Request) Response {
 		resp.OK = true
 		resp.Result = mustJSON(rep)
 		return resp
+	case MethodLANDevices:
+		rep, err := s.handler.LANDevices(ctx)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(rep)
+		return resp
 	case MethodNetRepair:
 		actions, err := s.handler.RepairNetwork(ctx)
 		if err != nil {

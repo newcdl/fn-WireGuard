@@ -41,6 +41,11 @@ func (l *Local) DeleteInterface(ctx context.Context, name string) error {
 	return l.Eng.DeleteInterface(ctx, name)
 }
 
+// LANDevices 读内网里的设备清单（只读）。
+func (l *Local) LANDevices(ctx context.Context) (*model.LANReport, error) {
+	return l.Eng.LANDevices(ctx)
+}
+
 // InspectNetwork 网络自检。
 func (l *Local) InspectNetwork(ctx context.Context) (model.NetworkReport, error) {
 	return l.Eng.InspectNetwork(ctx)

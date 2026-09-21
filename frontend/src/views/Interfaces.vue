@@ -11,6 +11,9 @@
       <el-button :icon="Download" @click="exportAll">导出连接配置</el-button>
       <el-button v-if="session.can('iface.write')" :icon="Refresh" @click="applyNow">立即应用</el-button>
       <el-button :icon="Reading" @click="helpVisible = true">配置说明</el-button>
+      <el-button v-if="session.can('iface.write')" :icon="Connection" @click="interconnectVisible = true">
+        与另一台 NAS 互联
+      </el-button>
       <div style="flex: 1"></div>
       <el-tag size="small" type="info" effect="plain">共 {{ list.length }} 条连接</el-tag>
     </div>
@@ -371,6 +374,9 @@
       </template>
     </el-dialog>
 
+    <!-- 多 NAS 互联：引导式生成邀请 / 导入邀请，建好后刷新列表 -->
+    <InterconnectDialog v-model="interconnectVisible" @done="load" />
+
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
@@ -379,10 +385,11 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Upload, Download, Refresh, ArrowDown, Reading } from '@element-plus/icons-vue'
+import { Plus, Upload, Download, Refresh, ArrowDown, Reading, Connection } from '@element-plus/icons-vue'
 import { api, download } from '@/api/client'
 import type { WgInterface } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import InterconnectDialog from '@/components/InterconnectDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
@@ -416,6 +423,7 @@ const confVisible = ref(false)
 const confTitle = ref('')
 const confText = ref('')
 const helpVisible = ref(false)
+const interconnectVisible = ref(false)
 const scenario = ref('home')
 
 // 连接级异常提示：与全局「系统状态」同源，避免连接页与总览给出互相矛盾的结论

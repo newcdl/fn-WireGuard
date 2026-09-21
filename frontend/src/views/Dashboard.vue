@@ -4,6 +4,17 @@
 <template>
   <div>
     <!--
+      分两个标签页：总览与网络拓扑。
+      拓扑单独一页不只是为了版面 —— 图表即使被隐藏也照样在跑动画，用 v-if 让它在切走时整个销毁，
+      不占 CPU（用户反馈过「有点卡」，一半原因在这里）。
+    -->
+    <el-radio-group v-model="tab" size="small" class="fnwg-page-tabs">
+      <el-radio-button value="main">总览</el-radio-button>
+      <el-radio-button value="topo">网络拓扑</el-radio-button>
+    </el-radio-group>
+
+    <div v-show="tab === 'main'">
+    <!--
       系统状态：与顶栏状态栏、系统维护同源（useSystemHealth）。
       以前这里堆了 4 条各自判断的告警，现在统一成一份清单，口径一致、点一下就能去处理。
     -->
@@ -111,6 +122,7 @@
       <div ref="chartEl" :style="{ height: chartHeight }"></div>
     </div>
 
+    <!-- 网络拓扑：一眼看清「本机所在内网 + 隧道设备 + 对端 NAS」的整体连通关系 -->
     <!-- 连接状态 -->
     <div class="fnwg-card" style="margin-bottom: 12px">
       <div class="fnwg-card-head">
@@ -263,6 +275,11 @@
     </el-row>
 
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
+    </div>
+
+    <div v-if="tab === 'topo'">
+      <TopologyGraph />
+    </div>
   </div>
 </template>
 
@@ -274,6 +291,7 @@ import * as echarts from 'echarts'
 import { api } from '@/api/client'
 import type { Overview, Status } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import TopologyGraph from '@/components/TopologyGraph.vue'
 import ItemCard from '@/components/ItemCard.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
@@ -332,6 +350,9 @@ const onlineCount = computed(() => {
 })
 
 const chartHeight = computed(() => (isMobile.value ? '180px' : '260px'))
+
+/** 当前标签页：拓扑图只在切过去时才创建（见模板里的 v-if）。 */
+const tab = ref<'main' | 'topo'>('main')
 
 async function load() {
   try {

@@ -49,6 +49,10 @@ export interface WgPeer {
   route_mode: 'full' | 'lan' | 'custom'
   /** 仅 route_mode=custom 时生效 */
   client_allowed_ips: string[]
+  /** 内网访问范围：inherit（随连接）/ restrict（只允许 lan_targets）/ deny（不允许访问内网） */
+  lan_policy: 'inherit' | 'restrict' | 'deny'
+  /** restrict 时允许访问的内网目标（可带端口，如 192.168.1.10:445） */
+  lan_targets: string[]
   endpoint_host: string
   endpoint_port: number
   allowed_ips: string[]
@@ -606,4 +610,75 @@ export interface InspectStatus {
 export interface InspectChecks {
   at: string
   items: InspectItem[]
+}
+
+/** 多 NAS 互联：生成邀请的入参 */
+export interface InterconnectInput {
+  peer_name: string
+  /** 对端（要互联的那一侧）的局域网网段 */
+  peer_lan_subnets: string[]
+  /** 对端的对外地址 host:port，可留空 */
+  peer_endpoint: string
+  /** 本机暴露给对端的网段，留空用探测到的家里网段 */
+  local_lan_subnets: string[]
+}
+
+/** 多 NAS 互联：生成邀请的结果 */
+export interface InterconnectCreated {
+  interface_id: number
+  interface_name: string
+  peer_id: number
+  tunnel_subnet: string
+  peer_tunnel_address: string
+  /** 交给对端的邀请文本（含对端私钥，等同于密码） */
+  invite_json: string
+  /** 对端不装本应用时可用的 wg-quick 配置 */
+  peer_conf: string
+  warnings: string[]
+}
+
+/** 多 NAS 互联：导入邀请的结果 */
+export interface InterconnectImported {
+  interface_id: number
+  interface_name: string
+  peer_id: number
+  peer_name: string
+  tunnel_address: string
+  tunnel_subnet: string
+  allowed_ips: string[]
+  client_allowed_ips: string[]
+  warnings: string[]
+}
+
+/** 拓扑图上的一个节点 */
+export interface TopologyNode {
+  id: string
+  /** nas（本机）/ lan（内网网段）/ host（内网设备）/ device（隧道设备）/ site（对端 NAS）/ site-lan（对端内网）/ foreign（疑似残留网卡） */
+  kind: string
+  label: string
+  sublabel?: string
+  /** ok / warn / off */
+  status: string
+  details: { key: string; value: string }[]
+}
+
+/** 拓扑图上的一条连线 */
+export interface TopologyLink {
+  from: string
+  to: string
+  kind: string
+  label?: string
+  status: string
+  /** 当前速率（字节/秒），界面据此决定流动动画的快慢 */
+  rate?: number
+}
+
+/** 一次拓扑快照 */
+export interface TopologyGraph {
+  at: string
+  host_name: string
+  nodes: TopologyNode[]
+  links: TopologyLink[]
+  /** 必须让用户知道的说明（数据来自哪里、哪一部分没读到） */
+  notes: string[]
 }

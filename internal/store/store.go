@@ -96,6 +96,11 @@ CREATE TABLE IF NOT EXISTS wg_peer (
   -- config_fp 是设备上次拿到配置时的客户端配置指纹（不含密钥），
   -- 用来判断「设备里那份配置是不是已经过期」，空表示从未生成过配置。
   config_fp     TEXT    NOT NULL DEFAULT '',
+  -- lan_policy / lan_targets 是「这台设备能访问内网的哪些目标」：默认 inherit 随连接的开关
+  -- （与升级前行为一致），restrict 只允许 lan_targets 里的目标，deny 表示不允许访问内网。
+  -- 它落在服务端规则上，设备侧改不了。
+  lan_policy    TEXT    NOT NULL DEFAULT 'inherit',
+  lan_targets   TEXT    NOT NULL DEFAULT '[]',
   -- disabled_reason 记录「被自动停用的原因」（quota / expire，空表示不是自动停用）。
   -- 月度额度要到月初自动恢复，而恢复的前提是知道当初为什么停用：只看 enabled=0
   -- 分不清「管理员手工停的」与「流量用尽自动停的」，分不清就会把前者也一并放开。
@@ -283,6 +288,9 @@ func (s *Store) migrate() error {
 		// 自动停用的原因（quota / expire）：默认空表示「不是自动停用」，
 		// 于是升级上来的历史数据不会被误判成「被额度停用」，也就不会被自动恢复。
 		{"wg_peer", "disabled_reason", `ALTER TABLE wg_peer ADD COLUMN disabled_reason TEXT NOT NULL DEFAULT ''`},
+		// 设备的内网访问范围：默认 inherit=随连接，升级后行为与升级前完全一致。
+		{"wg_peer", "lan_policy", `ALTER TABLE wg_peer ADD COLUMN lan_policy TEXT NOT NULL DEFAULT 'inherit'`},
+		{"wg_peer", "lan_targets", `ALTER TABLE wg_peer ADD COLUMN lan_targets TEXT NOT NULL DEFAULT '[]'`},
 	} {
 		if err := s.ensureColumn(c.table, c.column, c.ddl); err != nil {
 			return err

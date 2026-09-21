@@ -156,6 +156,16 @@ func (c *Client) DeleteInterface(ctx context.Context, name string) error {
 	return c.call(ctx, MethodDeleteInterface, DeleteInterfaceParams{Name: name}, nil)
 }
 
+// LANDevices 读内网里的设备清单（只读）。
+func (c *Client) LANDevices(ctx context.Context) (*model.LANReport, error) {
+	var out model.LANReport
+	err := c.call(ctx, MethodLANDevices, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // InspectNetwork 网络自检。
 func (c *Client) InspectNetwork(ctx context.Context) (model.NetworkReport, error) {
 	var rep model.NetworkReport

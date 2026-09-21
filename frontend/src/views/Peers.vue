@@ -293,6 +293,38 @@
           </div>
         </el-form-item>
 
+        <!-- 内网访问范围：与上面的「通行范围」不是一回事 ——
+             通行范围写在设备配置里（设备可改），这里是服务端规则（设备改不了）。 -->
+        <el-form-item>
+          <template #label><FieldLabel :meta="P.lan_policy" /></template>
+          <el-select v-model="form.lan_policy" style="width: 240px">
+            <el-option label="随连接（默认）" value="inherit" />
+            <el-option label="只允许访问指定目标" value="restrict" />
+            <el-option label="不允许访问内网" value="deny" />
+          </el-select>
+          <div class="fnwg-hint">
+            限制落在服务端的转发规则上，设备侧改不了。需要连接上已打开「允许设备访问家里内网」才会生效。
+          </div>
+        </el-form-item>
+
+        <el-form-item v-if="form.lan_policy === 'restrict'">
+          <template #label><FieldLabel :meta="P.lan_targets" /></template>
+          <el-select
+            v-model="form.lan_targets"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            placeholder="192.168.1.10 或 192.168.1.10:445"
+            style="width: 100%"
+          >
+            <el-option v-for="s in homeSubnets" :key="s" :label="s" :value="s" />
+          </el-select>
+          <div class="fnwg-hint">
+            列表之外的内网目标会被丢弃；写「地址:端口」时只放行该端口的 TCP / UDP。
+          </div>
+        </el-form-item>
+
         <el-form-item>
           <template #label><FieldLabel :meta="P.allowed_ips" /></template>
           <el-select
@@ -598,6 +630,8 @@ const emptyForm = () => ({
   generate_psk: true,
   route_mode: 'lan',
   client_allowed_ips: [] as string[],
+  lan_policy: 'inherit' as 'inherit' | 'restrict' | 'deny',
+  lan_targets: [] as string[],
   allowed_ips: [] as string[],
   endpoint_host: '',
   endpoint_port: 0,
@@ -771,6 +805,8 @@ function openEdit(row: WgPeer) {
     generate_psk: false,
     route_mode: row.route_mode || 'lan',
     client_allowed_ips: [...(row.client_allowed_ips || [])],
+    lan_policy: row.lan_policy || 'inherit',
+    lan_targets: [...(row.lan_targets || [])],
     allowed_ips: [...(row.allowed_ips || [])],
     endpoint_host: row.endpoint_host,
     endpoint_port: row.endpoint_port,
@@ -800,6 +836,8 @@ async function submit() {
       generate_psk: form.generate_psk,
       route_mode: form.route_mode,
       client_allowed_ips: form.client_allowed_ips,
+      lan_policy: form.lan_policy,
+      lan_targets: form.lan_targets,
       auto_address: true,
       allowed_ips: form.allowed_ips,
       endpoint_host: form.endpoint_host,

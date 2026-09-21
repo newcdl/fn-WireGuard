@@ -111,6 +111,23 @@ func (b *mockBackend) DeleteForeignInterface(name string) ([]string, error) {
 }
 
 // NATStatus 演示模式下不产生真实的转发规则。
+// LANDevices 演示模式下给一台样板内网。
+//
+// 内存后端读不到真实邻居表，但拓扑图在演示环境里也应该有东西可看；
+// Demo 标记会一路传到界面，明说这是样板数据而不是家里的机器。
+func (b *mockBackend) LANDevices(ctx context.Context) (*model.LANReport, error) {
+	return &model.LANReport{
+		Demo:     true,
+		Readable: true,
+		Devices: []model.LANDevice{
+			{IP: "192.168.1.1", MAC: "aa:bb:cc:00:00:01", Name: "主路由", Interface: "eth0", State: "reachable"},
+			{IP: "192.168.1.20", MAC: "aa:bb:cc:00:00:20", Name: "书房的电脑", Interface: "eth0", State: "reachable"},
+			{IP: "192.168.1.31", MAC: "aa:bb:cc:00:00:31", Interface: "eth0", State: "stale"},
+			{IP: "192.168.1.40", MAC: "aa:bb:cc:00:00:40", Name: "打印机", Interface: "eth0", State: "stale"},
+		},
+	}, nil
+}
+
 func (b *mockBackend) NATStatus() model.NATStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()

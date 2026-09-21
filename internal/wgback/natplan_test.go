@@ -6,6 +6,8 @@ package wgback
 import (
 	"strings"
 	"testing"
+
+	"fnwg/internal/model"
 )
 
 // 本文件是「内网访问（NAT 转发）」的回归测试。
@@ -445,5 +447,259 @@ func TestPlanNATSurfacesWANReason(t *testing.T) {
 	}
 	if plan.SkipReason != custom {
 		t.Fatalf("应原样透出数据面给出的原因，实际: %s", plan.SkipReason)
+	}
+}
+
+// TestPlanNATIncludesPeerSiteSubnets 站点到站点互联：对端站点网段要与隧道网段一起放行。
+//
+// 少了这一项的现场表现是「隧道通、对端 NAS 自己能访问本机内网，但对端局域网里的机器访问不了」——
+// 对端主机的源地址是它自己的局域网网段，不落在本连接的隧道网段里。
+func TestPlanNATIncludesPeerSiteSubnets(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.10.0.1/24"},
+		PeerSubnets:   []string{"192.168.2.0/24"},
+		WANInterfaces: []string{"end0"},
+		HostNetworks:  []string{"192.168.3.0/24"},
+	})
+	if !plan.Enable {
+		t.Fatalf("应启用转发，实际: %+v", plan)
+	}
+	want := []string{"10.10.0.0/24", "192.168.2.0/24"}
+	if len(plan.Sources) != len(want) {
+		t.Fatalf("源网段应包含隧道与对端站点两类，实际: %+v", plan.Sources)
+	}
+	for i := range want {
+		if plan.Sources[i] != want[i] {
+			t.Fatalf("源网段应为 %v，实际: %+v", want, plan.Sources)
+		}
+	}
+	// 指纹要能体现对端站点网段的变化，否则改了对端网段不会重建规则
+	other := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.10.0.1/24"},
+		PeerSubnets:   []string{"192.168.9.0/24"},
+		WANInterfaces: []string{"end0"},
+		HostNetworks:  []string{"192.168.3.0/24"},
+	})
+	if other.Fingerprint() == plan.Fingerprint() {
+		t.Fatal("对端站点网段不同时指纹必须不同，否则规则不会重建")
+	}
+}
+
+// TestPlanNATPeerSiteSubnetOverlapRejected 对端站点网段与 NAS 现有网段重叠时拒绝转发：
+// 那种配置会把本机内网与对端内网搅在一起，提示里必须说清是「对端」那一边要改。
+func TestPlanNATPeerSiteSubnetOverlapRejected(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.10.0.0/24"},
+		PeerSubnets:   []string{"192.168.3.0/24"},
+		WANInterfaces: []string{"end0"},
+		HostNetworks:  []string{"192.168.3.0/24"},
+	})
+	if plan.Enable {
+		t.Fatal("与主机网段重叠时不得启用转发")
+	}
+	if !strings.Contains(plan.SkipReason, "对端站点网段") {
+		t.Fatalf("应指出是对端站点网段重叠（改法与隧道网段不同），实际: %s", plan.SkipReason)
+	}
+}
+
+// TestPeerSiteSubnetsFromSpecs 从连接期望态里挑出对端站点网段：
+// 落在隧道内的（对端自己的地址）不算，默认路由写法一律丢弃，IPv6 跳过，重复只留一份。
+func TestPeerSiteSubnetsFromSpecs(t *testing.T) {
+	spec := model.InterfaceSpec{
+		Addresses: []string{"10.10.0.1/24"},
+		Peers: []model.PeerSpec{
+			{Name: "nas-b", AllowedIPs: []string{"10.10.0.2/32", "192.168.2.0/24", "192.168.2.0/24"}},
+			{Name: "nas-c", AllowedIPs: []string{"10.10.0.3/32", "172.16.5.0/24", "fd00::/64", "0.0.0.0/0"}},
+		},
+	}
+	got := peerSiteSubnets(spec, []string{"10.10.0.0/24"})
+	want := []string{"192.168.2.0/24", "172.16.5.0/24"}
+	if len(got) != len(want) {
+		t.Fatalf("应对端站点网段为 %v，实际: %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("应对端站点网段为 %v，实际: %v", want, got)
+		}
+	}
+	// 没有设备时为空；设备只有隧道地址时同样为空（普通设备不该被当成站点）
+	if len(peerSiteSubnets(model.InterfaceSpec{Peers: nil}, []string{"10.10.0.0/24"})) != 0 {
+		t.Fatal("没有设备时不应产生站点网段")
+	}
+	plain := model.InterfaceSpec{Peers: []model.PeerSpec{{AllowedIPs: []string{"10.10.0.7/32"}}}}
+	if len(peerSiteSubnets(plain, []string{"10.10.0.0/24"})) != 0 {
+		t.Fatal("只有隧道地址的普通设备不应产生站点网段")
+	}
+}
+
+// TestPlanNATNeverForwardsPeerDefaultRoute 兜底：即使数据里混进 0.0.0.0/0，
+// 也不能把它当站点网段放行（那等于把本机内网整个暴露给对端）。
+func TestPlanNATNeverForwardsPeerDefaultRoute(t *testing.T) {
+	spec := model.InterfaceSpec{
+		Addresses: []string{"10.10.0.1/24"},
+		Peers:     []model.PeerSpec{{AllowedIPs: []string{"0.0.0.0/0"}}},
+	}
+	if got := peerSiteSubnets(spec, []string{"10.10.0.0/24"}); len(got) != 0 {
+		t.Fatalf("默认路由写法必须被丢弃，实际: %v", got)
+	}
+}
+
+// TestPlanPeerTargetRules 按设备限制内网目标：白名单与拒绝两组纯数据都要能逐条核对。
+//
+// 顺序即语义：白名单在前、拒绝在后，且两者都必须排在网段级放行之前
+// （nftables 以第一条匹配的规则为终局判定）。这里核对的是「下发了什么」，
+// 顺序由 nat.go 的调用位置保证，另有 TestPlanPeerTargetOrder 用纯数据钉住相对顺序。
+func TestPlanPeerTargetRules(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.10.0.0/24"},
+		WANInterfaces: []string{"end0"},
+		HostNetworks:  []string{"192.168.1.0/24"},
+		PeerRestrictions: []PeerRestriction{
+			{Policy: model.LANPolicyRestrict, DeviceAddresses: []string{"10.10.0.5/32"},
+				Targets: []string{"192.168.1.10:445", "192.168.1.0/24", "192.168.1.10:445"}},
+			{Policy: model.LANPolicyDeny, DeviceAddresses: []string{"10.10.0.6/32"}},
+		},
+	})
+	if !plan.Enable {
+		t.Fatalf("应启用转发：%+v", plan)
+	}
+	// 白名单按稳定顺序输出（排序保证指纹稳定），重复目标只留一份
+	wantAllow := []string{"allow:10.10.0.5/32>192.168.1.0/24", "allow:10.10.0.5/32>192.168.1.10:445"}
+	if len(plan.PeerAllow) != 2 {
+		t.Fatalf("白名单应两条（去重后），实际：%+v", plan.PeerAllow)
+	}
+	for i := range wantAllow {
+		if plan.PeerAllow[i].Key() != wantAllow[i] {
+			t.Fatalf("白名单第 %d 条应为 %s，实际 %s", i, wantAllow[i], plan.PeerAllow[i].Key())
+		}
+	}
+	// 两台受限设备各自都要有「访问内网各网段」的拒绝规则
+	if len(plan.PeerDeny) != 2 {
+		t.Fatalf("两台受限设备应各有一条拒绝规则，实际：%+v", plan.PeerDeny)
+	}
+	for i, pair := range plan.PeerDeny {
+		if pair[1] != "192.168.1.0/24" {
+			t.Fatalf("第 %d 条拒绝的目标应为内网网段，实际 %v", i, pair)
+		}
+	}
+}
+
+// TestPlanPeerTargetOrder 白名单必须排在拒绝之前：反了的话「允许的目标」也会被挡住。
+func TestPlanPeerTargetOrder(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.10.0.0/24"},
+		WANInterfaces: []string{"end0"},
+		HostNetworks:  []string{"192.168.1.0/24"},
+		PeerRestrictions: []PeerRestriction{
+			{Policy: model.LANPolicyRestrict, DeviceAddresses: []string{"10.10.0.5/32"}, Targets: []string{"192.168.1.10"}},
+		},
+	})
+	if len(plan.PeerAllow) != 1 || len(plan.PeerDeny) != 1 {
+		t.Fatalf("应各有一条，实际 allow=%+v deny=%+v", plan.PeerAllow, plan.PeerDeny)
+	}
+	// 纯数据层面无法表达顺序，这里固定住「两组都不为空」这个前提：
+	// 只要两组都在，nat.go 就按 allow → deny 的顺序写入（见 addPeerTargetRules）。
+	if plan.PeerAllow[0].Src != plan.PeerDeny[0][0] {
+		t.Fatalf("白名单与拒绝应针对同一台设备，实际 %s / %s", plan.PeerAllow[0].Src, plan.PeerDeny[0][0])
+	}
+}
+
+// TestPlanPeerTargetsOnlyWhenLANEnabled 连接级开关没开时不产生任何按设备规则：
+// 那时本来就什么都访问不了，再下发拒绝规则只会让诊断页出现无法解释的规则。
+func TestPlanPeerTargetsOnlyWhenLANEnabled(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       false,
+		SourceSubnets: []string{"10.10.0.0/24"},
+		WANInterfaces: []string{"end0"},
+		HostNetworks:  []string{"192.168.1.0/24"},
+		PeerRestrictions: []PeerRestriction{
+			{Policy: model.LANPolicyDeny, DeviceAddresses: []string{"10.10.0.6/32"}},
+		},
+	})
+	if len(plan.PeerAllow) != 0 || len(plan.PeerDeny) != 0 {
+		t.Fatalf("开关没开时不该有按设备规则：%+v / %+v", plan.PeerAllow, plan.PeerDeny)
+	}
+}
+
+// TestPlanPeerTargetsFingerprint 指纹要跟着规则内容走：
+// 改了一台设备的允许目标却不重建规则，用户会看到「改了没生效」。
+func TestPlanPeerTargetsFingerprint(t *testing.T) {
+	base := NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.10.0.0/24"},
+		WANInterfaces: []string{"end0"},
+		HostNetworks:  []string{"192.168.1.0/24"},
+		PeerRestrictions: []PeerRestriction{
+			{Policy: model.LANPolicyRestrict, DeviceAddresses: []string{"10.10.0.5/32"}, Targets: []string{"192.168.1.10", "192.168.1.11"}},
+		},
+	}
+	one := PlanNAT(base)
+	// 顺序不同不该引起重建
+	reordered := base
+	reordered.PeerRestrictions = []PeerRestriction{
+		{Policy: model.LANPolicyRestrict, DeviceAddresses: []string{"10.10.0.5/32"}, Targets: []string{"192.168.1.11", "192.168.1.10"}},
+	}
+	if PlanNAT(reordered).Fingerprint() != one.Fingerprint() {
+		t.Fatal("目标顺序变化不该引起规则重建")
+	}
+	// 内容变化必须引起重建
+	changed := base
+	changed.PeerRestrictions = []PeerRestriction{
+		{Policy: model.LANPolicyRestrict, DeviceAddresses: []string{"10.10.0.5/32"}, Targets: []string{"192.168.1.10"}},
+	}
+	if PlanNAT(changed).Fingerprint() == one.Fingerprint() {
+		t.Fatal("目标内容变化必须引起规则重建")
+	}
+	// 策略从 restrict 改成 deny 也要变
+	denied := base
+	denied.PeerRestrictions = []PeerRestriction{
+		{Policy: model.LANPolicyDeny, DeviceAddresses: []string{"10.10.0.5/32"}},
+	}
+	if PlanNAT(denied).Fingerprint() == one.Fingerprint() {
+		t.Fatal("策略变化必须引起规则重建")
+	}
+}
+
+// TestPeerRestrictionsFromSpecs 从连接期望态里收集约束：
+// 源只取「落在隧道网段内」的地址（对端站点网段不是设备本身），inherit 的设备不进这份清单。
+func TestPeerRestrictionsFromSpecs(t *testing.T) {
+	specs := []model.InterfaceSpec{
+		{
+			Up:        true,
+			Addresses: []string{"10.10.0.1/24"},
+			Peers: []model.PeerSpec{
+				{Name: "restricted", AllowedIPs: []string{"10.10.0.5/32", "192.168.9.0/24"},
+					LANPolicy: model.LANPolicyRestrict, LANTargets: []string{"192.168.1.10:445"}},
+				{Name: "denied", AllowedIPs: []string{"10.10.0.6/32"}, LANPolicy: model.LANPolicyDeny},
+				{Name: "inherit", AllowedIPs: []string{"10.10.0.7/32"}, LANPolicy: model.LANPolicyInherit},
+			},
+		},
+		{
+			// 没启用的连接里的设备不参与（它的规则也不该下发）
+			Up:        false,
+			Addresses: []string{"10.11.0.1/24"},
+			Peers: []model.PeerSpec{
+				{AllowedIPs: []string{"10.11.0.5/32"}, LANPolicy: model.LANPolicyDeny},
+			},
+		},
+	}
+	got := peerRestrictions(specs, []string{"10.10.0.0/24", "10.11.0.0/24"})
+	if len(got) != 2 {
+		t.Fatalf("应收集到两台受限设备（inherit 与未启用的不算），实际：%+v", got)
+	}
+	if got[0].Policy != model.LANPolicyRestrict || len(got[0].DeviceAddresses) != 1 ||
+		got[0].DeviceAddresses[0] != "10.10.0.5/32" {
+		t.Fatalf("受限设备的源应只取隧道内地址：%+v", got[0])
+	}
+	if len(got[0].Targets) != 1 || got[0].Targets[0] != "192.168.1.10:445" {
+		t.Fatalf("目标应原样带上：%+v", got[0].Targets)
+	}
+	if got[1].Policy != model.LANPolicyDeny {
+		t.Fatalf("禁止访问的设备策略应保留：%+v", got[1])
 	}
 }

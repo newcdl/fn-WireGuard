@@ -85,6 +85,8 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.With(requirePerm(model.PermUserManage)).Post("/auth/security-code", s.handleIssueSecurityCode)
 
 		r.Get("/overview", s.handleOverview)
+		// 网络拓扑（只读）：以本机为中心，含内网设备、隧道设备与对端 NAS。
+		r.Get("/topology", s.handleTopology)
 		r.Get("/health", s.handleHealth)
 
 		// NAS 系统网络自检与修复（只处理本应用造成的残留，不触碰系统设置）
@@ -93,6 +95,12 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/cleanup", s.handleNetworkCleanup)
 		// 清理「不是本应用创建的」WireGuard 网卡（疑似历史残留，需二次确认）
 		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/foreign-interface/delete", s.handleDeleteForeignInterface)
+
+		// 多 NAS 互联（站点到站点）：一端生成邀请、另一端导入即配对。
+		// 生成即在本端建好连接与对端条目（隧道地址/端口走既有的自动分配），
+		// 两端的准入地址与通行范围都由同一份数据推导，免得两头手工填错一条就「不通」。
+		r.With(requirePerm(model.PermIfaceWrite)).Post("/interconnect", s.handleCreateInterconnect)
+		r.With(requirePerm(model.PermIfaceWrite)).Post("/interconnect/import", s.handleImportInterconnect)
 
 		// 配置漂移巡检：状态与「此刻的判定」只读；改计划与立即巡检要写权限。
 		// 判定在服务层只有一份实现（界面与定期报告读同一个函数），执行在代理进程 ——

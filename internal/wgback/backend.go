@@ -67,6 +67,8 @@ type Backend interface {
 	ManagedInterfaces() []string
 	// Inspect 网络自检（只读）。
 	Inspect(ctx context.Context) (model.NetworkReport, error)
+	// LANDevices 读内网里的设备清单（只读，来自内核邻居表）。
+	LANDevices(ctx context.Context) (*model.LANReport, error)
 	// DeleteForeignInterface 删除一个**不属于本应用**的 WireGuard 接口。
 	//
 	// 这是全项目唯一一处允许触碰非受管对象的能力，因此实现必须自校验：

@@ -22,8 +22,10 @@ const (
 	MethodHealth          = "health"
 	MethodDeleteInterface = "iface.delete"
 	MethodNetInspect      = "net.inspect"
-	MethodNetRepair       = "net.repair"
-	MethodNetCleanup      = "net.cleanup"
+	// MethodLANDevices 读内网里的设备清单（只读，来自内核邻居表）。
+	MethodLANDevices = "lan.devices"
+	MethodNetRepair  = "net.repair"
+	MethodNetCleanup = "net.cleanup"
 	// MethodNetDeleteForeign 删除一个不属于本应用的 WireGuard 网卡（疑似残留）。
 	// 这是白名单里唯一会触碰非受管对象的方法，代理侧会再次校验网卡类型。
 	MethodNetDeleteForeign = "net.delete_foreign_iface"
@@ -158,6 +160,8 @@ type Core interface {
 	DeleteInterface(ctx context.Context, name string) error
 	// InspectNetwork 网络自检（只读）。
 	InspectNetwork(ctx context.Context) (model.NetworkReport, error)
+	// LANDevices 读内网里的设备清单（只读，来自内核邻居表）。
+	LANDevices(ctx context.Context) (*model.LANReport, error)
 	// RepairNetwork 清除本应用残留在系统上的危险路由。
 	RepairNetwork(ctx context.Context) ([]string, error)
 	// CleanupNetwork 删除本应用创建的全部内核对象（停用/卸载使用）。

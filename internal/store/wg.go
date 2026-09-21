@@ -199,7 +199,8 @@ func (s *Store) InterfaceNames(ctx context.Context) (map[string]bool, error) {
 const peerCols = `p.id,p.interface_id,IFNULL(i.name,''),p.name,p.public_key,p.preshared_key,p.client_priv,
 	IFNULL(p.route_mode,'lan'),IFNULL(p.client_ips,'[]'),p.endpoint_host,
 	p.endpoint_port,p.allowed_ips,p.keepalive,p.group_tag,p.remark,p.quota_rx,p.quota_tx,p.expire_at,p.enabled,
-	p.created_at,p.updated_at,IFNULL(p.config_fp,''),IFNULL(p.disabled_reason,'')`
+	p.created_at,p.updated_at,IFNULL(p.config_fp,''),IFNULL(p.disabled_reason,''),
+	IFNULL(p.lan_policy,'inherit'),IFNULL(p.lan_targets,'[]')`
 
 const peerFrom = ` FROM wg_peer p LEFT JOIN wg_interface i ON i.id = p.interface_id`
 
@@ -214,16 +215,24 @@ func (s *Store) scanPeer(sc interface{ Scan(...any) error }) (*model.Peer, error
 		enabled   int
 		createdAt string
 		updatedAt string
+		lanPolicy string
+		lanTarget string
 	)
 	err := sc.Scan(&p.ID, &p.InterfaceID, &p.InterfaceName, &p.Name, &p.PublicKey, &psk, &clientKey,
 		&p.RouteMode, &clientIPs, &p.EndpointHost,
 		&p.EndpointPort, &allowed, &p.Keepalive, &p.GroupTag, &p.Remark, &p.QuotaRx, &p.QuotaTx, &expireAt,
-		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint, &p.DisabledReason)
+		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint, &p.DisabledReason,
+		&lanPolicy, &lanTarget)
 	if err != nil {
 		return nil, err
 	}
 	p.AllowedIPs = jsonStrings(allowed)
 	p.ClientAllowedIPs = jsonStrings(clientIPs)
+	p.LANTargets = jsonStrings(lanTarget)
+	p.LANPolicy = lanPolicy
+	if p.LANPolicy == "" {
+		p.LANPolicy = model.LANPolicyInherit
+	}
 	if p.RouteMode == "" {
 		p.RouteMode = model.RouteModeLAN
 	}
@@ -296,11 +305,11 @@ func (s *Store) CreatePeer(ctx context.Context, p *model.Peer) error {
 	p.CreatedAt, p.UpdatedAt = now, now
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO wg_peer(interface_id,name,public_key,preshared_key,client_priv,route_mode,client_ips,
-		 endpoint_host,endpoint_port,allowed_ips,
+		 endpoint_host,endpoint_port,allowed_ips,lan_policy,lan_targets,
 		 keepalive,group_tag,remark,quota_rx,quota_tx,expire_at,enabled,disabled_reason,config_fp,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
-		p.EndpointHost, p.EndpointPort, mustJSON(p.AllowedIPs),
+		p.EndpointHost, p.EndpointPort, mustJSON(p.AllowedIPs), lanPolicyArg(p.LANPolicy), mustJSON(p.LANTargets),
 		p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx, expireArg(p.ExpireAt), b2i(p.Enabled),
 		p.DisabledReason, p.ConfigFingerprint, ts(now), ts(now))
 	if err != nil {
@@ -308,6 +317,14 @@ func (s *Store) CreatePeer(ctx context.Context, p *model.Peer) error {
 	}
 	p.ID, _ = res.LastInsertId()
 	return nil
+}
+
+// lanPolicyArg 归一化策略取值：空值一律落成 inherit（与升级前行为一致）。
+func lanPolicyArg(v string) string {
+	if v == "" {
+		return model.LANPolicyInherit
+	}
+	return v
 }
 
 func expireArg(t *time.Time) any {
@@ -339,12 +356,12 @@ func (s *Store) UpdatePeer(ctx context.Context, p *model.Peer) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE wg_peer SET interface_id=?,name=?,public_key=?,preshared_key=?,client_priv=?,route_mode=?,client_ips=?,
 		 endpoint_host=?,endpoint_port=?,
-		 allowed_ips=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,disabled_reason=?,
+		 allowed_ips=?,lan_policy=?,lan_targets=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,disabled_reason=?,
 		 config_fp=?,updated_at=?
 		 WHERE id=?`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
 		p.EndpointHost, p.EndpointPort,
-		mustJSON(p.AllowedIPs), p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx,
+		mustJSON(p.AllowedIPs), lanPolicyArg(p.LANPolicy), mustJSON(p.LANTargets), p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx,
 		expireArg(p.ExpireAt), b2i(p.Enabled), p.DisabledReason, p.ConfigFingerprint, ts(now), p.ID)
 	if err != nil {
 		return err
