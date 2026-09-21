@@ -188,6 +188,18 @@ func (s *Server) dispatch(conn net.Conn, req *Request) Response {
 		resp.OK = true
 		resp.Result = mustJSON(map[string]any{"actions": actions})
 		return resp
+	case MethodInspectRun:
+		var p InspectRunParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(resp, errors.New("参数解析失败"))
+		}
+		res, err := s.handler.RunInspect(ctx, p.UserID, p.Username, p.SrcIP)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(res)
+		return resp
 	case MethodBackupRun:
 		var p BackupRunParams
 		if err := json.Unmarshal(req.Params, &p); err != nil {

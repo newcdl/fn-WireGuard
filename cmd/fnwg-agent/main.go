@@ -125,6 +125,13 @@ func main() {
 		GroupID:        sysutil.LookupGID(cfg.Group),
 	}, logger))
 
+	// 配置漂移巡检：挂在同一根常驻循环旁（见 reconcile.Inspector）。
+	//
+	// 判定与落库都放在代理进程：巡检要读内核里的规则与路由，还要读通知与备份的状态，
+	// 这些事实都在这一侧；界面只读报告，不自己判一遍（免得两边口径不一致）。
+	local := core.NewLocal(engine)
+	engine.SetInspector(service.New(st, local, logger, cfg.Version))
+
 	// 采样与收敛循环：进程启动即执行一次全量收敛，实现重启自恢复。
 	go engine.Run(ctx)
 
@@ -146,7 +153,7 @@ func main() {
 		}
 	}()
 
-	srv := agentapi.NewServer(cfg.SocketPath, cfg.Group, core.NewLocal(engine), logger)
+	srv := agentapi.NewServer(cfg.SocketPath, cfg.Group, local, logger)
 	if err := srv.Listen(); err != nil {
 		logger.Error("监听 socket 失败", "err", err)
 		os.Exit(1)

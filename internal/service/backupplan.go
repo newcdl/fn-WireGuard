@@ -65,10 +65,6 @@ const (
 	// 只能删自己写下的（与「不接管别人的网卡」同一条原则）。
 	BackupPlanFilePrefix = "fn-wireguard-backup-"
 	BackupPlanFileSuffix = ".json"
-
-	// FreqDaily / FreqWeekly 执行频率。
-	FreqDaily  = "daily"
-	FreqWeekly = "weekly"
 )
 
 // planMu 串行化执行与清理。
@@ -197,28 +193,23 @@ func LoadBackupPlan(ctx context.Context, st *store.Store) BackupPlan {
 	if plan.Keep < MinBackupKeep || plan.Keep > MaxBackupKeep {
 		plan.Keep = DefaultBackupKeep
 	}
-	if plan.Freq != FreqWeekly {
-		plan.Freq = FreqDaily
-	}
-	if _, _, ok := parseClock(plan.At); !ok {
-		plan.At = DefaultBackupPlan().At
-	}
-	if plan.Weekday < 1 || plan.Weekday > 7 {
-		plan.Weekday = 1
-	}
+	sched := plan.schedule().Normalize(DefaultBackupPlan().schedule())
+	plan.Freq, plan.At, plan.Weekday = sched.Freq, sched.At, sched.Weekday
 	return plan
+}
+
+// schedule 取出配置里的日程部分。
+//
+// 日程规则（每天/每周、几点、周几）只有一份实现，见 Schedule ——
+// 计划备份与配置漂移巡检共用它，免得两处各差一点。
+func (p BackupPlan) schedule() Schedule {
+	return Schedule{Freq: p.Freq, At: p.At, Weekday: p.Weekday}
 }
 
 // Validate 校验结构字段（与是否启用无关，执行前也要过一遍）。
 func (p BackupPlan) Validate() error {
-	if p.Freq != FreqDaily && p.Freq != FreqWeekly {
-		return fmt.Errorf("执行频率只能是「每天」或「每周」")
-	}
-	if _, _, ok := parseClock(p.At); !ok {
-		return fmt.Errorf("执行时刻要写成 24 小时制的 HH:MM，例如 03:30")
-	}
-	if p.Freq == FreqWeekly && (p.Weekday < 1 || p.Weekday > 7) {
-		return fmt.Errorf("每周执行要指定星期几（1=周一 … 7=周日）")
+	if err := p.schedule().Validate(); err != nil {
+		return err
 	}
 	if p.Keep < MinBackupKeep || p.Keep > MaxBackupKeep {
 		return fmt.Errorf("保留份数需要在 %d 到 %d 之间", MinBackupKeep, MaxBackupKeep)
@@ -338,90 +329,20 @@ func insideAnyDir(path string, dirs []string) bool {
 	return false
 }
 
-// parseClock 解析 HH:MM，返回时、分与是否合法。
-func parseClock(v string) (int, int, bool) {
-	parts := strings.Split(strings.TrimSpace(v), ":")
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
-		return 0, 0, false
-	}
-	return h, m, true
-}
-
-// Due 判断此刻是否应当执行。
-//
-// 判据只有两条：① 上一个日程点在「计划生效」之后；② 最近一次执行早于那个日程点。
-// 这样不必为「NAS 关机错过时间」「改过时间」额外维护状态：开机后一旦发现上一场日程
-// 还没做过，就补一次（少一份备份比晚一点更值得避免）。而刚打开开关那次不算错过
-// （基准见 SettingBackupPlanSince），否则用户会被立刻多备一份。
+// Due 判断此刻是否应当执行（日程规则本身见 Schedule）。
 func (p BackupPlan) Due(now, lastAt, since time.Time) bool {
 	if !p.Enabled {
 		return false
 	}
-	due, ok := p.lastDue(now)
-	if !ok {
-		return false
-	}
-	if !since.IsZero() && !due.After(since) {
-		return false
-	}
-	return lastAt.IsZero() || lastAt.Before(due)
-}
-
-// lastDue 返回「不晚于 now 的最近一个日程点」。
-func (p BackupPlan) lastDue(now time.Time) (time.Time, bool) {
-	h, m, ok := parseClock(p.At)
-	if !ok {
-		return time.Time{}, false
-	}
-	cand := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
-	if p.Freq == FreqWeekly {
-		// 1=周一 → time.Monday；7=周日 → 7%7=0 → time.Sunday。
-		wd := time.Weekday(p.Weekday % 7)
-		back := (int(now.Weekday()) - int(wd) + 7) % 7
-		cand = cand.AddDate(0, 0, -back)
-		if cand.After(now) {
-			cand = cand.AddDate(0, 0, -7)
-		}
-		return cand, true
-	}
-	if cand.After(now) {
-		cand = cand.AddDate(0, 0, -1)
-	}
-	return cand, true
+	return p.schedule().Due(now, lastAt, since)
 }
 
 // NextDue 返回下一次执行时间，供界面显示「下一次：明天 03:30」。
-//
-// 注意它只回答「日程上的下一个点」，不代表「此刻不会补跑」：
-// 若已经错过了上一场日程，下一次检查（最多 5 分钟后）就会立刻执行。
 func (p BackupPlan) NextDue(now time.Time) (time.Time, bool) {
 	if !p.Enabled {
 		return time.Time{}, false
 	}
-	h, m, ok := parseClock(p.At)
-	if !ok {
-		return time.Time{}, false
-	}
-	cand := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
-	switch p.Freq {
-	case FreqWeekly:
-		wd := time.Weekday(p.Weekday % 7)
-		ahead := (int(wd) - int(now.Weekday()) + 7) % 7
-		cand = cand.AddDate(0, 0, ahead)
-		if !cand.After(now) {
-			cand = cand.AddDate(0, 0, 7)
-		}
-	default:
-		if !cand.After(now) {
-			cand = cand.AddDate(0, 0, 1)
-		}
-	}
-	return cand, true
+	return p.schedule().NextDue(now)
 }
 
 // Describe 用一句话描述配置，供审计与日志使用。
@@ -429,25 +350,12 @@ func (p BackupPlan) Describe() string {
 	if !p.Enabled {
 		return "已关闭"
 	}
-	when := "每天 " + p.At
-	if p.Freq == FreqWeekly {
-		when = "每周" + weekdayLabel(p.Weekday) + " " + p.At
-	}
 	dir := strings.TrimSpace(p.Dir)
 	if dir == "" {
 		// 与界面上的说法保持一致，审计里也一眼能看懂
 		dir = "应用自己的备份目录"
 	}
-	return fmt.Sprintf("%s · 保留 %d 份 · 目标 %s", when, p.Keep, dir)
-}
-
-// weekdayLabel 把 1..7 转成中文星期。
-func weekdayLabel(n int) string {
-	labels := [...]string{"", "一", "二", "三", "四", "五", "六", "日"}
-	if n < 1 || n > 7 {
-		return ""
-	}
-	return labels[n]
+	return fmt.Sprintf("%s · 保留 %d 份 · 目标 %s", p.schedule().Describe(), p.Keep, dir)
 }
 
 // Status 汇总计划备份的当前状态。

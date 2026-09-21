@@ -27,6 +27,11 @@ const (
 	// MethodNetDeleteForeign 删除一个不属于本应用的 WireGuard 网卡（疑似残留）。
 	// 这是白名单里唯一会触碰非受管对象的方法，代理侧会再次校验网卡类型。
 	MethodNetDeleteForeign = "net.delete_foreign_iface"
+	// MethodInspectRun 立即执行一次配置漂移巡检。
+	//
+	// 巡检要读内核里的规则与路由，还要读通知与备份的状态：这些事实都在代理侧，
+	// 判定也只有一份实现（就在代理进程里），界面进程只显示结论。
+	MethodInspectRun = "inspect.run"
 	// MethodBackupRun 立即执行一次计划备份。
 	// 写授权目录需要特权身份：界面进程（fnwg）对用户授权的共享文件夹没有写权限。
 	MethodBackupRun = "backup.run"
@@ -73,6 +78,27 @@ type BackupRunParams struct {
 	UserID   int64  `json:"user_id"`
 	Username string `json:"username"`
 	SrcIP    string `json:"src_ip"`
+}
+
+// InspectRunParams 立即巡检查的参数。
+//
+// 执行者信息整份带过去：这次巡检要写审计，审计页得能看出「谁、从哪个 IP 手动跑了一次」。
+type InspectRunParams struct {
+	UserID   int64  `json:"user_id"`
+	Username string `json:"username"`
+	SrcIP    string `json:"src_ip"`
+}
+
+// InspectRunResult 是一次立即巡检的结果。
+//
+// 「查出了问题」是**正常结果**，不是协议错误：它要显示在界面上。
+// 协议层的 Error 只留给「巡检执行器本身不可用」。
+type InspectRunResult struct {
+	OK       bool `json:"ok"`
+	Errors   int  `json:"errors"`
+	Warnings int  `json:"warnings"`
+	// Summary 一句话结论（含前几条错误项的标题），供界面直接显示。
+	Summary string `json:"summary,omitempty"`
 }
 
 // BackupRunResult 是一次计划备份的执行结果。
@@ -139,6 +165,8 @@ type Core interface {
 	// DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡。
 	// 代理侧只允许删除 link 类型为 wireguard 的网卡，其余一律拒绝。
 	DeleteForeignInterface(ctx context.Context, name string) ([]string, error)
+	// RunInspect 立即执行一次配置漂移巡检（判定与落库都在代理进程里）。
+	RunInspect(ctx context.Context, userID int64, username, srcIP string) (InspectRunResult, error)
 	// RunBackupPlan 以特权身份立即执行一次计划备份。
 	RunBackupPlan(ctx context.Context, userID int64, username, srcIP string) (BackupRunResult, error)
 	// InspectBackupDir 检查备份目标目录并列出其中的副本。

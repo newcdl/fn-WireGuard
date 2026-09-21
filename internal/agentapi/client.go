@@ -185,6 +185,17 @@ func (c *Client) CleanupNetwork(ctx context.Context) ([]string, error) {
 	return out.Actions, nil
 }
 
+// RunInspect 让特权代理立即做一次配置漂移巡检。
+//
+// 由代理执行：巡检要读内核里的规则与路由，界面进程没有这个能力；
+// 判定也只在代理侧的那一份实现里，界面进程不自己判一遍。
+func (c *Client) RunInspect(ctx context.Context, userID int64, username, srcIP string) (InspectRunResult, error) {
+	var out InspectRunResult
+	params := InspectRunParams{UserID: userID, Username: username, SrcIP: srcIP}
+	err := c.call(ctx, MethodInspectRun, params, &out)
+	return out, err
+}
+
 // RunBackupPlan 让特权代理立即执行一次计划备份。
 //
 // 由代理写、不由界面进程写：目标目录是用户授权给应用的共享文件夹，

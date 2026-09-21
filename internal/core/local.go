@@ -56,6 +56,12 @@ func (l *Local) CleanupNetwork(ctx context.Context) ([]string, error) {
 	return l.Eng.CleanupNetwork(ctx)
 }
 
+// RunInspect 立即做一次配置漂移巡检（本实现即以本进程的身份执行）。
+func (l *Local) RunInspect(ctx context.Context, userID int64, username, srcIP string) (agentapi.InspectRunResult, error) {
+	ok, errs, warns, reason := l.Eng.RunInspectNow(ctx, userID, username, srcIP)
+	return agentapi.InspectRunResult{OK: ok, Errors: errs, Warnings: warns, Summary: reason}, nil
+}
+
 // RunBackupPlan 立即执行一次计划备份（本实现即以本进程的特权身份执行）。
 func (l *Local) RunBackupPlan(ctx context.Context, userID int64, username, srcIP string) (agentapi.BackupRunResult, error) {
 	ok, file, reason := l.Eng.RunBackupNow(ctx, userID, username, srcIP)

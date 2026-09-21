@@ -94,6 +94,14 @@ func (s *Server) mountAPI(r chi.Router) {
 		// 清理「不是本应用创建的」WireGuard 网卡（疑似历史残留，需二次确认）
 		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/foreign-interface/delete", s.handleDeleteForeignInterface)
 
+		// 配置漂移巡检：状态与「此刻的判定」只读；改计划与立即巡检要写权限。
+		// 判定在服务层只有一份实现（界面与定期报告读同一个函数），执行在代理进程 ——
+		// 这个接口只取结论，不自己判（详见 service.InspectChecks 的说明）。
+		r.Get("/system/inspect", s.handleInspectStatus)
+		r.Get("/system/inspect/checks", s.handleInspectChecks)
+		r.With(requirePerm(model.PermIfaceWrite)).Put("/system/inspect", s.handleSaveInspectPlan)
+		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/inspect/run", s.handleRunInspect)
+
 		// 事件通知：状态查询（含最近一次发送结果）与测试发送
 		r.Get("/system/notify", s.handleNotifyStatus)
 		r.With(requirePerm(model.PermUserManage)).Post("/system/notify/test", s.handleNotifyTest)

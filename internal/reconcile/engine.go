@@ -70,6 +70,21 @@ type BackupPlanRunner interface {
 	WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error)
 }
 
+// Inspector 是配置漂移巡检的执行器（实现见 service.RunInspectIfDue）。
+//
+// 与计划备份一样用接口：引擎只依赖存储与数据面，不 import 业务层。
+// 返回值同样刻意用原始值，引擎只需要知道「跑没跑、正不正常、一句话结论」。
+type Inspector interface {
+	// RunInspectIfDue 到点则巡检一次。
+	RunInspectIfDue(ctx context.Context, now time.Time) (ran, ok bool, reason string)
+	// RunInspectNow 立刻巡检一次（界面上点「立即巡检一次」），不看日程。
+	//
+	// 与按日程那一路落在同一个实现、同一个进程里：巡检的判定只有一份，
+	// 不会出现「界面说正常、报告说异常」这种两套口径
+	// （计划备份在这一点上连栽两轮，见 ROADMAP）。
+	RunInspectNow(ctx context.Context, userID int64, username, srcIP string) (ok bool, errors, warnings int, reason string)
+}
+
 type peerSample struct {
 	rx int64
 	tx int64
@@ -112,6 +127,8 @@ type Engine struct {
 	dnsOn bool
 	// backupPlan 计划备份执行器，由 cmd 层注入；为 nil 时跳过（命令行与测试环境）。
 	backupPlan BackupPlanRunner
+	// inspector 配置漂移巡检执行器，同样由 cmd 层注入；为 nil 时跳过。
+	inspector Inspector
 
 	trigger chan struct{}
 }
@@ -128,6 +145,17 @@ func (e *Engine) RunBackupNow(ctx context.Context, userID int64, username, srcIP
 		return false, "", errNoBackupRunner.Error()
 	}
 	return e.backupPlan.RunBackupNow(ctx, userID, username, srcIP)
+}
+
+// RunInspectNow 立刻做一次配置漂移巡检。
+//
+// 界面上点「立即巡检一次」走这里：巡检要读内核里的规则与路由，还要读通知与备份的状态，
+// 这些事实都在代理侧；判定也只有一份实现（就在代理进程里），界面进程不自己判一遍。
+func (e *Engine) RunInspectNow(ctx context.Context, userID int64, username, srcIP string) (bool, int, int, string) {
+	if e.inspector == nil {
+		return false, 0, 0, errNoInspector.Error()
+	}
+	return e.inspector.RunInspectNow(ctx, userID, username, srcIP)
 }
 
 // InspectBackupDir 检查备份目标目录并列出其中的副本。
@@ -159,6 +187,12 @@ func (e *Engine) WriteBackupCopy(ctx context.Context, dir string, backupID int64
 
 // errNoBackupRunner 表示引擎里没有注入计划备份执行器（命令行、测试环境）。
 var errNoBackupRunner = errors.New("后台服务未启用计划备份（请确认特权代理正在运行）")
+
+// errNoInspector 表示引擎里没有注入巡检执行器（命令行、测试环境）。
+var errNoInspector = errors.New("后台服务未启用配置漂移巡检（请确认特权代理正在运行）")
+
+// SetInspector 注入配置漂移巡检执行器。
+func (e *Engine) SetInspector(i Inspector) { e.inspector = i }
 
 // SetBackupPlanRunner 注入计划备份执行器。
 //
@@ -883,13 +917,15 @@ func (e *Engine) Run(ctx context.Context) {
 	reconc := time.NewTicker(ReconcileInterval)
 	quota := time.NewTicker(30 * time.Second)
 	cleanup := time.NewTicker(time.Hour)
-	backupPlan := time.NewTicker(BackupPlanCheckInterval)
+	// 同一根 ticker 驱动两个「按日程到点」的任务：计划备份与配置漂移巡检。
+	// 它们都只判断「到点没有」，5 分钟的检查间隔对准时性没有影响。
+	scheduled := time.NewTicker(BackupPlanCheckInterval)
 	defer func() {
 		sample.Stop()
 		reconc.Stop()
 		quota.Stop()
 		cleanup.Stop()
-		backupPlan.Stop()
+		scheduled.Stop()
 	}()
 
 	for {
@@ -911,8 +947,9 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-cleanup.C:
 			_ = e.store.PruneLogs(ctx, time.Now().AddDate(0, 0, -14))
 			_ = e.store.CleanExpiredSessions(ctx)
-		case <-backupPlan.C:
+		case <-scheduled.C:
 			e.runBackupPlan(ctx)
+			e.runInspect(ctx)
 		}
 	}
 }
@@ -940,5 +977,31 @@ func (e *Engine) runBackupPlan(ctx context.Context) {
 		Body: "这次没能把备份写到目标目录：" + reason +
 			"。修好之后可在「系统设置 → 备份还原 → 计划备份」里点「立即执行一次」补上。",
 		At: time.Now(),
+	})
+}
+
+// runInspect 到点做一次配置漂移巡检，发现了需要处理的问题时推送通知。
+//
+// 通知放在引擎侧发：通知队列只在代理进程里启动，而巡检也跑在那里。
+// 只推错误级结论（警告不推）：警告项往往长期存在（例如「疑似残留网卡」），
+// 每天推一条同样的提醒，用户很快就会把整个渠道屏蔽掉 —— 那比不推更糟。
+func (e *Engine) runInspect(ctx context.Context) {
+	if e.inspector == nil {
+		return
+	}
+	ran, ok, reason := e.inspector.RunInspectIfDue(ctx, time.Now())
+	if !ran {
+		return
+	}
+	if ok {
+		e.log.Info("巡检完成", "结论", reason)
+		return
+	}
+	e.log.Warn("巡检发现需要处理的问题", "结论", reason)
+	e.notifier.Notify(ctx, notify.Event{
+		Kind:  notify.KindInspectProblem,
+		Title: "配置漂移巡检发现需要处理的问题",
+		Body:  reason + "。详见「系统维护 → 配置漂移巡检」里的最近一次报告。",
+		At:    time.Now(),
 	})
 }

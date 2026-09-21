@@ -60,6 +60,12 @@ const (
 	// 备份失败特别值得推送：它不痛不痒，界面不看就发现不了，
 	// 而等到需要备份那天才发现「已经三个月没备份成功」，代价太大。
 	KindBackupFailed = "backup_failed"
+	// KindInspectProblem 配置漂移巡检发现了需要处理的问题。
+	//
+	// 巡检报出来的都是「安静地不工作」这一类：开关还是开的、界面看着正常，
+	// 直到真的需要它那天才发现早就失效了 —— 正是最值得主动说一声的故障。
+	// 只推错误级结论：警告（如「疑似残留网卡」）不推，免得每天一条同样的提醒被屏蔽。
+	KindInspectProblem = "inspect_problem"
 	// KindTest 测试消息，由用户在界面上主动触发。
 	KindTest = "test"
 )
@@ -197,6 +203,9 @@ func Kinds() []KindInfo {
 			Detail: "本应用发现并清理了自己遗留的路由或规则时推送（通常出现在升级、异常退出之后）"},
 		{Kind: KindBackupFailed, Group: GroupSystem, Label: "计划备份失败", Level: "warn",
 			Detail: "计划备份没写成功时推送（目标目录不可写、磁盘满、目录被删等）；同一天只推一次"},
+		{Kind: KindInspectProblem, Group: GroupSystem, Label: "巡检发现问题", Level: "warn",
+			Detail: "定期巡检查出「需要处理」的问题时推送（连接没工作、上网路线异常、计划备份失败等）；" +
+				"只是「待确认」的提示不推送，避免刷屏"},
 	}
 }
 

@@ -739,12 +739,48 @@ export const capabilityFields: Record<string, FieldMeta> = {
   },
 }
 
+/** 配置漂移巡检（定期体检）相关配置项 */
+export const inspectFields: Record<string, FieldMeta> = {
+  inspect_enabled: {
+    label: '启用配置漂移巡检',
+    hint: '按日程体检一次，把「和你的配置不一致」的地方写成一份报告',
+    what: '打开后按下面的日程做一次完整体检：后台服务、内核能力、系统上网路线、桌面入口、连接的在线状态、内网访问与设备隔离、访问控制是否互相矛盾、残留网卡、对外地址、通知、域名解析、计划备份，逐项给出结论。',
+    why: '这个应用启用的东西不少，而它们大多会「安静地失效」：系统升级、存储迁移、权限变化之后，界面上的开关还是开的，直到真的需要它那天才发现早就不工作了。',
+    effect:
+      '每次巡检写一份报告，保留最近若干份；发现「需要处理」的问题时，会按你的通知配置推送一条消息（只是「待确认」的提示不推送）。',
+    risk: '巡检只读：它只做检查、不做任何修改。要处理就按报告里的建议来 —— 多数能一键修复，或直接跳到对应页面。',
+  },
+  inspect_schedule: {
+    label: '巡检频率',
+    hint: '每天或每周的某个时刻执行一次',
+    what: '按 NAS 本地时间执行，可以选每天或每周的某一天。',
+    why: '想尽早知道就选每天；不想天天看报告就选每周。',
+    effect:
+      '若那一刻 NAS 没开机，开机后会自动补一次。默认 06:30，与计划备份（默认 03:30）错开，不抢同一分钟的磁盘。',
+  },
+  inspect_keep: {
+    label: '保留报告份数',
+    hint: '留着最近多少份报告，便于回看「什么时候开始不对劲的」',
+    what: '每次巡检写一份报告，这里决定最多留多少份（新的在前，超出的自动删掉最旧的）。',
+    why: '出问题的时候，最有用的信息往往是「上一次正常是什么时候」。',
+    effect: '报告很小（每份几 KB），按每天一次算，默认 14 份约等于两周。',
+  },
+  inspect_run: {
+    label: '立即巡检一次',
+    hint: '不等日程，马上体检一次并留下报告',
+    what: '立刻做一次与定期巡检完全相同的检查。',
+    why: '改过配置、重启过应用，或刚修好一个问题时，想马上确认现在的状态。',
+    effect: '结论立刻显示在本页，并作为最新一份报告记入历史；这一次不会触发推送通知。',
+  },
+}
+
 /** 配置说明大全的分组，供各处复用，避免重复维护 */
 export const allHelpGroups = [
   { key: 'iface', title: '我的连接（每条连接相当于一个安全通道）', fields: interfaceFields },
   { key: 'peer', title: '我的设备（手机、电脑等接入设备）', fields: peerFields },
   { key: 'setting', title: '系统设置', fields: settingFields },
   { key: 'backup', title: '备份与还原', fields: backupFields },
+  { key: 'inspect', title: '配置漂移巡检（定期体检）', fields: inspectFields },
   { key: 'user', title: '账号与权限', fields: userFields },
   { key: 'capability', title: '安全与可靠性机制（装好之后要会用）', fields: capabilityFields },
   { key: 'safety', title: 'NAS 系统网络安全说明', fields: netSafetyFields },

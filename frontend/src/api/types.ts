@@ -550,3 +550,60 @@ export interface BackupPlanStatus {
   /** 配置解析出来的实际落盘目录：目标选「应用自己的备份目录」时就是它 */
   resolved_dir: string
 }
+
+/**
+ * 巡检里的一条结论。
+ *
+ * level 为 ok 的是「检查且通过」的记录：界面上的异常清单会过滤掉它们，
+ * 但报告会留着 —— 一份只记异常的报告看不出「到底查了没有」。
+ */
+export interface InspectItem {
+  /** 稳定标识（界面据此去重，也用来对比「上次这条还在不在」） */
+  key: string
+  level: 'ok' | 'warning' | 'error'
+  title: string
+  detail: string
+  fix?: string
+  /** 能否在「系统维护」里一键修好 */
+  repairable?: boolean
+  /** 需要用户去别的页面处理时的目标路由名 */
+  to?: string
+}
+
+/** 一次巡检的完整结论 */
+export interface InspectReport {
+  at: string
+  /** 由用户点「立即巡检一次」触发（与按日程区分） */
+  manual?: boolean
+  items: InspectItem[]
+  errors: number
+  warnings: number
+  passed: number
+}
+
+/** 巡检计划：开关 + 日程 + 保留报告份数 */
+export interface InspectPlan {
+  enabled: boolean
+  freq: 'daily' | 'weekly'
+  at: string
+  /** 1=周一 … 7=周日（仅每周执行时有效） */
+  weekday: number
+  keep: number
+}
+
+/** 巡检的对外状态 */
+export interface InspectStatus {
+  plan: InspectPlan
+  /** 最近一次报告；从没跑过时为空 */
+  last?: InspectReport
+  /** 历史报告（含最近一次），新的在前 */
+  reports: InspectReport[]
+  since?: string
+  next_at?: string
+}
+
+/** 此刻的判定结论（顶栏与各页的异常清单读它，含通过项） */
+export interface InspectChecks {
+  at: string
+  items: InspectItem[]
+}

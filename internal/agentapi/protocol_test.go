@@ -33,6 +33,9 @@ type stubCore struct {
 	srcIP    string
 	userID   int64
 	copied   string
+
+	// 巡检：既要验证结论能不能原样回来，也要验证执行者信息有没有传过去（审计靠它）。
+	inspected bool
 }
 
 func (s *stubCore) Reconcile(context.Context) ([]string, error) { return nil, nil }
@@ -54,6 +57,11 @@ func (s *stubCore) DeleteForeignInterface(context.Context, string) ([]string, er
 func (s *stubCore) RunBackupPlan(_ context.Context, userID int64, username, srcIP string) (agentapi.BackupRunResult, error) {
 	s.userID, s.username, s.srcIP = userID, username, srcIP
 	return agentapi.BackupRunResult{OK: true, File: "written.json"}, nil
+}
+func (s *stubCore) RunInspect(_ context.Context, userID int64, username, srcIP string) (agentapi.InspectRunResult, error) {
+	s.inspected, s.userID, s.username, s.srcIP = true, userID, username, srcIP
+	return agentapi.InspectRunResult{OK: false, Errors: 2, Warnings: 3, Summary: "检查 13 项，2 项需要处理"},
+		nil
 }
 func (s *stubCore) InspectBackupDir(_ context.Context, dir string) (model.BackupDirInfo, error) {
 	s.dir = dir
@@ -104,6 +112,18 @@ func TestCoreRoundTrip(t *testing.T) {
 	}
 	if stub.userID != 42 || stub.username != "alice" || stub.srcIP != "10.0.0.9" {
 		t.Fatalf("执行者信息没传过去：%d/%s/%s", stub.userID, stub.username, stub.srcIP)
+	}
+
+	// 立即巡检：结论文案与各计数都要原样回来（界面直接显示它们）
+	ins, err := c.RunInspect(ctx, 7, "bob", "10.0.0.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ins.OK || ins.Errors != 2 || ins.Warnings != 3 || ins.Summary == "" {
+		t.Fatalf("巡检结果不对：%+v", ins)
+	}
+	if !stub.inspected || stub.userID != 7 || stub.username != "bob" || stub.srcIP != "10.0.0.8" {
+		t.Fatalf("巡检的执行者信息没传过去：%v %d/%s/%s", stub.inspected, stub.userID, stub.username, stub.srcIP)
 	}
 
 	// 目标目录实况
