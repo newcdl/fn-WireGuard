@@ -97,7 +97,11 @@
               <el-dropdown-menu>
                 <el-dropdown-item disabled>{{ myName }}（{{ roleLabel }}）</el-dropdown-item>
                 <el-dropdown-item command="help" divided>配置说明大全</el-dropdown-item>
-                <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                <!--
+                  飞牛账号（trim_uid > 0）在本应用里没有口令可改：它不是用密码登录的，
+                  身份由飞牛侧校验。给它一个「修改密码」只会让人以为自己漏设过密码。
+                -->
+                <el-dropdown-item v-if="!isGatewayAccount" command="password">修改密码</el-dropdown-item>
                 <el-dropdown-item command="totp">
                   二次验证
                   <el-tag
@@ -421,6 +425,13 @@ onUnmounted(() => {
   stopHealth()
   window.removeEventListener('keydown', onHotkey)
 })
+
+/**
+ * 当前是不是「飞牛账号」：它没有本应用口令（后端存的是格式非法的占位值）。
+ * 用于把「修改密码」这类本地口令操作收起来 —— 菜单里出现一个做不到的入口，
+ * 比没有这个入口更让人困惑。
+ */
+const isGatewayAccount = computed(() => !!session.user?.trim_uid)
 
 async function onCommand(cmd: string) {
   if (cmd === 'help') {

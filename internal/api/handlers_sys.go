@@ -46,6 +46,17 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 		"channel":           channelOf(r),
 		"gateway_available": gatewayAvailable(r),
 	}
+	// 本次请求带着可用的飞牛身份就把用户名报出来，**与是否已登录、是否已初始化都无关**：
+	//  - 登录页要在「刚退出登录」那一刻仍然显示「飞牛账号 XXX」这个入口，而那一刻恰好没有登录；
+	//  - 初始化页要在「还没建任何账号」时就知道能不能走「用飞牛账号登录」这条路 ——
+	//    早先这段写在初始化判断**之后**，于是全新安装时它永远拿不到身份，
+	//    初始化页明明是从飞牛桌面点进来的，却不给飞牛账号这个选项（真机反馈）。
+	if id, ok := gatewayIdentityIfTrusted(r); ok {
+		out["gateway_user"] = map[string]any{
+			"username": id.Username,
+			"is_admin": id.IsAdmin,
+		}
+	}
 	if !initialized {
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -55,15 +66,6 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 		out["user"] = u
 		out["identity"] = "session"
 	}
-	// 本次请求带着可用的飞牛身份就把用户名报出来，**与是否已登录无关**：
-	// 登录页要在「刚退出登录」那一刻仍然显示「飞牛账号 XXX」这个入口，
-	// 而那一刻恰好是没有登录的 —— 早先把它写在「未登录」分支里，退出后就再也拿不到了（真机反馈）。
-	if id, ok := gatewayIdentityIfTrusted(r); ok {
-		out["gateway_user"] = map[string]any{
-			"username": id.Username,
-			"is_admin": id.IsAdmin,
-		}
-	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -71,9 +73,15 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		// GatewayOnly 对应初始化页面上的第二个选项：不建本地口令账号，直接用飞牛账号登录。
+		GatewayOnly bool `json:"gateway_only"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if in.GatewayOnly {
+		s.setupGatewayOnly(w, r)
 		return
 	}
 	u, err := s.svc.Setup(r.Context(), in.Username, in.Password)
@@ -103,6 +111,51 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	if code, codeErr := s.svc.IssueSecurityCode(r.Context(), service.Actor{Username: in.Username}); codeErr != nil {
 		// 生成失败不该阻断初始化（账号已经建好了），但必须如实告知，
 		// 不能让用户以为自己已经拿到了后手。稍后可在「账号管理」里重新生成。
+		out["security_code_error"] = "安全码生成失败，请稍后到「账号管理」重新生成：" + codeErr.Error()
+	} else {
+		out["security_code"] = code
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// setupGatewayOnly 走「不建账号，直接用飞牛账号登录」这条路。
+//
+// 它不是绕开初始化，而是把「第一个管理员是谁」交给飞牛身份本身：发起这次初始化的
+// 那个飞牛账号就是第一份管理员（管理员 → 管理员、普通成员 → 只读，与此后每次飞牛登录
+// 完全同一套规则）。本地因此不落任何口令 —— 也就没有「用户的密码」这回事，
+// 登录页与账号管理里都不该再出现「修改密码」。
+//
+// 安全码照发：它是所有登录途径都失效时的唯一退路，必须在这一刻交给用户；
+// 而且此时账号已经建好（就是上面那份飞牛账号），应急登录有落点，不会发一枚无处可用的码。
+func (s *Server) setupGatewayOnly(w http.ResponseWriter, r *http.Request) {
+	// 只认通道可信的飞牛身份：端口入口上没有飞牛身份，也就谈不上「用飞牛账号登录」
+	id, ok := gatewayIdentityIfTrusted(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest,
+			"这次请求没有可用的飞牛身份，无法走「用飞牛账号登录」这条路：请从飞牛桌面点开本应用后初始化，或改用账号密码方式")
+		return
+	}
+	has, err := s.svc.HasUsers(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if has {
+		writeErr(w, http.StatusBadRequest, "系统已初始化，请直接登录")
+		return
+	}
+	step, err := s.svc.LoginAsGatewayUser(r.Context(), id.UID, id.Username, id.IsAdmin, r.UserAgent(), clientIP(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.setSessionCookie(w, step.Token)
+	out := map[string]any{
+		"user":        step.User,
+		"permissions": model.PermissionsOf(step.User.Role),
+	}
+	if code, codeErr := s.svc.IssueSecurityCode(r.Context(), service.Actor{Username: "setup"}); codeErr != nil {
+		// 与账号密码方式一致：生成失败不阻断初始化，但必须如实告知，不能让人以为拿到了后手
 		out["security_code_error"] = "安全码生成失败，请稍后到「账号管理」重新生成：" + codeErr.Error()
 	} else {
 		out["security_code"] = code

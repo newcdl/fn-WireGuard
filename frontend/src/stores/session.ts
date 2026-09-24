@@ -153,6 +153,28 @@ export const useSession = defineStore('session', {
     },
 
     /**
+     * 不建本地账号的初始化：把第一位管理员交给飞牛身份（对应后端 setupGatewayOnly）。
+     *
+     * 与 setup 的区别只有一点：本地不落任何口令。之后进入方式完全由飞牛账号承担，
+     * 所以账号管理里也不该出现「修改密码」这类本地口令操作。
+     */
+    async setupWithGateway(): Promise<{ securityCode: string; securityCodeError: string }> {
+      const res = await api.post<{
+        user: User
+        security_code?: string
+        security_code_error?: string
+      }>('/auth/setup', { gateway_only: true })
+      this.user = res.user
+      this.authenticated = true
+      this.initialized = true
+      await this.loadMe()
+      return {
+        securityCode: res.security_code || '',
+        securityCodeError: res.security_code_error || '',
+      }
+    },
+
+    /**
      * 应急登录：用安全码进入。
      *
      * 成功后服务端会下发新的一枚安全码（旧码已被消耗），必须展示给用户保存。

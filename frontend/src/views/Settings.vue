@@ -622,6 +622,33 @@
                 </li>
               </ul>
             </el-collapse-item>
+
+            <!--
+              法律与免责：随安装包分发的 LICENSE（安装时读的就是它）里有完整说明，
+              这里放一份要点，让用户不必去找文件、也不必等下次安装才看得到。
+            -->
+            <el-collapse-item title="法律与免责声明" name="legal">
+              <p class="fnwg-about-text">
+                本应用是通用的网络配置管理工具，请只在<strong>你拥有合法使用权的设备与网络</strong>上使用。
+              </p>
+              <p class="fnwg-about-text">
+                <strong>严禁用于任何违法用途</strong>：未经授权访问、控制、干扰或探测他人的网络与设备；
+                绕过网络管理、审计或计费；侵犯他人隐私、通信秘密、个人信息或知识产权；传播违法信息；
+                以及其他违反所在地法律法规的行为。
+              </p>
+              <p class="fnwg-about-text">
+                <strong>使用者须对使用本应用的全部行为及其后果自行承担全部责任。</strong>
+                作者不参与、无法知悉也无法控制使用者的具体用途与部署环境，因此不对使用者的任何行为承担连带责任。
+              </p>
+              <p class="fnwg-about-text">
+                本应用按「现状」提供，不附带任何明示或默示的担保；在适用法律允许的最大范围内，
+                作者与贡献者不对因使用或无法使用本应用而产生的任何直接、间接、附带、特殊或后果性损失承担责任。
+              </p>
+              <p class="fnwg-about-text">
+                完整说明见随安装包分发的《用户协议与隐私说明》（设备上应用目录下的 <code>LICENSE</code> 文件）。
+                若不同意其中任何内容，请停止使用并卸载本应用。
+              </p>
+            </el-collapse-item>
           </el-collapse>
           <el-descriptions :column="1" border size="small">
             <el-descriptions-item label="版本">{{ session.version || '-' }}</el-descriptions-item>
