@@ -37,7 +37,7 @@ func TestSnapshotAutoCaptureAndRollback(t *testing.T) {
 	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
 
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", ListenPort: 51820, Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", ListenPort: 51820, Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatalf("创建连接失败: %v", err)
@@ -72,7 +72,7 @@ func TestSnapshotAutoCaptureAndRollback(t *testing.T) {
 
 	// 连续改动：换监听端口 + 删掉一台设备
 	if _, err := svc.UpdateInterface(ctx, it.ID, service.CreateInterfaceInput{
-		Name: "wg0", ListenPort: 51999, Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", ListenPort: 51999, Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("修改连接失败: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestSnapshotExcludesAccounts(t *testing.T) {
 
 	// 回滚要求快照里有连接，先建一条
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", ListenPort: 51820, Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", ListenPort: 51820, Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("创建连接失败: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestSnapshotSkipsUnchangedConfig(t *testing.T) {
 	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
 
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("创建连接失败: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestSnapshotPruneKeepsLimit(t *testing.T) {
 		t.Fatalf("写入保留份数失败: %v", err)
 	}
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatalf("创建连接失败: %v", err)
@@ -277,7 +277,7 @@ func TestSnapshotsStayOutOfBackupList(t *testing.T) {
 	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
 
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("创建连接失败: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestBackupCoversDNSRecords(t *testing.T) {
 	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
 
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("创建连接失败: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestRollbackRejectsNonSnapshot(t *testing.T) {
 	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
 
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("创建连接失败: %v", err)
 	}

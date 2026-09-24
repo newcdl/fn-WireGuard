@@ -97,7 +97,11 @@
               <el-dropdown-menu>
                 <el-dropdown-item disabled>{{ myName }}（{{ roleLabel }}）</el-dropdown-item>
                 <el-dropdown-item command="help" divided>配置说明大全</el-dropdown-item>
-                <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                <!--
+                  飞牛账号（trim_uid > 0）在本应用里没有口令可改：它不是用密码登录的，
+                  身份由飞牛侧校验。给它一个「修改密码」只会让人以为自己漏设过密码。
+                -->
+                <el-dropdown-item v-if="!isGatewayAccount" command="password">修改密码</el-dropdown-item>
                 <el-dropdown-item command="totp">
                   二次验证
                   <el-tag
@@ -110,7 +114,16 @@
                     已开启
                   </el-tag>
                 </el-dropdown-item>
-                <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+                <!--
+                  能不能退出，看的是**这次身份是怎么来的**（session = 本应用会话，gateway = 飞牛身份），
+                  而不是「从哪个入口进来的」。早先按通道判断，导致从飞牛桌面进来的账号密码会话也退不了登录
+                  （真实故障：用户升级后发现退不出去）。
+                -->
+                <!-- 每次进入都有会话（飞牛身份要先在登录页换一次会话），所以退出登录永远有效 -->
+                <el-dropdown-item command="logout" divided>
+                  退出登录
+                  <span v-if="session.identity === 'gateway'" class="fnwg-hint">（飞牛账号会话）</span>
+                </el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>
@@ -197,6 +210,9 @@
 
     <TwoFactorDialog v-model="totpVisible" />
   </div>
+
+    <!-- 敏感操作前的二次验证：由请求层触发，见 api/client.ts -->
+    <StepUpDialog v-model="stepUpVisible" @done="onStepUpDone" />
 </template>
 
 <script setup lang="ts">
@@ -226,6 +242,8 @@ import {
 import { api } from '@/api/client'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import TwoFactorDialog from '@/components/TwoFactorDialog.vue'
+import StepUpDialog from '@/components/StepUpDialog.vue'
+import { registerStepUpHandler } from '@/api/client'
 import GlobalSearch from '@/components/GlobalSearch.vue'
 import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
@@ -239,6 +257,24 @@ const router = useRouter()
 const session = useSession()
 const realtime = useRealtime()
 const { isMobile, dialogWidth } = useBreakpoint()
+
+// 敏感操作需要先验证一次身份时，请求层会回调到这里弹框（见 api/client.ts 的说明）。
+const stepUpVisible = ref(false)
+let stepUpResolve: ((ok: boolean) => void) | null = null
+
+registerStepUpHandler(
+  () =>
+    new Promise<boolean>((resolve) => {
+      stepUpResolve = resolve
+      stepUpVisible.value = true
+    }),
+)
+
+function onStepUpDone(ok: boolean): void {
+  stepUpVisible.value = false
+  stepUpResolve?.(ok)
+  stepUpResolve = null
+}
 
 const { errors, warnings, tone, toneLabel, start: startHealth, stop: stopHealth } = useSystemHealth()
 
@@ -390,6 +426,13 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onHotkey)
 })
 
+/**
+ * 当前是不是「飞牛账号」：它没有本应用口令（后端存的是格式非法的占位值）。
+ * 用于把「修改密码」这类本地口令操作收起来 —— 菜单里出现一个做不到的入口，
+ * 比没有这个入口更让人困惑。
+ */
+const isGatewayAccount = computed(() => !!session.user?.trim_uid)
+
 async function onCommand(cmd: string) {
   if (cmd === 'help') {
     helpVisible.value = true
@@ -406,6 +449,8 @@ async function onCommand(cmd: string) {
   }
   if (cmd === 'logout') {
     await ElMessageBox.confirm('确认退出登录？', '提示', { type: 'warning' })
+    // 退出之后会跳到登录页；但**从飞牛桌面进来的话，下一次请求会按飞牛身份免密重新进入** ——
+    // 不说清楚，用户会以为「退出没生效」。想用账号密码登录请看 IP:端口 入口。
     await session.logout()
     router.replace({ name: 'login' })
   }

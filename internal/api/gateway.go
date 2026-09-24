@@ -106,3 +106,96 @@ func uidAllowed(uid int) bool {
 	}
 	return false
 }
+
+// gatewayIdentityHeaders 是飞牛统一网关注入的身份头（官方文档「统一网关 → 会话校验和用户 Header」）。
+//
+// 这里只登记**名字**，不代表信任：目前仅用于只读诊断（GET /auth/gateway-probe）显示「看到了哪些头」。
+// 将来若启用免密登录，信任判定必须与通道绑定（见 gatewayTrusted），
+// 并在端口通道上把这些头**删掉**——因为官方文档没有承诺网关会剥离客户端伪造的同名头，
+// 「在端口上伪造管理员」必须从结构上不可能，而不是靠每处代码自觉。
+var gatewayIdentityHeaders = []string{"X-Trim-Userid", "X-Trim-Username", "X-Trim-Isadmin"}
+
+// GatewayIdentity 是网关注入的飞牛身份。
+type GatewayIdentity struct {
+	UID      int64
+	Username string
+	IsAdmin  bool
+}
+
+// gatewayIdentity 解析网关注入的身份头，ok=false 表示这次请求没有可用的飞牛身份。
+//
+// 取值校验刻意从严：三个头缺一不可，Isadmin 只认明确的 true/false
+// （写成 "1"、"yes" 之类一律不认——不能让一个格式怪异的头被当成管理员凭据）。
+// **调用前必须先确认通道可信**，用 gatewayIdentityIfTrusted 而不是直接调它。
+func gatewayIdentity(r *http.Request) (GatewayIdentity, bool) {
+	uidText := strings.TrimSpace(r.Header.Get("X-Trim-Userid"))
+	isAdminText := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Trim-Isadmin")))
+	name := strings.TrimSpace(r.Header.Get("X-Trim-Username"))
+	if uidText == "" || name == "" {
+		return GatewayIdentity{}, false
+	}
+	if isAdminText != "true" && isAdminText != "false" {
+		return GatewayIdentity{}, false
+	}
+	uid, err := strconv.ParseInt(uidText, 10, 64)
+	if err != nil || uid <= 0 {
+		return GatewayIdentity{}, false
+	}
+	return GatewayIdentity{UID: uid, Username: name, IsAdmin: isAdminText == "true"}, true
+}
+
+// gatewayIdentityIfTrusted 只在通道可信时才解析飞牛身份。
+//
+// 故意做成「要用身份就必须经过它」：通道判断与身份解析绑在一起，
+// 别处就没法只拿身份、忘了看通道。
+func gatewayIdentityIfTrusted(r *http.Request) (GatewayIdentity, bool) {
+	if !gatewayTrusted(r) {
+		return GatewayIdentity{}, false
+	}
+	return gatewayIdentity(r)
+}
+
+type ctxKeyStrippedIdentity ctxKey
+
+const ctxStrippedIdentityKey ctxKeyStrippedIdentity = "fnwg.stripped_identity_headers"
+
+// stripUntrustedIdentityHeaders 在**通道不可信**时删掉身份头，并记下删过哪些。
+//
+// 为什么必须由我们删：官方文档只写了「不要信任客户端传入的用户 ID」，
+// 从没承诺网关会剥离客户端伪造的同名头。把它放进中间件，
+// 是为了让「在端口上伪造 X-Trim-Isadmin 冒充管理员」**在结构上不可能**，
+// 而不是依赖每处代码自觉判断通道。
+//
+// 记下名字是给只读诊断用的：它同时是「伪造的头确实到了应用」与「我们确实剥掉了」两件事的证据。
+func (s *Server) stripUntrustedIdentityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if gatewayTrusted(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		var stripped []string
+		for _, h := range gatewayIdentityHeaders {
+			if r.Header.Get(h) == "" {
+				continue
+			}
+			stripped = append(stripped, h)
+			r.Header.Del(h)
+		}
+		if len(stripped) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 有人往端口上传身份头：这不是正常流量，值得留痕（只记名字，不记取值）。
+		s.log.Warn("端口通道收到伪造的网关身份头，已忽略",
+			"headers", strings.Join(stripped, ","), "ip", clientIP(r))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxStrippedIdentityKey, stripped)))
+	})
+}
+
+// strippedIdentityHeaders 取出被剥掉的头名字（只读诊断用）。
+func strippedIdentityHeaders(r *http.Request) []string {
+	if v, ok := r.Context().Value(ctxStrippedIdentityKey).([]string); ok {
+		return v
+	}
+	return nil
+}

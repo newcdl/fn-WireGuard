@@ -4,7 +4,13 @@
 // Package model 定义贯穿数据层、收敛引擎与 API 的领域模型。
 package model
 
-import "time"
+import (
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+)
 
 // 角色常量。
 const (
@@ -22,7 +28,17 @@ const (
 // 早期版本把两者混为一个字段，导致服务端填 0.0.0.0/0 时往 NAS 上写了默认路由，
 // 抢占系统默认路由并影响 fnOS 自身网络（含 FN Connect）。现在两者彻底分离。
 const (
-	// RouteModeFull 设备全部流量走本连接（全局代理）。
+	// 设备的内网访问范围（见 Peer.LANPolicy）。
+	//
+	// 为什么需要它：连接级的「允许设备访问家里内网」是一刀切的，而设备侧那份配置
+	// （ClientAllowedIPs）只是**建议** —— 设备完全可以自己改路由绕过去。
+	// 真正说了算的是服务端规则，这三个取值就是那条规则的开关。
+	//
+	// 默认值必须与升级前的行为完全一致（inherit），否则升级会顺手收紧或放开用户的网络。
+	LANPolicyInherit  = "inherit"
+	LANPolicyRestrict = "restrict"
+	LANPolicyDeny     = "deny"
+
 	RouteModeFull = "full"
 	// RouteModeLAN 仅访问本端网段，其余流量走设备本地网络。
 	RouteModeLAN = "lan"
@@ -33,6 +49,14 @@ const (
 	RouteTableOff = "off"
 	// RouteTableClient 仅当本机作为客户端时才为对端网段添加路由。
 	RouteTableClient = "client"
+
+	// PeerDisabledQuota / PeerDisabledExpired 是设备被**自动**停用的原因（Peer.DisabledReason 的取值）。
+	//
+	// 只记「为什么停用」，不记具体数值或期限：那些会随管理员调整而变，
+	// 而能不能自动恢复取决于原因 —— 条件解除时（到了新的一月、额度提高、期限延长）
+	// 只有这两个原因会被自动放开，管理员手工停用的（原因为空）绝不自动恢复。
+	PeerDisabledQuota   = "quota"
+	PeerDisabledExpired = "expire"
 )
 
 // 权限点，用于 RBAC 粗粒度校验。
@@ -136,7 +160,17 @@ type Peer struct {
 	// ClientAllowedIPs 仅在 RouteMode=custom 时生效，表示客户端侧的通行范围。
 	ClientAllowedIPs []string `json:"client_allowed_ips"`
 	// AllowedIPs 是服务端准入地址：允许该设备使用哪些源地址，主机侧不据此添加任何路由。
-	AllowedIPs   []string   `json:"allowed_ips"`
+	AllowedIPs []string `json:"allowed_ips"`
+	// LANPolicy 是该设备的「内网访问范围」，取值见 LANPolicy* 常量。
+	//
+	// 与 ClientAllowedIPs 的区别（最容易混的一处）：
+	//   - ClientAllowedIPs 写在**设备那份配置**里，决定设备哪些流量进隧道 —— 设备侧可以改；
+	//   - LANPolicy 落在**服务端的转发规则**上，决定这台设备实际能访问内网的哪些目标 —— 设备改不了。
+	// 前者管「进不进隧道」，后者管「进了隧道之后能去哪」。
+	LANPolicy string `json:"lan_policy"`
+	// LANTargets 仅在 LANPolicy=restrict 时有意义：允许该设备访问的内网目标，
+	// 写法见 ParseLANTarget：192.168.1.10、192.168.1.0/24、192.168.1.10:445。
+	LANTargets   []string   `json:"lan_targets"`
 	EndpointHost string     `json:"endpoint_host"`
 	EndpointPort int        `json:"endpoint_port"`
 	Keepalive    int        `json:"persistent_keepalive"`
@@ -146,8 +180,15 @@ type Peer struct {
 	QuotaTx      int64      `json:"quota_tx"`
 	ExpireAt     *time.Time `json:"expire_at,omitempty"`
 	Enabled      bool       `json:"enabled"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// DisabledReason 是「被自动停用的原因」：quota（流量用尽）或 expire（已到期），
+	// 空表示不是自动停用（在用的、或管理员手工停用的）。
+	//
+	// 必须落库：月度额度要到月初自动恢复，而恢复的前提正是知道当初为什么停用 ——
+	// 光看 enabled=false 分不清「管理员手工停的」与「流量用尽自动停的」，
+	// 分不清就会把前者也一并放开。
+	DisabledReason string    `json:"disabled_reason,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 	// ConfigFingerprint 是这台设备**上次拿到配置时**的客户端配置指纹
 	// （由 wgconf.ClientFingerprint 计算，不含任何密钥）。空表示从未生成过配置。
 	//
@@ -318,14 +359,20 @@ type StatSample struct {
 
 // User 是应用内账号。
 type User struct {
-	ID           int64      `json:"id"`
-	Username     string     `json:"username"`
-	PasswordHash string     `json:"-"`
-	TOTPSecret   string     `json:"-"`
-	Role         string     `json:"role"`
-	Status       int        `json:"status"` // 1 启用 0 禁用
-	LastLoginAt  *time.Time `json:"last_login_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"-"`
+	TOTPSecret   string `json:"-"`
+	// TrimUID 非 0 表示这个账号来自飞牛统一网关的免密登录，值就是飞牛用户 UID；0 表示自建账号。
+	// 用 UID 而不是用户名做对应关系：按名字匹配会让一个叫 admin 的飞牛普通用户
+	// 直接对上本地管理员账号，那是提权漏洞。
+	TrimUID int64 `json:"trim_uid,omitempty"`
+	// TrimName 是飞牛用户名的快照，**仅供展示**，永远不参与任何匹配。
+	TrimName    string     `json:"trim_name,omitempty"`
+	Role        string     `json:"role"`
+	Status      int        `json:"status"` // 1 启用 0 禁用
+	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 	// TOTPEnabled 是派生给人看的字段：TOTPSecret 本身必须用 `json:"-"` 隐藏
 	// （它落在 /users 响应里就等于把二次验证密钥泄给了任何能读账号列表的人），
 	// 但「这个账号有没有开二次验证」需要让管理员看得到。
@@ -513,4 +560,109 @@ type PeerSpec struct {
 	Endpoint     string
 	AllowedIPs   []string
 	Keepalive    int
+	// LANPolicy / LANTargets 见 Peer.LANPolicy：服务端按设备限制内网访问目标。
+	// 只有这两项进内核 —— 客户端那份配置（ClientAllowedIPs）不下发。
+	LANPolicy  string
+	LANTargets []string
+}
+
+// ParseLANTarget 解析一条内网目标：192.168.1.10、192.168.1.0/24、192.168.1.10:445。
+//
+// 返回归一化后的地址/网段与端口（无端口为 0）。放在 model 里而不是各层各写一份：
+// 服务层要校验它、数据面要按它生成规则，两处各写一份解析器，迟早出现
+// 「界面能填、规则不认」这种最难查的偏差。
+//
+// 刻意只接受 IPv4 单主机或网段：目标为空、写成默认路由都会被拒绝 ——
+// 这个字段的语义是「允许去哪」，写成 0.0.0.0/0 等于不做限制，必须让用户明确表达。
+func ParseLANTarget(raw string) (string, int, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "", 0, fmt.Errorf("目标不能为空")
+	}
+	addr, portStr := v, ""
+	// 端口分隔：只在「最后一个冒号、右侧是纯数字」时当成端口。
+	if i := strings.LastIndex(v, ":"); i >= 0 {
+		if _, err := strconv.Atoi(strings.TrimSpace(v[i+1:])); err == nil {
+			addr, portStr = v[:i], strings.TrimSpace(v[i+1:])
+		}
+	}
+	port := 0
+	if portStr != "" {
+		n, err := strconv.Atoi(portStr)
+		if err != nil || n <= 0 || n > 65535 {
+			return "", 0, fmt.Errorf("端口要写 1 到 65535 之间的数字")
+		}
+		port = n
+	}
+	out := ""
+	if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+		out = ip.To4().String()
+	} else if _, n, err := net.ParseCIDR(addr); err == nil && n.IP.To4() != nil {
+		if ones, _ := n.Mask.Size(); ones == 0 {
+			return "", 0, fmt.Errorf("不能写 0.0.0.0/0：那是「所有地址」，等于不做限制")
+		}
+		out = (&net.IPNet{IP: n.IP.Mask(n.Mask), Mask: n.Mask}).String()
+	} else {
+		return "", 0, fmt.Errorf("%q 不是合法的 IPv4 地址或网段，写成 192.168.1.10 或 192.168.1.0/24", v)
+	}
+	return out, port, nil
+}
+
+// LANTargetString 把一条目标还原成可读文本（用于回显与提示）。
+func LANTargetString(addr string, port int) string {
+	if port > 0 {
+		return fmt.Sprintf("%s:%d", addr, port)
+	}
+	return addr
+}
+
+// LANDevice 是内网里的一台设备（从内核邻居表读到的**事实**，只读）。
+//
+// 为什么要读邻居表：NAS 天生知道「连上隧道的设备」，却不知道「家里还有哪些机器」——
+// 而拓扑图上前者只是几个节点，后者才是用户真正想看的全貌。
+// 邻居表是内核里现成的、只读的事实来源，不需要任何扫描或额外流量。
+//
+// 代价（必须让用户知道）：邻居表只记「最近通信过」的对端。NAS 是文件服务器，
+// 平时打得交道不少，但它看不到从没跟它说过话的机器 —— 界面上的说明会写清这一点。
+type LANDevice struct {
+	IP        string `json:"ip"`
+	MAC       string `json:"mac,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Interface string `json:"interface,omitempty"`
+	// State 是内核里的邻居状态（reachable / stale / delay / probe / failed / permanent）。
+	State string `json:"state,omitempty"`
+}
+
+// LANReport 是「内网里有哪些设备」的读取结果。
+type LANReport struct {
+	// Demo 为真表示这是演示数据（内存后端），不是真实网络的观测结果。
+	// 与「读不到」分开：演示模式照样有东西可画，但不能让人以为那是家里的机器。
+	Demo bool `json:"demo,omitempty"`
+	// Readable 为假表示这次没能读到（代理不可用、或运行在不支持的平台上）。
+	// 界面据此区分「内网里没有别的设备」与「这次没读到」—— 两者绝不能混。
+	Readable bool        `json:"readable"`
+	Devices  []LANDevice `json:"devices,omitempty"`
+	Reason   string      `json:"reason,omitempty"`
+}
+
+// BackupCopy 是外部备份目录里的一份副本。
+//
+// 放在 model 里而不是各自定义一份：它以同一形状穿过三个包 ——
+// 特权代理（真正读写这个目录的进程）→ 协议 → 界面接口。
+// 三处各写一个同形结构，迟早会有一处的字段名或 json tag 走偏，
+// 而那种偏差的表现是「界面上少一列或时间显示不出来」，很难往回追。
+type BackupCopy struct {
+	Name    string    `json:"name"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+}
+
+// BackupDirInfo 是外部备份目录的实况：能不能写、有什么要说清的、里面有哪些副本。
+//
+// OK/Note 由**真正执行写入的进程**给出（见 internal/service 里 InspectTargetDir 的说明），
+// 界面只负责显示，不自己判断。
+type BackupDirInfo struct {
+	OK    bool         `json:"ok"`
+	Note  string       `json:"note,omitempty"`
+	Files []BackupCopy `json:"files,omitempty"`
 }

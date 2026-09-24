@@ -30,7 +30,10 @@
         </div>
 
         <!-- 桌面端表格 -->
-        <div v-if="!isMobile" class="fnwg-card">
+        <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+        <ViewSwitch v-model="auditViewMode" />
+
+        <div v-if="auditIsTable" class="fnwg-card">
           <el-table :data="audit" v-loading="loadingAudit" size="small" empty-text="暂无操作记录">
             <el-table-column label="时间" width="170">
               <template #default="{ row }">{{ formatTime(row.ts) }}</template>
@@ -66,6 +69,7 @@
 
         <!-- 移动端卡片 -->
         <div v-else v-loading="loadingAudit">
+          <div class="fnwg-card-grid">
           <ItemCard
             v-for="row in audit"
             :key="row.id"
@@ -94,6 +98,7 @@
               <span class="fnwg-kv-val">{{ row.message }}</span>
             </div>
           </ItemCard>
+          </div>
           <div v-if="!audit.length && !loadingAudit" class="fnwg-empty">暂无操作记录</div>
           <el-pagination
             class="fnwg-pager"
@@ -125,7 +130,10 @@
           <el-button :icon="Search" @click="loadLogs">查询</el-button>
         </div>
 
-        <div v-if="!isMobile" class="fnwg-card">
+        <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+        <ViewSwitch v-model="runtimeViewMode" />
+
+        <div v-if="runtimeIsTable" class="fnwg-card">
           <el-table :data="logs" v-loading="loadingLogs" size="small" empty-text="暂无运行日志">
             <el-table-column label="时间" width="170">
               <template #default="{ row }">{{ formatTime(row.ts) }}</template>
@@ -149,6 +157,7 @@
         </div>
 
         <div v-else v-loading="loadingLogs">
+          <div class="fnwg-card-grid">
           <ItemCard
             v-for="row in logs"
             :key="row.id"
@@ -167,6 +176,7 @@
               <span class="fnwg-kv-val">{{ row.fields }}</span>
             </div>
           </ItemCard>
+          </div>
           <div v-if="!logs.length && !loadingLogs" class="fnwg-empty">暂无运行日志</div>
           <el-pagination
             class="fnwg-pager"
@@ -177,6 +187,13 @@
             @current-change="onLogPage"
           />
         </div>
+      </el-tab-pane>
+
+      <!-- 流量报表：谁用了多少、什么时候用的，以及导出明细。
+           用 v-if 而非常驻渲染：页签没打开就不必请求数据；图表也不该在隐藏的容器里初始化 ——
+           隐藏容器宽度为 0，ECharts 会照着这个尺寸画出一块空白画布，之后怎么切回来都是空的。 -->
+      <el-tab-pane label="流量报表" name="traffic">
+        <TrafficReport v-if="tab === 'traffic'" />
       </el-tab-pane>
     </el-tabs>
   </div>
@@ -189,8 +206,16 @@ import { Search, CircleCheck } from '@element-plus/icons-vue'
 import { api } from '@/api/client'
 import type { AuditEntry, LogEntry } from '@/api/types'
 import ItemCard from '@/components/ItemCard.vue'
+import TrafficReport from '@/components/TrafficReport.vue'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { formatTime } from '@/utils/format'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
+
+
+// 表格 / 卡片视图：由用户决定并记住（两个列表各用一个键，切一个不会连带另一个）
+const { mode: auditViewMode, isTable: auditIsTable } = useViewMode('logs-audit')
+const { mode: runtimeViewMode, isTable: runtimeIsTable } = useViewMode('logs-runtime')
 
 const { isMobile } = useBreakpoint()
 

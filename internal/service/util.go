@@ -14,6 +14,12 @@ import (
 	"fnwg/internal/wgkey"
 )
 
+// boolPtr 把布尔字面量取址。
+//
+// 供「有没有指定」语义的入参使用（见 CreateInterfaceInput.Enabled、PeerInput.Enabled）：
+// 这些字段是指针，nil 与「显式设为 false」是两件事，直接写字面量过不了编译。
+func boolPtr(b bool) *bool { return &b }
+
 // newUUID 生成 UUID v4 形式的随机标识。
 func newUUID() string {
 	b := make([]byte, 16)

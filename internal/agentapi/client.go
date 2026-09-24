@@ -156,6 +156,16 @@ func (c *Client) DeleteInterface(ctx context.Context, name string) error {
 	return c.call(ctx, MethodDeleteInterface, DeleteInterfaceParams{Name: name}, nil)
 }
 
+// LANDevices 读内网里的设备清单（只读）。
+func (c *Client) LANDevices(ctx context.Context) (*model.LANReport, error) {
+	var out model.LANReport
+	err := c.call(ctx, MethodLANDevices, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // InspectNetwork 网络自检。
 func (c *Client) InspectNetwork(ctx context.Context) (model.NetworkReport, error) {
 	var rep model.NetworkReport
@@ -183,6 +193,57 @@ func (c *Client) CleanupNetwork(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return out.Actions, nil
+}
+
+// RunInspect 让特权代理立即做一次配置漂移巡检。
+//
+// 由代理执行：巡检要读内核里的规则与路由，界面进程没有这个能力；
+// 判定也只在代理侧的那一份实现里，界面进程不自己判一遍。
+func (c *Client) RunInspect(ctx context.Context, userID int64, username, srcIP string) (InspectRunResult, error) {
+	var out InspectRunResult
+	params := InspectRunParams{UserID: userID, Username: username, SrcIP: srcIP}
+	err := c.call(ctx, MethodInspectRun, params, &out)
+	return out, err
+}
+
+// RunBackupPlan 让特权代理立即执行一次计划备份。
+//
+// 由代理写、不由界面进程写：目标目录是用户授权给应用的共享文件夹，
+// 界面进程（fnwg）对它没有写权限。
+func (c *Client) RunBackupPlan(ctx context.Context, userID int64, username, srcIP string) (BackupRunResult, error) {
+	var out BackupRunResult
+	params := BackupRunParams{UserID: userID, Username: username, SrcIP: srcIP}
+	err := c.call(ctx, MethodBackupRun, params, &out)
+	return out, err
+}
+
+// InspectBackupDir 让代理检查备份目标目录并列出其中的副本。
+func (c *Client) InspectBackupDir(ctx context.Context, dir string) (model.BackupDirInfo, error) {
+	var out model.BackupDirInfo
+	if err := c.call(ctx, MethodBackupDirInspect, BackupDirParams{Dir: dir}, &out); err != nil {
+		return model.BackupDirInfo{}, err
+	}
+	return out, nil
+}
+
+// ReadBackupCopy 让代理读取目标目录里的一份副本。
+func (c *Client) ReadBackupCopy(ctx context.Context, dir, name string) ([]byte, error) {
+	var out BackupCopyRawResult
+	params := BackupCopyReadParams{Dir: dir, Name: name}
+	if err := c.call(ctx, MethodBackupCopyRead, params, &out); err != nil {
+		return nil, err
+	}
+	return out.Raw, nil
+}
+
+// WriteBackupCopy 让代理把一份本地备份另存到目标目录。
+func (c *Client) WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error) {
+	var out BackupCopyWriteResult
+	params := BackupCopyWriteParams{Dir: dir, BackupID: backupID, UserID: userID, Username: username, SrcIP: srcIP}
+	if err := c.call(ctx, MethodBackupCopyWrite, params, &out); err != nil {
+		return "", err
+	}
+	return out.Name, nil
 }
 
 // DeleteForeignInterface 删除一个不属于本应用的 WireGuard 网卡（疑似残留）。

@@ -170,6 +170,9 @@ func (s *Store) DeleteInterface(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM wg_peer WHERE interface_id=?`, id)
+	// 流量记录同理一并清掉（理由见 DeletePeer）：连接没了，它的设备也没了，
+	// 而 interface_id 会被后续新建的连接复用。
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM wg_traffic_hourly WHERE interface_id=?`, id)
 	return nil
 }
 
@@ -196,7 +199,8 @@ func (s *Store) InterfaceNames(ctx context.Context) (map[string]bool, error) {
 const peerCols = `p.id,p.interface_id,IFNULL(i.name,''),p.name,p.public_key,p.preshared_key,p.client_priv,
 	IFNULL(p.route_mode,'lan'),IFNULL(p.client_ips,'[]'),p.endpoint_host,
 	p.endpoint_port,p.allowed_ips,p.keepalive,p.group_tag,p.remark,p.quota_rx,p.quota_tx,p.expire_at,p.enabled,
-	p.created_at,p.updated_at,IFNULL(p.config_fp,'')`
+	p.created_at,p.updated_at,IFNULL(p.config_fp,''),IFNULL(p.disabled_reason,''),
+	IFNULL(p.lan_policy,'inherit'),IFNULL(p.lan_targets,'[]')`
 
 const peerFrom = ` FROM wg_peer p LEFT JOIN wg_interface i ON i.id = p.interface_id`
 
@@ -211,16 +215,24 @@ func (s *Store) scanPeer(sc interface{ Scan(...any) error }) (*model.Peer, error
 		enabled   int
 		createdAt string
 		updatedAt string
+		lanPolicy string
+		lanTarget string
 	)
 	err := sc.Scan(&p.ID, &p.InterfaceID, &p.InterfaceName, &p.Name, &p.PublicKey, &psk, &clientKey,
 		&p.RouteMode, &clientIPs, &p.EndpointHost,
 		&p.EndpointPort, &allowed, &p.Keepalive, &p.GroupTag, &p.Remark, &p.QuotaRx, &p.QuotaTx, &expireAt,
-		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint)
+		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint, &p.DisabledReason,
+		&lanPolicy, &lanTarget)
 	if err != nil {
 		return nil, err
 	}
 	p.AllowedIPs = jsonStrings(allowed)
 	p.ClientAllowedIPs = jsonStrings(clientIPs)
+	p.LANTargets = jsonStrings(lanTarget)
+	p.LANPolicy = lanPolicy
+	if p.LANPolicy == "" {
+		p.LANPolicy = model.LANPolicyInherit
+	}
 	if p.RouteMode == "" {
 		p.RouteMode = model.RouteModeLAN
 	}
@@ -293,18 +305,26 @@ func (s *Store) CreatePeer(ctx context.Context, p *model.Peer) error {
 	p.CreatedAt, p.UpdatedAt = now, now
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO wg_peer(interface_id,name,public_key,preshared_key,client_priv,route_mode,client_ips,
-		 endpoint_host,endpoint_port,allowed_ips,
-		 keepalive,group_tag,remark,quota_rx,quota_tx,expire_at,enabled,config_fp,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 endpoint_host,endpoint_port,allowed_ips,lan_policy,lan_targets,
+		 keepalive,group_tag,remark,quota_rx,quota_tx,expire_at,enabled,disabled_reason,config_fp,created_at,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
-		p.EndpointHost, p.EndpointPort, mustJSON(p.AllowedIPs),
+		p.EndpointHost, p.EndpointPort, mustJSON(p.AllowedIPs), lanPolicyArg(p.LANPolicy), mustJSON(p.LANTargets),
 		p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx, expireArg(p.ExpireAt), b2i(p.Enabled),
-		p.ConfigFingerprint, ts(now), ts(now))
+		p.DisabledReason, p.ConfigFingerprint, ts(now), ts(now))
 	if err != nil {
 		return err
 	}
 	p.ID, _ = res.LastInsertId()
 	return nil
+}
+
+// lanPolicyArg 归一化策略取值：空值一律落成 inherit（与升级前行为一致）。
+func lanPolicyArg(v string) string {
+	if v == "" {
+		return model.LANPolicyInherit
+	}
+	return v
 }
 
 func expireArg(t *time.Time) any {
@@ -336,13 +356,13 @@ func (s *Store) UpdatePeer(ctx context.Context, p *model.Peer) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE wg_peer SET interface_id=?,name=?,public_key=?,preshared_key=?,client_priv=?,route_mode=?,client_ips=?,
 		 endpoint_host=?,endpoint_port=?,
-		 allowed_ips=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,
+		 allowed_ips=?,lan_policy=?,lan_targets=?,keepalive=?,group_tag=?,remark=?,quota_rx=?,quota_tx=?,expire_at=?,enabled=?,disabled_reason=?,
 		 config_fp=?,updated_at=?
 		 WHERE id=?`,
 		p.InterfaceID, p.Name, p.PublicKey, psk, clientKey, p.RouteMode, mustJSON(p.ClientAllowedIPs),
 		p.EndpointHost, p.EndpointPort,
-		mustJSON(p.AllowedIPs), p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx,
-		expireArg(p.ExpireAt), b2i(p.Enabled), p.ConfigFingerprint, ts(now), p.ID)
+		mustJSON(p.AllowedIPs), lanPolicyArg(p.LANPolicy), mustJSON(p.LANTargets), p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx,
+		expireArg(p.ExpireAt), b2i(p.Enabled), p.DisabledReason, p.ConfigFingerprint, ts(now), p.ID)
 	if err != nil {
 		return err
 	}
@@ -361,6 +381,14 @@ func (s *Store) DeletePeer(ctx context.Context, id int64) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
+	// 该设备的流量记录一并删除。
+	//
+	// 不留在库里当历史：设备删掉之后 peer_id 会被后续新建的设备复用，
+	// 留着就会把上一台设备的用量算到新设备头上 —— 报表与「每月额度」都会因此失真，
+	// 而两者看起来都「有数据」，没人会怀疑是串了账。
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM wg_traffic_hourly WHERE peer_id=?`, id); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -369,7 +397,9 @@ func (s *Store) BatchSetPeerEnabled(ctx context.Context, ids []int64, enabled bo
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	q := `UPDATE wg_peer SET enabled=?, updated_at=? WHERE id IN (` + placeholders(len(ids)) + `)`
+	// 用户显式启停时一并清掉「自动停用原因」：手工停用的设备不能被月初的自动恢复误放开，
+	// 手工启用的设备也不该留着一个已不成立的原因。
+	q := `UPDATE wg_peer SET enabled=?, disabled_reason='', updated_at=? WHERE id IN (` + placeholders(len(ids)) + `)`
 	args := []any{b2i(enabled), ts(time.Now())}
 	for _, id := range ids {
 		args = append(args, id)

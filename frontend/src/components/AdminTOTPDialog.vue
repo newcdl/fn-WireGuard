@@ -79,7 +79,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import QRCode from 'qrcode'
+import { styledQrDataUrl } from '@/utils/qr'
 import { api } from '@/api/client'
 import type { TOTPSetup } from '@/api/types'
 import { useBreakpoint } from '@/composables/useBreakpoint'
@@ -123,7 +123,8 @@ async function start() {
   try {
     const out = await api.post<TOTPSetup>(`/users/${props.userId}/totp/setup`, {})
     secret.value = out.secret
-    qr.value = await QRCode.toDataURL(out.uri, { margin: 1, width: 320 })
+    // 与设备配置码同一套样式（圆点 + 中心图标）：绑定码内容短、模块少，余量比设备码还大
+    qr.value = await styledQrDataUrl(out.uri, 320)
   } catch (e) {
     // 失败原因由服务端给全（例如账号已停用），这里原样展示，不自己编一个说法
     loadError.value = (e as Error).message

@@ -23,13 +23,13 @@ func TestPeerConfigStaleLifecycle(t *testing.T) {
 	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
 
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	p, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, Name: "我的手机", GenerateKeys: true, AutoAddress: true, Enabled: true,
+		InterfaceID: it.ID, Name: "我的手机", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +90,7 @@ func TestPeerConfigStaleLifecycle(t *testing.T) {
 		RouteMode:   p.RouteMode,
 		AllowedIPs:  p.AllowedIPs,
 		Keepalive:   p.Keepalive,
-		Enabled:     true,
+		Enabled:     boolPtr(true),
 	}
 	rename := base
 	rename.Name = "改名后的手机"
@@ -129,13 +129,13 @@ func TestPeerScopeConflictRejected(t *testing.T) {
 	actor := service.Actor{Username: "tester"}
 
 	wg0, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wg1, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg1", Addresses: []string{"10.11.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg1", Addresses: []string{"10.11.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestPeerScopeConflictRejected(t *testing.T) {
 			AutoAddress:      true,
 			RouteMode:        model.RouteModeCustom,
 			ClientAllowedIPs: scope,
-			Enabled:          true,
+			Enabled:          boolPtr(true),
 		}, actor)
 		return err
 	}

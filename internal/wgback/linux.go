@@ -925,13 +925,6 @@ func (b *linuxBackend) hostRouteContext(excludeIdx int) ([]string, []HostRoute, 
 	return nets, out, nil
 }
 
-func maskedCIDR(n *net.IPNet) string {
-	if n == nil {
-		return ""
-	}
-	return (&net.IPNet{IP: n.IP.Mask(n.Mask), Mask: n.Mask}).String()
-}
-
 // eachRoute 遍历系统**全部路由表**中的路由。
 //
 // 两个必须显式处理的细节（netlink 库的默认行为对我们都不合适）：
@@ -1333,6 +1326,48 @@ func (b *linuxBackend) Snapshot(names []string) ([]model.InterfaceStatus, error)
 }
 
 // Inspect 供网络自检使用：返回本应用相关的事实，不做任何修改。
+// LANDevices 读内核邻居表，回答「这台 NAS 所在的内网里有哪些设备」。
+//
+// 纯只读：只列邻居表，不发探测包、不做扫描。代价要说清 ——
+// 邻居表只记「最近和 NAS 通信过」的机器，从来没打过交道的设备不会出现；
+// 界面上会写明这一点，避免用户以为「图上是全部设备」。
+//
+// 过滤规则见 buildLANDevices（纯函数，跨平台可测）：隧道网卡上的记录不是内网设备，
+// 只保留落在主机网段里的地址。
+func (b *linuxBackend) LANDevices(ctx context.Context) (*model.LANReport, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return &model.LANReport{Reason: "读取网卡列表失败：" + err.Error()}, nil
+	}
+	nameOf := map[int]string{}
+	tunnels := []string{}
+	for _, l := range links {
+		name := l.Attrs().Name
+		nameOf[l.Attrs().Index] = name
+		if l.Type() == "wireguard" || b.state.IsManaged(name) {
+			tunnels = append(tunnels, name)
+		}
+	}
+	neighs, err := netlink.NeighList(0, netlink.FAMILY_V4)
+	if err != nil {
+		return &model.LANReport{Reason: "读取邻居表失败：" + err.Error()}, nil
+	}
+	entries := make([]neighEntry, 0, len(neighs))
+	for _, n := range neighs {
+		mac := ""
+		if len(n.HardwareAddr) > 0 {
+			mac = n.HardwareAddr.String()
+		}
+		entries = append(entries, neighEntry{
+			IP: n.IP.String(), MAC: mac, State: neighStateName(n.State), Link: nameOf[n.LinkIndex],
+		})
+	}
+	return &model.LANReport{
+		Readable: true,
+		Devices:  buildLANDevices(entries, LANDeviceFilter{TunnelLinks: tunnels, Subnets: b.hostNetworksLocked()}),
+	}, nil
+}
+
 func (b *linuxBackend) Inspect(ctx context.Context) (model.NetworkReport, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -31,11 +31,12 @@
       <el-button :icon="Refresh" @click="load">刷新</el-button>
       <el-button :icon="Reading" @click="helpVisible = true">配置说明</el-button>
       <div style="flex: 1"></div>
+      <ViewSwitch v-model="viewMode" />
       <el-tag size="small" type="info" effect="plain">在线 {{ onlineCount }} / 共 {{ filtered.length }} 台</el-tag>
     </div>
 
     <!-- 桌面端：表格 -->
-    <div v-if="!isMobile" class="fnwg-card">
+    <div v-if="isTable" class="fnwg-card">
       <el-table
         :data="filtered"
         v-loading="loading"
@@ -91,6 +92,29 @@
             ↓{{ formatBytes(row.rx_bytes) }} ↑{{ formatBytes(row.tx_bytes) }}
           </template>
         </el-table-column>
+        <el-table-column label="本月用量" width="170">
+          <template #default="{ row }">
+            <!-- 有额度才画进度条：不限额的设备显示一个「用了多少」就够了，
+                 加一条永远不动的空进度条只会让人以为设置没生效。 -->
+            <template v-if="usage[row.id]">
+              <span :class="{ 'fnwg-over-quota': overQuota(row.id) }">
+                {{ formatBytes(usage[row.id].month_tx_bytes) }}
+              </span>
+              <span v-if="usage[row.id].quota_tx > 0" class="fnwg-hint">
+                / {{ formatBytes(usage[row.id].quota_tx) }}
+              </span>
+              <el-progress
+                v-if="usage[row.id].quota_tx > 0"
+                :percentage="usagePercent(row.id)"
+                :status="overQuota(row.id) ? 'exception' : undefined"
+                :show-text="false"
+                :stroke-width="6"
+                style="margin-top: 2px"
+              />
+            </template>
+            <span v-else class="fnwg-hint">-</span>
+          </template>
+        </el-table-column>
         <el-table-column label="有效期" width="90">
           <template #default="{ row }">
             <span v-if="!row.expire_at">长期</span>
@@ -118,6 +142,7 @@
         <span style="font-size: 12px; opacity: 0.65">已选 {{ selectedIds.length }} 台</span>
       </div>
 
+      <div class="fnwg-card-grid">
       <ItemCard
         v-for="row in filtered"
         :key="row.id"
@@ -160,6 +185,7 @@
           <el-button v-if="session.can('peer.write')" size="small" @click="remove(row)">删除</el-button>
         </template>
       </ItemCard>
+      </div>
       <div v-if="!filtered.length && !loading" class="fnwg-empty">还没有设备，点击上方「添加设备」开始</div>
     </div>
 
@@ -267,6 +293,38 @@
           </div>
           <div v-if="form.id" class="fnwg-hint">
             提醒：通行范围写在设备配置里，保存后这台设备会显示「需重新扫码」，需要重新导入一次才会生效。
+          </div>
+        </el-form-item>
+
+        <!-- 内网访问范围：与上面的「通行范围」不是一回事 ——
+             通行范围写在设备配置里（设备可改），这里是服务端规则（设备改不了）。 -->
+        <el-form-item>
+          <template #label><FieldLabel :meta="P.lan_policy" /></template>
+          <el-select v-model="form.lan_policy" style="width: 240px">
+            <el-option label="随连接（默认）" value="inherit" />
+            <el-option label="只允许访问指定目标" value="restrict" />
+            <el-option label="不允许访问内网" value="deny" />
+          </el-select>
+          <div class="fnwg-hint">
+            限制落在服务端的转发规则上，设备侧改不了。需要连接上已打开「允许设备访问家里内网」才会生效。
+          </div>
+        </el-form-item>
+
+        <el-form-item v-if="form.lan_policy === 'restrict'">
+          <template #label><FieldLabel :meta="P.lan_targets" /></template>
+          <el-select
+            v-model="form.lan_targets"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            placeholder="192.168.1.10 或 192.168.1.10:445"
+            style="width: 100%"
+          >
+            <el-option v-for="s in homeSubnets" :key="s" :label="s" :value="s" />
+          </el-select>
+          <div class="fnwg-hint">
+            列表之外的内网目标会被丢弃；写「地址:端口」时只放行该端口的 TCP / UDP。
           </div>
         </el-form-item>
 
@@ -497,13 +555,22 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh, ArrowDown, Reading, Upload } from '@element-plus/icons-vue'
-import QRCode from 'qrcode'
+import { styledQrDataUrl } from '@/utils/qr'
 import { api } from '@/api/client'
-import type { PeerConfigResult, PeerImportResult, PeerImportRow, WgInterface, WgPeer } from '@/api/types'
+import type {
+  PeerConfigResult,
+  PeerImportResult,
+  PeerImportRow,
+  TrafficReport,
+  WgInterface,
+  WgPeer,
+} from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
 import ScenarioPicker from '@/components/ScenarioPicker.vue'
 import {
   allHelpGroups,
@@ -521,6 +588,8 @@ import { copyText } from '@/utils/clipboard'
 const route = useRoute()
 const session = useSession()
 const { isMobile, drawerSize, dialogWidth } = useBreakpoint()
+// 表格 / 卡片视图：由用户决定并记住
+const { mode: viewMode, isTable } = useViewMode('peers')
 
 // 复用全局已拉取的自检结果：只为了拿到探测到的家里网段，
 // 让「自定义可访问范围」可以直接点选，而不是凭记忆手写 IP。
@@ -534,6 +603,9 @@ void interfaceFields
 const interfaces = ref<WgInterface[]>([])
 const peers = ref<WgPeer[]>([])
 const loading = ref(false)
+
+/** 每台设备的本月发送量与额度，来自流量报表（见 loadUsage）。 */
+const usage = ref<Record<number, { month_tx_bytes: number; quota_tx: number }>>({})
 const saving = ref(false)
 const selectedIds = ref<number[]>([])
 const ifaceFilter = ref<number | undefined>(undefined)
@@ -565,6 +637,8 @@ const emptyForm = () => ({
   generate_psk: true,
   route_mode: 'lan',
   client_allowed_ips: [] as string[],
+  lan_policy: 'inherit' as 'inherit' | 'restrict' | 'deny',
+  lan_targets: [] as string[],
   allowed_ips: [] as string[],
   endpoint_host: '',
   endpoint_port: 0,
@@ -657,6 +731,43 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // 用量单独取一次（设备列表接口不带它，而它来自按小时的记账明细）。
+  // 放在 load 的末尾：设备的新增、删除、改额度都会经过 load，
+  // 于是「本月用量」自动跟着刷新，不必在每个操作里各记一次。
+  void loadUsage()
+}
+
+/**
+ * 取每台设备的本月发送量与额度。
+ *
+ * 报表接口的区间参数给 1 天：这里只要「本月」这一个数（它按自然月单独累计，
+ * 与区间无关），逐日明细不必带回来。
+ */
+async function loadUsage() {
+  try {
+    const rep = await api.get<TrafficReport>('/traffic/report?days=1')
+    const map: Record<number, { month_tx_bytes: number; quota_tx: number }> = {}
+    for (const p of rep.peers || []) {
+      map[p.peer_id] = { month_tx_bytes: p.month_tx_bytes, quota_tx: p.quota_tx }
+    }
+    usage.value = map
+  } catch {
+    // 用量取不到不该影响设备管理：这一列留空即可，删掉设备、改配置照样能做
+    usage.value = {}
+  }
+}
+
+/** 本月用量占额度的百分比（没有额度时返回 0，不显示进度条）。 */
+function usagePercent(id: number) {
+  const u = usage.value[id]
+  if (!u || !u.quota_tx) return 0
+  return Math.min(100, Math.round((u.month_tx_bytes / u.quota_tx) * 100))
+}
+
+/** 是否已经用满额度 —— 用满就会触发自动停用，这一列必须能一眼看出来。 */
+function overQuota(id: number) {
+  const u = usage.value[id]
+  return !!u && u.quota_tx > 0 && u.month_tx_bytes >= u.quota_tx
 }
 
 function onSelectionChange(rows: WgPeer[]) {
@@ -701,6 +812,8 @@ function openEdit(row: WgPeer) {
     generate_psk: false,
     route_mode: row.route_mode || 'lan',
     client_allowed_ips: [...(row.client_allowed_ips || [])],
+    lan_policy: row.lan_policy || 'inherit',
+    lan_targets: [...(row.lan_targets || [])],
     allowed_ips: [...(row.allowed_ips || [])],
     endpoint_host: row.endpoint_host,
     endpoint_port: row.endpoint_port,
@@ -730,6 +843,8 @@ async function submit() {
       generate_psk: form.generate_psk,
       route_mode: form.route_mode,
       client_allowed_ips: form.client_allowed_ips,
+      lan_policy: form.lan_policy,
+      lan_targets: form.lan_targets,
       auto_address: true,
       allowed_ips: form.allowed_ips,
       endpoint_host: form.endpoint_host,
@@ -766,7 +881,9 @@ async function submit() {
 async function loadConfig(row: WgPeer) {
   const res = await api.get<PeerConfigResult>(`/peers/${row.id}/config`)
   cfg.value = res
-  qrDataUrl.value = await QRCode.toDataURL(res.qr_payload || res.conf, { margin: 1, width: 480 })
+  // 样式化的二维码：深色模块画成圆点、中心放应用图标（见 utils/qr.ts 里那几条不能省的约束）
+  // 720：整份配置的模块数不少，内联尺寸给大一点，位图导出/放大时更稳
+  qrDataUrl.value = await styledQrDataUrl(res.qr_payload || res.conf, 720)
   // 生成配置等于把最新设置交付给了设备，服务端已记下这次交付；
   // 立刻刷新列表，让「需重新扫码」标记当场消失（否则要等下次手动刷新）。
   if (row.config_stale) await load()
@@ -946,5 +1063,10 @@ watch(
 .fnwg-warn {
   color: var(--el-color-warning);
   font-size: 12px;
+}
+
+/* 本月用量已经触到额度上限：用满就会被自动停用，这一眼必须看得出来 */
+.fnwg-over-quota {
+  color: var(--el-color-danger);
 }
 </style>

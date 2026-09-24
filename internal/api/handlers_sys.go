@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"fnwg"
 	"fnwg/internal/model"
 	"fnwg/internal/service"
+	"fnwg/internal/store"
 )
 
 // ---------------------------------------------------------------- 认证
@@ -37,6 +40,22 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 		// 是给安装/升级脚本用的：只看端口就报「安装成功」，
 		// 用户点桌面图标才发现是 502（见 apps/fn-wireguard/cmd/common 的 fnwg_gateway_check）。
 		"socket_ready": s.gatewaySocketReady(),
+		// 本次请求走的哪条通道、能不能用飞牛身份免密进入 —— 登录页据此决定要不要给指引
+		// （例如「免密只在从飞牛桌面打开时可用」「回飞牛桌面重新点开」）。
+		// 只回答「能不能」，不回答「你是谁」：登录前不该从这里拿到任何身份信息。
+		"channel":           channelOf(r),
+		"gateway_available": gatewayAvailable(r),
+	}
+	// 本次请求带着可用的飞牛身份就把用户名报出来，**与是否已登录、是否已初始化都无关**：
+	//  - 登录页要在「刚退出登录」那一刻仍然显示「飞牛账号 XXX」这个入口，而那一刻恰好没有登录；
+	//  - 初始化页要在「还没建任何账号」时就知道能不能走「用飞牛账号登录」这条路 ——
+	//    早先这段写在初始化判断**之后**，于是全新安装时它永远拿不到身份，
+	//    初始化页明明是从飞牛桌面点进来的，却不给飞牛账号这个选项（真机反馈）。
+	if id, ok := gatewayIdentityIfTrusted(r); ok {
+		out["gateway_user"] = map[string]any{
+			"username": id.Username,
+			"is_admin": id.IsAdmin,
+		}
 	}
 	if !initialized {
 		writeJSON(w, http.StatusOK, out)
@@ -45,6 +64,7 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 	if u, err := s.svc.Authenticate(r.Context(), extractToken(r)); err == nil {
 		out["authenticated"] = true
 		out["user"] = u
+		out["identity"] = "session"
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -53,9 +73,15 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		// GatewayOnly 对应初始化页面上的第二个选项：不建本地口令账号，直接用飞牛账号登录。
+		GatewayOnly bool `json:"gateway_only"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if in.GatewayOnly {
+		s.setupGatewayOnly(w, r)
 		return
 	}
 	u, err := s.svc.Setup(r.Context(), in.Username, in.Password)
@@ -85,6 +111,51 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	if code, codeErr := s.svc.IssueSecurityCode(r.Context(), service.Actor{Username: in.Username}); codeErr != nil {
 		// 生成失败不该阻断初始化（账号已经建好了），但必须如实告知，
 		// 不能让用户以为自己已经拿到了后手。稍后可在「账号管理」里重新生成。
+		out["security_code_error"] = "安全码生成失败，请稍后到「账号管理」重新生成：" + codeErr.Error()
+	} else {
+		out["security_code"] = code
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// setupGatewayOnly 走「不建账号，直接用飞牛账号登录」这条路。
+//
+// 它不是绕开初始化，而是把「第一个管理员是谁」交给飞牛身份本身：发起这次初始化的
+// 那个飞牛账号就是第一份管理员（管理员 → 管理员、普通成员 → 只读，与此后每次飞牛登录
+// 完全同一套规则）。本地因此不落任何口令 —— 也就没有「用户的密码」这回事，
+// 登录页与账号管理里都不该再出现「修改密码」。
+//
+// 安全码照发：它是所有登录途径都失效时的唯一退路，必须在这一刻交给用户；
+// 而且此时账号已经建好（就是上面那份飞牛账号），应急登录有落点，不会发一枚无处可用的码。
+func (s *Server) setupGatewayOnly(w http.ResponseWriter, r *http.Request) {
+	// 只认通道可信的飞牛身份：端口入口上没有飞牛身份，也就谈不上「用飞牛账号登录」
+	id, ok := gatewayIdentityIfTrusted(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest,
+			"这次请求没有可用的飞牛身份，无法走「用飞牛账号登录」这条路：请从飞牛桌面点开本应用后初始化，或改用账号密码方式")
+		return
+	}
+	has, err := s.svc.HasUsers(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if has {
+		writeErr(w, http.StatusBadRequest, "系统已初始化，请直接登录")
+		return
+	}
+	step, err := s.svc.LoginAsGatewayUser(r.Context(), id.UID, id.Username, id.IsAdmin, r.UserAgent(), clientIP(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.setSessionCookie(w, step.Token)
+	out := map[string]any{
+		"user":        step.User,
+		"permissions": model.PermissionsOf(step.User.Role),
+	}
+	if code, codeErr := s.svc.IssueSecurityCode(r.Context(), service.Actor{Username: "setup"}); codeErr != nil {
+		// 与账号密码方式一致：生成失败不阻断初始化，但必须如实告知，不能让人以为拿到了后手
 		out["security_code_error"] = "安全码生成失败，请稍后到「账号管理」重新生成：" + codeErr.Error()
 	} else {
 		out["security_code"] = code
@@ -395,6 +466,8 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"user":        u,
 		"permissions": model.PermissionsOf(u.Role),
 		"version":     s.version,
+		// 这次身份是怎么来的（本应用会话 / 飞牛网关注入），界面据此决定能不能「退出登录」
+		"identity": identityKind(r),
 	})
 }
 
@@ -763,12 +836,27 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "share_dir": s.shareDir})
+	// 多带一个 missing：记录在数据库里，文件却可能已经被手动删掉或移走。
+	// 让界面提前把这一行标出来并禁掉下载/还原，比等用户点了再报错省事 ——
+	// 那种报错（open …: no such file）既不好读，也说不清该怎么办。
+	type backupRow struct {
+		store.BackupRecord
+		Missing bool `json:"missing"`
+	}
+	rows := make([]backupRow, 0, len(items))
+	for _, it := range items {
+		_, statErr := os.Stat(filepath.Join(s.shareDir, it.Filename))
+		rows = append(rows, backupRow{BackupRecord: it, Missing: os.IsNotExist(statErr)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": rows, "share_dir": s.shareDir})
 }
 
 func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Note string `json:"note"`
+		// Dir 是可选的「另存一份到」：留空表示只存到应用自己的备份目录（与历史行为一致）。
+		// 只能选用户在飞牛里授权给本应用的目录；写入由特权代理执行，见 Core.WriteBackupCopy。
+		Dir string `json:"dir"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -779,7 +867,22 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, rec)
+	out := map[string]any{"backup": rec}
+	if strings.TrimSpace(in.Dir) != "" {
+		// 另存也交给代理：写入发生在用户授权的共享文件夹上，而界面进程对它没有写权限。
+		// 源按备份 ID 指定（代理自己去找文件），不给协议任何任意路径读写的能力。
+		a := actorOf(r)
+		_, derr := s.svc.Core.WriteBackupCopy(r.Context(), in.Dir, rec.ID, a.UserID, a.Username, a.SrcIP)
+		if derr != nil {
+			// 本地那份已经写好了，这里只是「另存一份」没成。不能整体报失败 ——
+			// 那会让人以为没备份，而备份其实好好地在列表里。返回成功 + 单独说明。
+			out["copy_error"] = derr.Error()
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		out["copied_to"] = filepath.Clean(strings.TrimSpace(in.Dir))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {

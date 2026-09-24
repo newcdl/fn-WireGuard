@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"fnwg/internal/notify"
 	"io"
 	"log/slog"
 	"os"
@@ -22,8 +23,10 @@ import (
 	"fnwg/internal/core"
 	"fnwg/internal/reconcile"
 	"fnwg/internal/secretbox"
+	"fnwg/internal/service"
 	"fnwg/internal/store"
 	"fnwg/internal/sysutil"
+	"fnwg/internal/traffic"
 	"fnwg/internal/wgback"
 )
 
@@ -108,8 +111,37 @@ func main() {
 		return
 	}
 
+	// 计划备份：挂在常驻的收敛循环旁（见 reconcile.BackupPlanRunner）。
+	//
+	// 放在代理进程而不是 web 进程：代理是本应用里「一定在跑」的那个进程，
+	// 备份恰恰是最不该依赖界面进程是否活着的功能；另外失败通知要走通知队列，
+	// 而队列只在代理进程里启动。
+	//
+	// 授权目录来自飞牛注入的 TRIM_DATA_ACCESSIBLE_PATHS：应用只能写用户授权给它的目录，
+	// 目标目录必须落在其中（校验见 service.ValidateBackupTarget）。
+	engine.SetBackupPlanRunner(service.NewBackupPlanRunner(st, cfg.Version, service.BackupPlanEnv{
+		OwnDir:         cfg.ShareDir(),
+		AuthorizedDirs: cfg.AuthorizedDirs(),
+		Dev:            cfg.Dev,
+		GroupID:        sysutil.LookupGID(cfg.Group),
+	}, logger))
+
+	// 配置漂移巡检：挂在同一根常驻循环旁（见 reconcile.Inspector）。
+	//
+	// 判定与落库都放在代理进程：巡检要读内核里的规则与路由，还要读通知与备份的状态，
+	// 这些事实都在这一侧；界面只读报告，不自己判一遍（免得两边口径不一致）。
+	local := core.NewLocal(engine)
+	engine.SetInspector(service.New(st, local, logger, cfg.Version))
+	// 新设备提醒要走通知投递：把引擎的投递器交给服务
+	// （界面进程也会装配一个 Service，它不需要投递，所以用注入而不是让 service 直接持有）
+	service.SetAssetsNotifier(func(ctx context.Context, ev notify.Event) { engine.Notifier().Notify(ctx, ev) })
+
 	// 采样与收敛循环：进程启动即执行一次全量收敛，实现重启自恢复。
 	go engine.Run(ctx)
+
+	// 流量采样：把内核里的累计计数折算成按小时的增量，供报表与「每月额度」使用。
+	// 只在这里（生产）与开发模式的 web 进程里各起一个 —— 两个进程同时写会重复计账。
+	traffic.New(st, engine.Status, logger).Start(ctx)
 
 	// 周期性修正共享文件权限，覆盖 SQLite 自行创建 -wal/-shm 的情况
 	go func() {
@@ -125,7 +157,7 @@ func main() {
 		}
 	}()
 
-	srv := agentapi.NewServer(cfg.SocketPath, cfg.Group, core.NewLocal(engine), logger)
+	srv := agentapi.NewServer(cfg.SocketPath, cfg.Group, local, logger)
 	if err := srv.Listen(); err != nil {
 		logger.Error("监听 socket 失败", "err", err)
 		os.Exit(1)

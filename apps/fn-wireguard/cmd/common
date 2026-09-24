@@ -238,6 +238,25 @@ fnwg_service_port() {
 
 # ---------------------------------------------------------------- systemd 模式
 
+# fnwg_authorized_env_line：把「用户授权给本应用的目录」写给服务进程。
+#
+# 为什么必须显式写进单元：飞牛注入的 TRIM_* 只活在**它调用我们脚本的那个环境**里，
+# 而 systemd 启动的服务不继承调用者的环境。少了这一行，Web/Agent 进程永远看不到
+# 授权目录（TRIM_DATA_ACCESSIBLE_PATHS），界面上就一直显示「暂未授权任何目录」——
+# 用户明明已经授权、也重启过应用，却怎么都不出现。端口同理，见 fnwg_service_port。
+#
+# 授权变了怎么办：每次 fnwg_start 都会重写单元（fnwg_systemd_install），
+# 而「在飞牛里改授权」走的是配置回调 → fnwg_start，于是新值会随单元一起写进去。
+#
+# 值为空也照样写（空 Environment= 是合法的）：这样单元内容始终等于「当前授权」，
+# 撤销授权时不会留下一份旧的、看起来还在生效的值。
+# 值里若带双引号会破坏 systemd 的解析，直接剔除（目录名里出现引号属极端情况）。
+fnwg_authorized_env_line() {
+    local raw="${TRIM_DATA_ACCESSIBLE_PATHS:-}"
+    raw="${raw//\"/}"
+    printf 'Environment="FNWG_AUTHORIZED_DIRS=%s"\n' "$raw"
+}
+
 # fnwg_write_agent_unit <appdest>
 fnwg_write_agent_unit() {
     local appdest="$1"
@@ -252,6 +271,7 @@ Before=fnwg-web.service
 Type=simple
 User=root
 Group=root
+$(fnwg_authorized_env_line)
 ExecStart=${appdest}/fnwg-agent --var ${TRIM_PKGVAR} --etc ${TRIM_PKGETC} --home ${TRIM_PKGHOME} --socket ${TRIM_PKGVAR}/agent.sock --group ${FNWG_GROUP}
 Restart=always
 RestartSec=3
@@ -290,6 +310,7 @@ PartOf=fnwg-agent.service
 Type=simple
 User=${FNWG_GROUP}
 Group=${FNWG_GROUP}
+$(fnwg_authorized_env_line)
 # ExecStartPre 前缀 + 表示「在沙箱外以完整权限执行」。每次拉起 Web 进程都先把
 # socket 落点调成同组可写，而不是只依赖安装脚本那一次 —— 因为飞牛的重新部署会
 # 重建 target 目录并把权限恢复成 root:root 755，之后 Restart=always 的自动重启
@@ -367,9 +388,19 @@ fnwg_pid_alive() {
     kill -0 "$pid" 2>/dev/null
 }
 
+# fnwg_export_authorized：把授权目录导出成服务进程读得到的变量名（见 fnwg_authorized_env_line）。
+#
+# PID 文件模式没有 systemd 单元可写，只能靠环境继承；但 runuser/setpriv 这类降权工具
+# 对环境的处理并不一致，显式 export 一次最稳 —— 少了它，PID 模式下同样会出现
+# 「用户已授权、界面却一直显示暂未授权」。
+fnwg_export_authorized() {
+    export FNWG_AUTHORIZED_DIRS="${TRIM_DATA_ACCESSIBLE_PATHS:-}"
+}
+
 fnwg_pidfile_start() {
     local logdir="$TRIM_PKGVAR/log" appdest
     mkdir -p "$logdir"
+    fnwg_export_authorized
     if ! appdest="$(fnwg_appdest)"; then
         fnwg_log "错误：无法确定应用运行目录，PID 模式下无法启动"
         return 1
@@ -418,6 +449,7 @@ fnwg_restart_web() {
         fi
         rm -f "$file"
         appdest="$(fnwg_appdest)" || return 1
+        fnwg_export_authorized
         nohup fnwg_run_as_user "$appdest/fnwg-web" \
             --bind 0.0.0.0 --port "$(fnwg_service_port)" \
             --var "$TRIM_PKGVAR" --etc "$TRIM_PKGETC" --home "$TRIM_PKGHOME" \

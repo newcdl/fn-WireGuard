@@ -34,3 +34,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# AI 助手在本仓库留下的本地记忆与规则，属于个人工作区状态，不随源码公开
+.codebuddy/

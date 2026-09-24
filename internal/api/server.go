@@ -32,6 +32,9 @@ type Server struct {
 	assets   fs.FS
 	version  string
 	shareDir string
+	// planRunner 计划备份执行器。放在服务端而不是每次请求新建：
+	// 它内部靠包级锁串行化「写入 + 清理旧份」，每次新建就挡不住并发触发。
+	planRunner *service.BackupPlanRunner
 
 	loginMu    sync.Mutex
 	loginFails map[string]loginFail
@@ -51,7 +54,10 @@ type loginFail struct {
 }
 
 // NewServer 创建 API 服务。
-func NewServer(svc *service.Service, logger *slog.Logger, version, shareDir string) *Server {
+//
+// planRunner 由 cmd 层构造并注入：目标目录的合法性依赖飞牛注入的授权环境变量
+// （TRIM_DATA_ACCESSIBLE_PATHS），那只有 cmd 层拿得到。
+func NewServer(svc *service.Service, logger *slog.Logger, version, shareDir string, planRunner *service.BackupPlanRunner) *Server {
 	// 配置快照与备份共用共享目录：那里已经被应用中心授予了组读写权限，
 	// 另开子目录还得再走一遍权限自愈，不如同目录、靠文件名前缀区分。
 	svc.SetSnapshotDir(shareDir)
@@ -60,6 +66,7 @@ func NewServer(svc *service.Service, logger *slog.Logger, version, shareDir stri
 		log:        logger,
 		version:    version,
 		shareDir:   shareDir,
+		planRunner: planRunner,
 		loginFails: map[string]loginFail{},
 	}
 }
@@ -204,6 +211,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		token := extractToken(r)
 		u, err := s.svc.Authenticate(r.Context(), token)
 		if err != nil {
+			// 这里**不再**凭网关注入的身份直接放行：飞牛身份要经登录页那个按钮
+			// 换成会话（POST /auth/gateway-login）之后才算登录。
+			// 早先按请求头自动放行，导致「退出登录」等于下一刻又被带进来（真机反馈）。
 			// 被拒的请求必须留痕。此前这里是静默 401，于是「请求压根没到达服务端」
 			// 与「到达了但没通过鉴权」在日志里一模一样 —— 都是一片安静，
 			// 排障的人只会得出「什么都没发生」这个错误结论。
@@ -245,7 +255,7 @@ func (s *Server) gatewaySocketReady() bool {
 	return p != nil && probeGatewaySocket(*p) == gatewaySocketOK
 }
 
-func requirePerm(perm string) func(http.Handler) http.Handler {
+func (s *Server) requirePerm(perm string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			u := userOf(r)
@@ -257,7 +267,66 @@ func requirePerm(perm string) func(http.Handler) http.Handler {
 				writeErr(w, http.StatusForbidden, "当前角色无此操作权限")
 				return
 			}
+			if s.stepUpNeeded(r, perm) {
+				writeStepUp(w)
+				return
+			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// stepUpNeeded 判断这次请求是否要先过一次二次验证（开关默认关，见 service/stepup.go）。
+//
+// 只对「凭飞牛身份免密进来」的请求生效（这类会话没有本应用令牌）：
+// 端口通道走账号密码登录，登录本身就是一次凭据校验，而且它是用户被自己开的开关
+// 挡住时的**退路** —— 把退路也堵上就等于自锁。
+func (s *Server) stepUpNeeded(r *http.Request, perm string) bool {
+	if !service.SensitivePerm(perm) {
+		return false
+	}
+	au, ok := r.Context().Value(ctxUser).(*authUser)
+	if !ok || au == nil || au.User == nil || au.User.TrimUID <= 0 {
+		return false
+	}
+	if !s.svc.StepUpEnabled(r.Context()) {
+		return false
+	}
+	return !s.svc.StepUpFresh(au.User.ID)
+}
+
+// identityKind 说明「这次请求的身份是怎么来的」：
+//   - "session"：本应用会话（账号密码 / 安全码登录换来的令牌）；
+//   - "gateway"：飞牛网关注入的身份（无令牌，见 requireAuth 的免密分支）。
+//
+// 界面必须能分辨这两者：**能退出的是前者**（有会话可注销），后者没有会话可退，
+// 「退出登录」对它无从谈起 —— 但判断依据**绝不能是通道**：
+// 从飞牛桌面进来的请求既可能是飞牛身份，也可能是用户自己用账号密码登录出来的会话
+// （真实故障：按通道判断，导致从飞牛桌面进来的账号密码会话也退不了登录）。
+func identityKind(r *http.Request) string {
+	au, ok := r.Context().Value(ctxUser).(*authUser)
+	if !ok || au == nil {
+		return ""
+	}
+	// 飞牛账号没有本应用口令，所以它的会话必然是「以飞牛账号登录」换来的。
+	// 据此判断会话来源，比在会话表里另加一列更省，也不会两处不一致。
+	if au.User.TrimUID > 0 || au.Token == "" {
+		return "gateway"
+	}
+	return "session"
+}
+
+// writeStepUp 回一个前端能认出来的 403：它表示「先去验证一次」，而不是「你没这个权限」。
+//
+// 两者必须能分辨：若共用一句话，界面只能显示「无权限」，
+// 用户完全不知道该做什么，也不知道自己其实是能做的。
+func writeStepUp(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"code":             428,
+		"message":          "这一步需要先验证一次身份（动态口令）",
+		"step_up_required": true,
+	})
 }

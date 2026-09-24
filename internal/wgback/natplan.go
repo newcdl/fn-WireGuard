@@ -8,6 +8,8 @@ import (
 	"net"
 	"sort"
 	"strings"
+
+	"fnwg/internal/model"
 )
 
 // 本文件决定两件相关但独立的事要怎么落地到同一张专用 nftables 表里：
@@ -46,6 +48,18 @@ type NATPlanInput struct {
 	Enabled bool
 	// SourceSubnets 需要被改写的源网段（各连接的隧道网段）。
 	SourceSubnets []string
+	// PeerRestrictions 是「按设备限制内网访问目标」的约束（inherit 的条目不必传进来）。
+	//
+	// 与 PeerSubnets 的方向相反，别混：PeerSubnets 是「对端站点网段要放行」（加宽），
+	// 这里是「某台设备只能去哪」（收窄）。
+	PeerRestrictions []PeerRestriction
+	// PeerSubnets 是「对端站点网段」：设备准入地址里落在隧道之外的部分
+	// （站点到站点互联时，对端局域网里的主机用这些源地址发来流量）。
+	//
+	// 与隧道网段同等对待，但来源不同：隧道网段是「本连接的设备」，
+	// 这里是「对端 NAS 背后的机器」。少了这一项，站点互联的表现会是
+	// 「隧道通、对端 NAS 自己能访问，但对端局域网里的机器访问不了」。
+	PeerSubnets []string
 	// WANInterfaces 出口网卡（默认路由所在网卡）。
 	WANInterfaces []string
 	// WANReason 是数据面探测不到出口网卡时给出的**具体**原因，为空则使用内置通用提示。
@@ -66,6 +80,35 @@ type NATPlanInput struct {
 	// 隔离范围要覆盖全部隧道，而不是只覆盖开了隔离的那一条：
 	// 若只隔离 wg0，wg1 里的设备仍能访问 wg0 的设备，那隔离就是假的。
 	TunnelSubnets []string
+}
+
+// PeerRestriction 是「某台设备能访问内网的哪些目标」。
+type PeerRestriction struct {
+	// Policy 见 model.LANPolicy*：restrict（只允许 Targets）或 deny（不允许访问内网）。
+	Policy string
+	// DeviceAddresses 是该台设备在隧道里的地址（/32 形式），用于匹配源。
+	DeviceAddresses []string
+	// Targets 是 restrict 时允许访问的目标，写法见 model.ParseLANTarget（可带端口）。
+	Targets []string
+}
+
+// PeerTargetRule 是一条「允许某台设备访问某个内网目标」的规则（纯数据）。
+//
+// 输出纯数据的原因与 IsolationRules 相同：规则到底会下发成什么样，要能在单元测试里
+// 穷举核对，而不是靠读回内核规则去间接推断。
+type PeerTargetRule struct {
+	Src string
+	Dst string
+	// Port > 0 时只放行该端口（TCP / UDP 各一条规则），否则放行全部协议。
+	Port int
+}
+
+// Key 返回该规则的稳定描述（指纹与测试核对用）。
+func (r PeerTargetRule) Key() string {
+	if r.Port > 0 {
+		return fmt.Sprintf("allow:%s>%s:%d", r.Src, r.Dst, r.Port)
+	}
+	return fmt.Sprintf("allow:%s>%s", r.Src, r.Dst)
 }
 
 // NATPlan 是内网访问与设备隔离的落地决策。
@@ -90,6 +133,13 @@ type NATPlan struct {
 	TunnelSources []string
 	// IsolateReason 是隔离规则无法下发时的原因（面向用户）。
 	IsolateReason string
+
+	// PeerAllow / PeerDeny 是按设备的内网访问范围（纯数据，测试可穷举核对）：
+	//   - PeerAllow：先放行的白名单（restrict 设备允许的目标，可带端口）；
+	//   - PeerDeny：再把该设备访问「内网」的流量丢掉 —— 白名单排在它前面，因此不在白名单里的都被挡住。
+	// 两者都必须排在网段级放行之前，否则丢弃轮不到生效（nftables 以第一条匹配的规则为终局判定）。
+	PeerAllow []PeerTargetRule
+	PeerDeny  [][2]string
 }
 
 // Empty 表示这份决策不需要在内核里留下任何规则。
@@ -109,10 +159,27 @@ func (p NATPlan) Fingerprint() string {
 			parts = append(parts, "iso:"+r[0]+">"+r[1])
 		}
 	}
+	parts = append(parts, peerACLFingerprint(p)...)
 	if len(parts) == 0 {
 		return ""
 	}
 	return strings.Join(parts, "|")
+}
+
+// peerACLFingerprint 按「实际要下发的规则」计算按设备规则的指纹。
+//
+// 与隔离规则同一理由：输入列表的顺序或写法变化不该引起规则重建，
+// 而规则内容变化必须引起重建 —— 否则改了一台设备的允许目标，规则却还是旧的。
+func peerACLFingerprint(p NATPlan) []string {
+	out := []string{}
+	for _, r := range p.PeerAllow {
+		out = append(out, "acl:"+r.Key())
+	}
+	for _, pair := range p.PeerDeny {
+		out = append(out, "acl-deny:"+pair[0]+">"+pair[1])
+	}
+	sort.Strings(out)
+	return out
 }
 
 // IsolationRules 返回设备间隔离的「源网段 → 目标网段」丢弃规则对。
@@ -152,6 +219,7 @@ func PlanNAT(in NATPlanInput) NATPlan {
 	// 先算隔离：它与内网访问能不能启用无关，不能因为后者提前返回而丢掉。
 	plan.applyIsolation(in)
 	plan.applyForwarding(in)
+	plan.applyPeerTargets(in)
 	return plan
 }
 
@@ -187,13 +255,16 @@ func (p *NATPlan) applyForwarding(in NATPlanInput) {
 		return
 	}
 
-	// 目前只对 IPv4 隧道网段做地址改写；IPv6 的转发放行后续版本再支持。
-	all := normalizeCIDRs(in.SourceSubnets)
+	// 目前只对 IPv4 网段做地址改写；IPv6 的转发放行后续版本再支持。
+	// 对端站点网段与隧道网段一起参与后面的全部检查（尤其是「不能与主机网段重叠」）：
+	// 它们都会成为转发的源，安全性要求完全一致。
+	all := normalizeCIDRs(append(append([]string{}, in.SourceSubnets...), in.PeerSubnets...))
 	if len(all) == 0 {
 		p.SkipReason = "未获取到这条连接的隧道网段，无法确定要放行哪些设备"
 		return
 	}
 	sources := ipv4Subnets(all)
+	sites := ipv4Subnets(in.PeerSubnets)
 	if len(sources) == 0 {
 		p.SkipReason = "本连接的隧道地址是 IPv6，目前暂不支持 IPv6 的内网访问转发"
 		return
@@ -222,11 +293,19 @@ func (p *NATPlan) applyForwarding(in NATPlanInput) {
 		if err != nil {
 			continue
 		}
-		if overlapsAny(n, hostNets) {
-			p.SkipReason = fmt.Sprintf("隧道网段 %s 与 NAS 现有网段重叠，为避免影响系统网络已跳过；"+
-				"请到「我的连接」中把「本机专用地址」改成不冲突的网段", s)
+		if !overlapsAny(n, hostNets) {
+			continue
+		}
+		// 说清是哪一类网段重叠：两者的改法完全不同 ——
+		// 隧道网段去改「本机专用地址」，对端站点网段要去改对端那条设备的允许来源。
+		if contains(sites, s) {
+			p.SkipReason = fmt.Sprintf("对端站点网段 %s 与 NAS 现有网段重叠，转发已跳过；"+
+				"它应当是**对端**局域网的网段，请核对后修改那条互联设备", s)
 			return
 		}
+		p.SkipReason = fmt.Sprintf("隧道网段 %s 与 NAS 现有网段重叠，为避免影响系统网络已跳过；"+
+			"请到「我的连接」中把「本机专用地址」改成不冲突的网段", s)
+		return
 	}
 
 	sort.Strings(sources)
@@ -234,6 +313,146 @@ func (p *NATPlan) applyForwarding(in NATPlanInput) {
 	p.Enable = true
 	p.Sources = sources
 	p.WANs = wans
+}
+
+// peerSiteSubnets 返回「对端站点网段」：本连接各设备的准入地址里落在隧道之外的部分。
+//
+// 语义来自既有的「设备准入地址」（`PeerSpec.AllowedIPs` = 这个对端可以用哪些源地址进来）：
+// 落在隧道网段里的是它自己的隧道地址；隧道之外的就是站点互联时对端背后的网段
+// （例如对端局域网的 192.168.2.0/24）。只有把它们也纳入转发的源，
+// 对端局域网里的主机才能访问本机内网。
+//
+// 两条例外（宁可不放行，也不多放一个网段）：
+//  1. 默认路由写法一律丢弃 —— 准入校验已经禁止，这里再挡一次：
+//     万一从旧数据里读到 0.0.0.0/0，那等于把本机内网整个暴露给对端；
+//  2. IPv6 跳过（nft 规则目前只写 IPv4 匹配，与隧道网段同一口径）。
+func peerSiteSubnets(s model.InterfaceSpec, tunnel []string) []string {
+	tunnelNets := parseCIDRs(tunnel)
+	out := []string{}
+	for _, p := range s.Peers {
+		for _, a := range p.AllowedIPs {
+			_, n, err := net.ParseCIDR(strings.TrimSpace(a))
+			if err != nil || n.IP.To4() == nil {
+				continue
+			}
+			if ones, bits := n.Mask.Size(); bits == 32 && ones == 0 {
+				continue
+			}
+			if overlapsAny(n, tunnelNets) {
+				continue
+			}
+			c := maskedCIDR(n)
+			if !contains(out, c) {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// applyPeerTargets 计算「按设备限制内网访问目标」的规则。
+//
+// 只在「内网访问」开着时才谈得上限制：连接级开关没开时本来就什么都访问不了，
+// 此时再下发拒绝规则只是徒增规则，还会让「明明没开内网访问，却看到一堆 ACL 规则」难以解释。
+//
+// 拒绝集用的是**主机网段**（HostNetworks，即 NAS 自己所在的那些网段），不是隧道网段：
+// 隧道内的互访由「设备间隔离」负责，两者不能混。
+func (p *NATPlan) applyPeerTargets(in NATPlanInput) {
+	if !in.Enabled || len(in.PeerRestrictions) == 0 {
+		return
+	}
+	hostNets := ipv4Subnets(in.HostNetworks)
+	if len(hostNets) == 0 {
+		// 不知道内网是哪几段时不下发拒绝规则：宁可少挡一层，
+		// 也不能凭猜把设备的正常访问切掉 —— 那会让「配了限制」比「没配」更糟。
+		return
+	}
+	seenAllow := map[string]bool{}
+	seenDeny := map[string]bool{}
+	for _, r := range in.PeerRestrictions {
+		if r.Policy != model.LANPolicyRestrict && r.Policy != model.LANPolicyDeny {
+			continue
+		}
+		for _, dev := range ipv4Subnets(r.DeviceAddresses) {
+			if r.Policy == model.LANPolicyRestrict {
+				for _, t := range r.Targets {
+					addr, port, err := model.ParseLANTarget(t)
+					if err != nil {
+						continue // 保存期已经校验过；这里跳过单条，不中断整份计划
+					}
+					rule := PeerTargetRule{Src: dev, Dst: addr, Port: port}
+					if seenAllow[rule.Key()] {
+						continue
+					}
+					seenAllow[rule.Key()] = true
+					p.PeerAllow = append(p.PeerAllow, rule)
+				}
+			}
+			for _, net := range hostNets {
+				key := dev + ">" + net
+				if seenDeny[key] {
+					continue
+				}
+				seenDeny[key] = true
+				p.PeerDeny = append(p.PeerDeny, [2]string{dev, net})
+			}
+		}
+	}
+	// 排序让指纹稳定：否则列表顺序一变就会被判定成「内容变了」，每轮收敛都重建规则。
+	sort.Slice(p.PeerAllow, func(i, j int) bool { return p.PeerAllow[i].Key() < p.PeerAllow[j].Key() })
+	sort.Slice(p.PeerDeny, func(i, j int) bool {
+		if p.PeerDeny[i][0] != p.PeerDeny[j][0] {
+			return p.PeerDeny[i][0] < p.PeerDeny[j][0]
+		}
+		return p.PeerDeny[i][1] < p.PeerDeny[j][1]
+	})
+}
+
+// maskedCIDR 把网段归一化
+//
+// 放在本文件（而不是 linux.go）：它是纯计算，跨平台的用例也要能调到它 ——
+// 指纹与规则内容都依赖归一化结果，任何平台都该能测。
+func maskedCIDR(n *net.IPNet) string {
+	if n == nil {
+		return ""
+	}
+	return (&net.IPNet{IP: n.IP.Mask(n.Mask), Mask: n.Mask}).String()
+}
+
+// peerRestrictions 收集「按设备限制内网访问目标」的约束。
+//
+// 源地址取该设备在**本连接隧道网段内**的地址：对端的站点网段不是设备本身，不能当源。
+// 设备在隧道里的地址通常就是一个 /32，多个也一并带上。
+func peerRestrictions(specs []model.InterfaceSpec, tunnels []string) []PeerRestriction {
+	tunnelNets := parseCIDRs(tunnels)
+	out := []PeerRestriction{}
+	for _, s := range specs {
+		if !s.Up {
+			continue
+		}
+		for _, p := range s.Peers {
+			if p.LANPolicy != model.LANPolicyRestrict && p.LANPolicy != model.LANPolicyDeny {
+				continue
+			}
+			addrs := []string{}
+			for _, a := range p.AllowedIPs {
+				_, n, err := net.ParseCIDR(strings.TrimSpace(a))
+				if err != nil || n.IP.To4() == nil {
+					continue
+				}
+				if !overlapsAny(n, tunnelNets) {
+					continue
+				}
+				addrs = append(addrs, maskedCIDR(n))
+			}
+			if len(addrs) == 0 {
+				// 没有隧道地址就无从匹配源：跳过，而不是退化成「限制所有人」。
+				continue
+			}
+			out = append(out, PeerRestriction{Policy: p.LANPolicy, DeviceAddresses: addrs, Targets: p.LANTargets})
+		}
+	}
+	return out
 }
 
 // ipv4Subnets 规范化网段列表并只保留 IPv4（nft 规则目前只写 IPv4 匹配）。

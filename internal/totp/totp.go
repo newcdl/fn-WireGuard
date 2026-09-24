@@ -128,6 +128,19 @@ func codeAt(key []byte, counter uint64) string {
 	return fmt.Sprintf("%0*d", Digits, v%codeMod)
 }
 
+// IconURL 是写进 otpauth 链接、供身份验证器显示的应用图标。
+//
+// 为什么用 GitHub 上的图标：验证器里的图标不由二维码决定，而是 App 自己去查的 ——
+// 它按发行方名称匹配，我们的名称里有「WireGuard」，于是被匹配成官方 WireGuard 的 logo。
+// otpauth 提供了可选的 image 参数来指定图标，但不认它的 App 会直接忽略（Google
+// Authenticator、Microsoft Authenticator、Authy 都不认；Aegis、Ente Auth、2FAS 认）。
+// 既然本项目开源，用仓库里的图标地址最合适：公网可达（不依赖 NAS 的局域网地址，
+// 出门在外也取得到），也不会把内网地址写进验证器条目。
+//
+// 用 tag 而不是分支：分支会被改写甚至删除，而这条地址一旦写进用户的验证器就长期有效，
+// 必须不可变。图标若有更新，改这里并同步测试即可。
+const IconURL = "https://raw.githubusercontent.com/newcdl/fn-WireGuard/v0.9.0/apps/fn-wireguard/app/ui/images/icon_192.png"
+
 // ProvisioningURI 生成供身份验证器扫码的 otpauth:// 链接。
 //
 // account 一般是「用户名@NAS」，issuer 是显示在验证器里的服务名。
@@ -138,6 +151,9 @@ func ProvisioningURI(issuer, account, secret string) string {
 	v.Set("algorithm", "SHA1")
 	v.Set("digits", strconv.Itoa(Digits))
 	v.Set("period", strconv.Itoa(Period))
+	// image 是 otpauth 的可选扩展：少数验证器会用它显示图标，其余按规范忽略未知参数。
+	// 代价是链接变长（二维码更密），但绑定码只扫一次，这点代价换一个正确的图标值得。
+	v.Set("image", IconURL)
 	// label 里的冒号是 otpauth 约定的「发行方:账号」分隔符，需保留；
 	// url.PathEscape 不会转义冒号，正好符合要求。
 	return "otpauth://totp/" + url.PathEscape(issuer+":"+account) + "?" + v.Encode()

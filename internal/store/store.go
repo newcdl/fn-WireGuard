@@ -96,6 +96,15 @@ CREATE TABLE IF NOT EXISTS wg_peer (
   -- config_fp 是设备上次拿到配置时的客户端配置指纹（不含密钥），
   -- 用来判断「设备里那份配置是不是已经过期」，空表示从未生成过配置。
   config_fp     TEXT    NOT NULL DEFAULT '',
+  -- lan_policy / lan_targets 是「这台设备能访问内网的哪些目标」：默认 inherit 随连接的开关
+  -- （与升级前行为一致），restrict 只允许 lan_targets 里的目标，deny 表示不允许访问内网。
+  -- 它落在服务端规则上，设备侧改不了。
+  lan_policy    TEXT    NOT NULL DEFAULT 'inherit',
+  lan_targets   TEXT    NOT NULL DEFAULT '[]',
+  -- disabled_reason 记录「被自动停用的原因」（quota / expire，空表示不是自动停用）。
+  -- 月度额度要到月初自动恢复，而恢复的前提是知道当初为什么停用：只看 enabled=0
+  -- 分不清「管理员手工停的」与「流量用尽自动停的」，分不清就会把前者也一并放开。
+  disabled_reason TEXT  NOT NULL DEFAULT '',
   created_at    TEXT    NOT NULL,
   updated_at    TEXT    NOT NULL
 );
@@ -111,6 +120,27 @@ CREATE TABLE IF NOT EXISTS wg_peer_stat (
 );
 CREATE INDEX IF NOT EXISTS idx_stat_peer_ts ON wg_peer_stat(interface_id, public_key, ts);
 
+-- 按小时聚合的流量：报表与「每月额度」的唯一依据。
+--
+-- 为什么不直接用上面那张原始采样表算：
+--   原始采样是「一个点一行」，按 5 分钟采样 × 每台设备 × 90 天就是百万级行数，
+--   长期写放大不可接受（ROADMAP R8）；这里每小时一行、增量累加，
+--   20 台设备保留 90 天也只有四万余行。
+--
+-- 为什么存增量而不是累计快照：
+--   内核的累计计数会在接口重建（重启、重新下发配置）后归零，
+--   存增量才能让「这个月用了多少」不受影响 —— 采集侧负责识别计数回绕、
+--   把它当作新基线，绝不把负数写进来。
+CREATE TABLE IF NOT EXISTS wg_traffic_hourly (
+  peer_id      INTEGER NOT NULL,
+  interface_id INTEGER NOT NULL,
+  hour_ts      INTEGER NOT NULL,
+  rx_bytes     INTEGER NOT NULL DEFAULT 0,
+  tx_bytes     INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_traffic_hour ON wg_traffic_hourly(peer_id, hour_ts);
+CREATE INDEX IF NOT EXISTS idx_traffic_iface ON wg_traffic_hourly(interface_id, hour_ts);
+
 CREATE TABLE IF NOT EXISTS sys_user (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT    NOT NULL UNIQUE,
@@ -119,7 +149,12 @@ CREATE TABLE IF NOT EXISTS sys_user (
   role          TEXT    NOT NULL DEFAULT 'viewer',
   status        INTEGER NOT NULL DEFAULT 1,
   last_login_at TEXT,
-  created_at    TEXT    NOT NULL
+  created_at    TEXT    NOT NULL,
+  -- 飞牛统一网关免密登录：账号对应的飞牛用户 UID（NULL = 本应用自建账号）。
+  -- 单独加一列而不是新造映射表：账号管理、审计、会话都直接复用既有一套，少一条并行路径。
+  trim_uid      INTEGER,
+  -- 飞牛用户名的快照，仅用于展示（永不参与匹配）。
+  trim_name     TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sys_session (
@@ -255,10 +290,26 @@ func (s *Store) migrate() error {
 		// 客户端配置指纹：默认空表示「从未生成过配置」，
 		// 此时不显示「配置已过期」——升级不该让所有设备列表突然飘满提示。
 		{"wg_peer", "config_fp", `ALTER TABLE wg_peer ADD COLUMN config_fp TEXT NOT NULL DEFAULT ''`},
+		// 自动停用的原因（quota / expire）：默认空表示「不是自动停用」，
+		// 于是升级上来的历史数据不会被误判成「被额度停用」，也就不会被自动恢复。
+		{"wg_peer", "disabled_reason", `ALTER TABLE wg_peer ADD COLUMN disabled_reason TEXT NOT NULL DEFAULT ''`},
+		// 设备的内网访问范围：默认 inherit=随连接，升级后行为与升级前完全一致。
+		{"wg_peer", "lan_policy", `ALTER TABLE wg_peer ADD COLUMN lan_policy TEXT NOT NULL DEFAULT 'inherit'`},
+		{"wg_peer", "lan_targets", `ALTER TABLE wg_peer ADD COLUMN lan_targets TEXT NOT NULL DEFAULT '[]'`},
+		// 飞牛统一网关免密登录：账号对应的飞牛用户 UID（NULL/0 表示自建账号）。
+		{"sys_user", "trim_uid", `ALTER TABLE sys_user ADD COLUMN trim_uid INTEGER`},
+		// 飞牛用户名的快照，仅用于展示。
+		{"sys_user", "trim_name", `ALTER TABLE sys_user ADD COLUMN trim_name TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := s.ensureColumn(c.table, c.column, c.ddl); err != nil {
 			return err
 		}
+	}
+	// 一个飞牛用户只对应一个本地账号：唯一索引是这条不变量的兜底 ——
+	// 两个请求同时首次进入时会同时发现「账号不存在」，靠它拦下重复创建，而不是靠时序运气。
+	// 放在迁移之后：新建库要等列建好，老库要等 ALTER 完成。
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_trim ON sys_user(trim_uid) WHERE trim_uid IS NOT NULL`); err != nil {
+		return err
 	}
 	if err := s.migrateNetworkSafety(); err != nil {
 		return err

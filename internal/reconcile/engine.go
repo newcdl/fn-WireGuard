@@ -13,6 +13,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -35,6 +36,54 @@ const SampleInterval = 2 * time.Second
 
 // persistInterval 是历史采样落库间隔。
 const persistInterval = 60 * time.Second
+
+// BackupPlanCheckInterval 是计划备份的检查间隔。
+//
+// 5 分钟一查：日程精度是分钟，查得更密没有额外收益；而按小时查会让「每天 03:30」
+// 最晚拖到 04:30 才跑——那一刻 NAS 若正好在忙或关机，就可能白等一天。
+const BackupPlanCheckInterval = 5 * time.Minute
+
+// BackupPlanRunner 由上层注入（见 SetBackupPlanRunner）：到点则执行一次计划备份。
+//
+// 用接口而不是直接调用业务层：引擎的方向一直是「只依赖存储与数据面」，
+// 让它 import service 会把这条边界拆掉（业务层本来就依赖引擎提供的状态）。
+// 返回值刻意用三个原始值，调用方只需要知道「跑没跑、成没成、为什么没成」。
+type BackupPlanRunner interface {
+	RunIfDue(ctx context.Context, now time.Time) (ran, ok bool, reason string)
+	// RunBackupNow 立刻执行一次（界面上点「立即执行一次」），不看日程。
+	//
+	// 手动执行也放在这里，是因为它**必须由特权代理执行**：写入目标是飞牛授权给应用的目录，
+	// 而界面进程（fnwg）对那个目录没有写权限。让界面进程自己写，就会出现「保存时检查通过、
+	// 真写文件时被拒」这种自相矛盾的结果 —— 真机上已经这样翻过一次车。
+	// 两条路（按日程 / 手动）落在同一个进程、同一个身份上，就不会再各走一套。
+	RunBackupNow(ctx context.Context, userID int64, username, srcIP string) (ok bool, file, reason string)
+	// InspectBackupDir 检查备份目标目录并列出其中的副本。
+	//
+	// 「能不能写」必须由本进程（特权代理）回答：目标目录是用户授权给应用的共享文件夹，
+	// 界面进程（fnwg）对它没有写权限，问它得到的是它自己的权限，与备份能否成功无关。
+	InspectBackupDir(ctx context.Context, dir string) (model.BackupDirInfo, error)
+	// ReadBackupCopy 读取目标目录里的一份副本（供界面下载、或用它还原）。
+	ReadBackupCopy(ctx context.Context, dir, name string) ([]byte, error)
+	// WriteBackupCopy 把一份本地备份另存到目标目录，返回实际写出的文件名。
+	//
+	// 源按备份 ID 指定，不接受任意路径：这是特权进程，协议层刻意不提供任意路径读写能力。
+	WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error)
+}
+
+// Inspector 是配置漂移巡检的执行器（实现见 service.RunInspectIfDue）。
+//
+// 与计划备份一样用接口：引擎只依赖存储与数据面，不 import 业务层。
+// 返回值同样刻意用原始值，引擎只需要知道「跑没跑、正不正常、一句话结论」。
+type Inspector interface {
+	// RunInspectIfDue 到点则巡检一次。
+	RunInspectIfDue(ctx context.Context, now time.Time) (ran, ok bool, reason string)
+	// RunInspectNow 立刻巡检一次（界面上点「立即巡检一次」），不看日程。
+	//
+	// 与按日程那一路落在同一个实现、同一个进程里：巡检的判定只有一份，
+	// 不会出现「界面说正常、报告说异常」这种两套口径
+	// （计划备份在这一点上连栽两轮，见 ROADMAP）。
+	RunInspectNow(ctx context.Context, userID int64, username, srcIP string) (ok bool, errors, warnings int, reason string)
+}
 
 type peerSample struct {
 	rx int64
@@ -76,9 +125,79 @@ type Engine struct {
 	lastDiff   []string
 	// dnsOn 记录当前「内网域名解析」开关状态，供状态上报使用。
 	dnsOn bool
+	// backupPlan 计划备份执行器，由 cmd 层注入；为 nil 时跳过（命令行与测试环境）。
+	backupPlan BackupPlanRunner
+	// inspector 配置漂移巡检执行器，同样由 cmd 层注入；为 nil 时跳过。
+	inspector Inspector
 
 	trigger chan struct{}
 }
+
+// RunBackupNow 以特权身份立即执行一次计划备份，返回「成没成、写到哪、为什么没成」。
+//
+// 界面上的「立即执行一次」走这里：写入目标是用户授权的目录，界面进程没有写权限，
+// 而本进程（代理）以 root 运行，不受这个限制。
+//
+// 执行者信息（谁、从哪来）整份往下传：这次执行要写审计，审计页得能看出是有人手动跑的，
+// 而不是系统自己跑了一次。
+func (e *Engine) RunBackupNow(ctx context.Context, userID int64, username, srcIP string) (bool, string, string) {
+	if e.backupPlan == nil {
+		return false, "", errNoBackupRunner.Error()
+	}
+	return e.backupPlan.RunBackupNow(ctx, userID, username, srcIP)
+}
+
+// RunInspectNow 立刻做一次配置漂移巡检。
+//
+// 界面上点「立即巡检一次」走这里：巡检要读内核里的规则与路由，还要读通知与备份的状态，
+// 这些事实都在代理侧；判定也只有一份实现（就在代理进程里），界面进程不自己判一遍。
+func (e *Engine) RunInspectNow(ctx context.Context, userID int64, username, srcIP string) (bool, int, int, string) {
+	if e.inspector == nil {
+		return false, 0, 0, errNoInspector.Error()
+	}
+	return e.inspector.RunInspectNow(ctx, userID, username, srcIP)
+}
+
+// InspectBackupDir 检查备份目标目录并列出其中的副本。
+//
+// 目标目录的一切读写都由本进程完成（见 BackupPlanRunner 的说明），因此这里的结论
+// 可以直接当成事实：能写就是能写。
+func (e *Engine) InspectBackupDir(ctx context.Context, dir string) (model.BackupDirInfo, error) {
+	if e.backupPlan == nil {
+		return model.BackupDirInfo{}, errNoBackupRunner
+	}
+	return e.backupPlan.InspectBackupDir(ctx, dir)
+}
+
+// ReadBackupCopy 读取目标目录里的一份副本。
+func (e *Engine) ReadBackupCopy(ctx context.Context, dir, name string) ([]byte, error) {
+	if e.backupPlan == nil {
+		return nil, errNoBackupRunner
+	}
+	return e.backupPlan.ReadBackupCopy(ctx, dir, name)
+}
+
+// WriteBackupCopy 把一份本地备份另存到目标目录。
+func (e *Engine) WriteBackupCopy(ctx context.Context, dir string, backupID int64, userID int64, username, srcIP string) (string, error) {
+	if e.backupPlan == nil {
+		return "", errNoBackupRunner
+	}
+	return e.backupPlan.WriteBackupCopy(ctx, dir, backupID, userID, username, srcIP)
+}
+
+// errNoBackupRunner 表示引擎里没有注入计划备份执行器（命令行、测试环境）。
+var errNoBackupRunner = errors.New("后台服务未启用计划备份（请确认特权代理正在运行）")
+
+// errNoInspector 表示引擎里没有注入巡检执行器（命令行、测试环境）。
+var errNoInspector = errors.New("后台服务未启用配置漂移巡检（请确认特权代理正在运行）")
+
+// SetInspector 注入配置漂移巡检执行器。
+func (e *Engine) SetInspector(i Inspector) { e.inspector = i }
+
+// SetBackupPlanRunner 注入计划备份执行器。
+//
+// 由 cmd 层调用：只有那里同时知道「应用自己的数据目录在哪」和「谁来生成备份内容」。
+func (e *Engine) SetBackupPlanRunner(r BackupPlanRunner) { e.backupPlan = r }
 
 // New 创建引擎。
 func New(st *store.Store, back wgback.Backend, logger *slog.Logger) *Engine {
@@ -146,6 +265,9 @@ func (e *Engine) Desired(ctx context.Context) ([]model.InterfaceSpec, error) {
 				Endpoint:     p.EndpointString(),
 				AllowedIPs:   p.AllowedIPs,
 				Keepalive:    p.Keepalive,
+				// 按设备限制内网访问目标：策略与目标要进期望态，数据面才判得了。
+				LANPolicy:  p.LANPolicy,
+				LANTargets: p.LANTargets,
 			})
 		}
 		specs = append(specs, spec)
@@ -200,6 +322,11 @@ func (e *Engine) DeleteInterface(ctx context.Context, name string) error {
 	}
 	e.log.Info("已删除接口", "name", name)
 	return nil
+}
+
+// LANDevices 读内网里的设备清单（只读，来自内核邻居表）。
+func (e *Engine) LANDevices(ctx context.Context) (*model.LANReport, error) {
+	return e.back.LANDevices(ctx)
 }
 
 // InspectNetwork 网络自检（只读），用于界面展示与排障。
@@ -520,6 +647,9 @@ func (e *Engine) notifyInterface(ctx context.Context, changes []ifacePresence, n
 }
 
 // Status 返回最近一次状态快照。
+// Notifier 暴露投递器，供进程装配时把它交给服务（新设备提醒等服务侧事件需要它）。
+func (e *Engine) Notifier() *notify.Sender { return e.notifier }
+
 func (e *Engine) Status() model.Status {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -611,72 +741,172 @@ func (e *Engine) EnrichInterfaces(ifaces []model.Interface) {
 	}
 }
 
-// enforceQuota 执行流量配额与到期检查，必要时自动禁用节点。
-func (e *Engine) enforceQuota(ctx context.Context) {
-	snap := e.Status()
+// EnforceQuota 执行流量配额与到期检查：该停用的停用，条件解除的自动恢复。
+//
+// 额度按**自然月**计算，依据是落盘的流量聚合（见 internal/traffic）。早先的口径是
+// 「从设备创建起累计」，而用户填 50GB 时想的是「每月 50GB」；更要紧的是内核的累计计数
+// 会在接口重建（重启、重新下发配置）后归零，于是额度会在重启之后悄悄失效 ——
+// 用户以为它已经被挡住了，实际上又能继续用。
+//
+// 「月初自动恢复」是这套口径的另一半：只停用不恢复，用户每个月都要手工点一次启用。
+// 而恢复的前提是分辨得出「当初是谁停用的」，所以自动停用会写下原因（DisabledReason）——
+// 管理员手工停用的设备（原因为空）永远不会被自动放开。
+func (e *Engine) EnforceQuota(ctx context.Context) {
 	peers, err := e.store.ListPeers(ctx, 0)
 	if err != nil {
 		return
 	}
 	now := time.Now()
-	for _, iface := range snap.Interfaces {
-		for _, st := range iface.Peers {
-			for _, p := range peers {
-				if p.InterfaceName != iface.Name || p.PublicKey != st.PublicKey || !p.Enabled {
-					continue
-				}
-				reason := ""
-				if p.ExpireAt != nil && now.After(*p.ExpireAt) {
-					reason = "已到期"
-				} else if p.QuotaRx > 0 && st.RxBytes >= p.QuotaRx {
-					reason = fmt.Sprintf("接收流量超过配额 %d 字节", p.QuotaRx)
-				} else if p.QuotaTx > 0 && st.TxBytes >= p.QuotaTx {
-					reason = fmt.Sprintf("发送流量超过配额 %d 字节", p.QuotaTx)
-				}
-				if reason == "" {
-					continue
-				}
-				p.Enabled = false
-				if err := e.store.UpdatePeer(ctx, &p); err != nil {
-					continue
-				}
-				msg := fmt.Sprintf("节点 %s 已自动禁用：%s", p.Name, reason)
-				e.log.Warn(msg)
-				_ = e.store.AddLog(ctx, "warn", "quota", msg, "")
-				_ = e.store.AddAudit(ctx, &model.AuditEntry{
-					Action:     "peer.auto_disable",
-					TargetType: "peer",
-					TargetID:   fmt.Sprint(p.ID),
-					Username:   "system",
-					Result:     "ok",
-					Message:    msg,
-				})
+	// 本自然月的起点（本地时区）：额度问的就是「这个月用超了没有」。
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	used, err := e.store.TrafficTotalsSince(ctx, monthStart)
+	if err != nil {
+		// 读不到用量时什么都不做：停用设备是破坏性动作，不能基于「没有数据」下判断。
+		return
+	}
 
-				// 到期与流量用尽必须主动通知：设备被自动停用后，界面上看到的只是「离线」，
-				// 不通知的话用户会去检查自己的网络，而真正的原因在配额与期限设置里。
-				name := p.Name
-				if name == "" {
-					name = "未命名设备"
-				}
-				kind, title, hint := notify.KindQuota,
-					fmt.Sprintf("设备「%s」流量用尽，已自动停用", name),
-					"如需继续使用，请在设备设置里提高流量配额后重新启用。"
-				if p.ExpireAt != nil && now.After(*p.ExpireAt) {
-					kind = notify.KindExpired
-					title = fmt.Sprintf("设备「%s」已到期，已自动停用", name)
-					hint = "如需继续使用，请在设备设置里延长到期时间后重新启用。"
-				}
-				e.notifier.Notify(ctx, notify.Event{
-					Kind:  kind,
-					Title: title,
-					Body:  fmt.Sprintf("自动停用原因：%s。%s", reason, hint),
-					Peer:  name,
-					Iface: iface.Name,
-					At:    now,
-				})
+	for i := range peers {
+		p := peers[i]
+		dec, reason, detail := DecideQuota(p, used[p.ID], now)
+		switch dec {
+		case QuotaDisable:
+			p.Enabled, p.DisabledReason = false, reason
+			if err := e.store.UpdatePeer(ctx, &p); err != nil {
+				continue
 			}
+			e.peerAutoDisabled(ctx, p, reason, detail, now)
+		case QuotaRestore:
+			p.Enabled, p.DisabledReason = true, ""
+			if err := e.store.UpdatePeer(ctx, &p); err != nil {
+				continue
+			}
+			e.peerAutoRestored(ctx, p)
 		}
 	}
+}
+
+// QuotaDecision 是额度/期限检查的结论。
+type QuotaDecision int
+
+const (
+	// QuotaKeep 保持现状。
+	QuotaKeep QuotaDecision = iota
+	// QuotaDisable 需要自动停用。
+	QuotaDisable
+	// QuotaRestore 停用条件已解除，需要自动恢复。
+	QuotaRestore
+)
+
+// DecideQuota 判定某台设备当前该怎么处理，是纯函数：不读库、不改状态、不依赖当前时间以外的东西。
+//
+// 之所以独立出来：这段判定会**改动用户的设备状态**（停用一台设备等于把它踢下线），
+// 而分支不少 —— 到期、收/发两个方向的额度、自动停用后的恢复、以及「管理员手工停用的绝不能自动放开」。
+// 纯函数才能把这些分支逐条穷举，而不是等到真机上某台设备莫名其妙被放开了才发现。
+//
+// usage 传的是该设备**本自然月**的累计用量；停用的具体原因写进 DisabledReason，
+// 因为那个原因决定了条件解除后能不能自动恢复。
+func DecideQuota(p model.Peer, usage store.TrafficTotal, now time.Time) (QuotaDecision, string, string) {
+	reason, detail := "", ""
+	switch {
+	case p.ExpireAt != nil && now.After(*p.ExpireAt):
+		reason = model.PeerDisabledExpired
+		detail = "已到期 " + p.ExpireAt.Local().Format("2006-01-02 15:04")
+	case p.QuotaTx > 0 && usage.TxBytes >= p.QuotaTx:
+		reason = model.PeerDisabledQuota
+		detail = fmt.Sprintf("本月发送 %s，已达上限 %s", humanBytes(usage.TxBytes), humanBytes(p.QuotaTx))
+	case p.QuotaRx > 0 && usage.RxBytes >= p.QuotaRx:
+		reason = model.PeerDisabledQuota
+		detail = fmt.Sprintf("本月接收 %s，已达上限 %s", humanBytes(usage.RxBytes), humanBytes(p.QuotaRx))
+	}
+
+	switch {
+	case p.Enabled && reason != "":
+		return QuotaDisable, reason, detail
+	case !p.Enabled && p.DisabledReason != "" && reason == "":
+		// 条件已解除：到了新的一月，或管理员提高了额度、延长了期限。
+		// 只恢复「当初是自动停用」的设备 —— 管理员手工停用的 DisabledReason 为空，绝不自动放开。
+		return QuotaRestore, "", ""
+	}
+	return QuotaKeep, "", ""
+}
+
+// peerAutoDisabled 记录并通知一次自动停用。
+//
+// 到期与流量用尽必须主动通知：设备被停用后，界面上看到的只是「离线」，
+// 不通知的话用户会去检查自己的网络，而真正的原因在配额与期限设置里。
+func (e *Engine) peerAutoDisabled(ctx context.Context, p model.Peer, reason, detail string, now time.Time) {
+	name := p.Name
+	if name == "" {
+		name = "未命名设备"
+	}
+	msg := fmt.Sprintf("设备 %s 已自动停用：%s", name, detail)
+	e.log.Warn(msg)
+	_ = e.store.AddLog(ctx, "warn", "quota", msg, "")
+	_ = e.store.AddAudit(ctx, &model.AuditEntry{
+		Action:     "peer.auto_disable",
+		TargetType: "peer",
+		TargetID:   fmt.Sprint(p.ID),
+		Username:   "system",
+		Result:     "ok",
+		Message:    msg,
+	})
+
+	kind, title, hint := notify.KindQuota,
+		fmt.Sprintf("设备「%s」本月流量用尽，已自动停用", name),
+		"下个自然月会按当月用量自动恢复；如需立刻继续使用，可在设备设置里提高流量额度后重新启用。"
+	if reason == model.PeerDisabledExpired {
+		kind, title, hint = notify.KindExpired,
+			fmt.Sprintf("设备「%s」已到期，已自动停用", name),
+			"如需继续使用，请在设备设置里延长到期时间后重新启用。"
+	}
+	e.notifier.Notify(ctx, notify.Event{
+		Kind:  kind,
+		Title: title,
+		Body:  fmt.Sprintf("自动停用原因：%s。%s", detail, hint),
+		Peer:  name,
+		Iface: p.InterfaceName,
+		At:    now,
+	})
+}
+
+// peerAutoRestored 记录一次自动恢复。
+//
+// 刻意不发通知：设备恢复后会照常握手上线，那时既有的「设备上线」事件本身就会通知用户；
+// 再加一条「已恢复」只会在群里多刷一条重复消息。
+func (e *Engine) peerAutoRestored(ctx context.Context, p model.Peer) {
+	name := p.Name
+	if name == "" {
+		name = "未命名设备"
+	}
+	msg := fmt.Sprintf("设备 %s 的停用条件已解除，已自动恢复启用", name)
+	e.log.Info(msg)
+	_ = e.store.AddLog(ctx, "info", "quota", msg, "")
+	_ = e.store.AddAudit(ctx, &model.AuditEntry{
+		Action:     "peer.auto_enable",
+		TargetType: "peer",
+		TargetID:   fmt.Sprint(p.ID),
+		Username:   "system",
+		Result:     "ok",
+		Message:    msg,
+	})
+}
+
+// humanBytes 把字节数写成日志与通知里能一眼看懂的形式。
+//
+// 只用在给用户看的文字里（日志、Webhook 正文）；接口返回的仍是原始字节数，
+// 由前端按自己的习惯格式化 —— 服务端不该替界面决定显示成 MB 还是 GiB。
+func humanBytes(n int64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	v := float64(n)
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d %s", n, units[0])
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
 // Run 启动采样与收敛循环，阻塞直到 ctx 结束。
@@ -698,11 +928,15 @@ func (e *Engine) Run(ctx context.Context) {
 	reconc := time.NewTicker(ReconcileInterval)
 	quota := time.NewTicker(30 * time.Second)
 	cleanup := time.NewTicker(time.Hour)
+	// 同一根 ticker 驱动两个「按日程到点」的任务：计划备份与配置漂移巡检。
+	// 它们都只判断「到点没有」，5 分钟的检查间隔对准时性没有影响。
+	scheduled := time.NewTicker(BackupPlanCheckInterval)
 	defer func() {
 		sample.Stop()
 		reconc.Stop()
 		quota.Stop()
 		cleanup.Stop()
+		scheduled.Stop()
 	}()
 
 	for {
@@ -720,10 +954,65 @@ func (e *Engine) Run(ctx context.Context) {
 				e.log.Warn("触发收敛失败", "err", err)
 			}
 		case <-quota.C:
-			e.enforceQuota(ctx)
+			e.EnforceQuota(ctx)
 		case <-cleanup.C:
 			_ = e.store.PruneLogs(ctx, time.Now().AddDate(0, 0, -14))
 			_ = e.store.CleanExpiredSessions(ctx)
+		case <-scheduled.C:
+			e.runBackupPlan(ctx)
+			e.runInspect(ctx)
 		}
 	}
+}
+
+// runBackupPlan 到点执行一次计划备份，失败时推送通知。
+//
+// 通知放在引擎侧发：通知队列只在代理进程里启动（见 service 的说明），
+// 而计划备份可能与界面同进程、也可能不在——交给「持有已启动队列」的一方发最可靠。
+func (e *Engine) runBackupPlan(ctx context.Context) {
+	if e.backupPlan == nil {
+		return
+	}
+	ran, ok, reason := e.backupPlan.RunIfDue(ctx, time.Now())
+	if !ran {
+		return
+	}
+	if ok {
+		e.log.Info("计划备份已完成")
+		return
+	}
+	e.log.Warn("计划备份失败", "err", reason)
+	e.notifier.Notify(ctx, notify.Event{
+		Kind:  notify.KindBackupFailed,
+		Title: "计划备份失败",
+		Body: "这次没能把备份写到目标目录：" + reason +
+			"。修好之后可在「系统设置 → 备份还原 → 计划备份」里点「立即执行一次」补上。",
+		At: time.Now(),
+	})
+}
+
+// runInspect 到点做一次配置漂移巡检，发现了需要处理的问题时推送通知。
+//
+// 通知放在引擎侧发：通知队列只在代理进程里启动，而巡检也跑在那里。
+// 只推错误级结论（警告不推）：警告项往往长期存在（例如「疑似残留网卡」），
+// 每天推一条同样的提醒，用户很快就会把整个渠道屏蔽掉 —— 那比不推更糟。
+func (e *Engine) runInspect(ctx context.Context) {
+	if e.inspector == nil {
+		return
+	}
+	ran, ok, reason := e.inspector.RunInspectIfDue(ctx, time.Now())
+	if !ran {
+		return
+	}
+	if ok {
+		e.log.Info("巡检完成", "结论", reason)
+		return
+	}
+	e.log.Warn("巡检发现需要处理的问题", "结论", reason)
+	e.notifier.Notify(ctx, notify.Event{
+		Kind:  notify.KindInspectProblem,
+		Title: "配置漂移巡检发现需要处理的问题",
+		Body:  reason + "。详见「系统维护 → 配置漂移巡检」里的最近一次报告。",
+		At:    time.Now(),
+	})
 }

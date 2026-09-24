@@ -49,6 +49,10 @@ export interface WgPeer {
   route_mode: 'full' | 'lan' | 'custom'
   /** 仅 route_mode=custom 时生效 */
   client_allowed_ips: string[]
+  /** 内网访问范围：inherit（随连接）/ restrict（只允许 lan_targets）/ deny（不允许访问内网） */
+  lan_policy: 'inherit' | 'restrict' | 'deny'
+  /** restrict 时允许访问的内网目标（可带端口，如 192.168.1.10:445） */
+  lan_targets: string[]
   endpoint_host: string
   endpoint_port: number
   allowed_ips: string[]
@@ -108,6 +112,16 @@ export interface AuthState {
   initialized: boolean
   authenticated: boolean
   user: User | null
+  /** 本次请求走的通道：socket = 飞牛桌面经统一网关进来，port = 端口直连。 */
+  channel?: string
+  /** 本次请求是否带着可用的飞牛身份（即能不能免密进入）。 */
+  gateway_available?: boolean
+  /** 有飞牛身份却被挡住时的原因（例如账号已被停用），登录页直接显示。 */
+  gateway_blocked?: string
+  /** 这次身份是怎么来的：session = 本应用会话（可退出登录）；gateway = 飞牛网关注入的身份。 */
+  identity?: 'session' | 'gateway'
+  /** 本次请求带着的飞牛身份（登录页据此显示「以飞牛账号 XXX 登录」按钮）。 */
+  gateway_user?: { username: string; is_admin: boolean }
 }
 
 export interface Health {
@@ -129,6 +143,10 @@ export interface User {
   created_at: string
   /** 是否已开启二次验证（密钥本身不会下发，只给这个派生标志） */
   totp_enabled?: boolean
+  /** 非 0 表示这是飞牛账号（值即飞牛用户 UID）：不能用密码登录，用户名也不可改。 */
+  trim_uid?: number
+  /** 飞牛用户名的快照，仅用于展示。 */
+  trim_name?: string
 }
 
 /** 二次验证状态。 */
@@ -213,6 +231,8 @@ export interface BackupRecord {
   note: string
   include_key: boolean
   created_at: string
+  /** 记录在、文件却已经不在了（被手动删除或移走）：界面据此禁掉下载与还原 */
+  missing?: boolean
 }
 
 /** 配置快照与当前配置之间的一处变化 */
@@ -456,4 +476,227 @@ export interface PeerImportResult {
   created: number
   failed: number
   items: PeerImportItem[]
+}
+
+/** 某一天（服务器本地时区的自然日）的流量合计 */
+export interface TrafficDay {
+  day: string
+  rx_bytes: number
+  tx_bytes: number
+}
+
+/** 流量报表里的一台设备 */
+export interface TrafficPeerRow {
+  peer_id: number
+  name: string
+  interface_id: number
+  interface_name: string
+  enabled: boolean
+  /** 被自动停用的原因：quota（用量超限）/ expire（已到期），空表示不是自动停用 */
+  disabled_reason?: string
+  expire_at?: string | null
+  /** 每月的发送额度（0 表示不限） */
+  quota_tx: number
+  month_rx_bytes: number
+  month_tx_bytes: number
+  rx_bytes: number
+  tx_bytes: number
+  daily: TrafficDay[]
+}
+
+/** 流量报表：区间汇总 + 逐日明细 + 保留策略 */
+export interface TrafficReport {
+  days: number
+  from: string
+  to: string
+  peers: TrafficPeerRow[]
+  daily: TrafficDay[]
+  rx_bytes: number
+  tx_bytes: number
+  retention_days: number
+  hour_rows: number
+  oldest?: string | null
+}
+
+/** 计划备份的配置 */
+export interface BackupPlan {
+  enabled: boolean
+  /** daily（每天）| weekly（每周） */
+  freq: string
+  /** 执行时刻 HH:MM（NAS 本地时间） */
+  at: string
+  /** 1=周一 … 7=周日，仅每周执行时有效 */
+  weekday: number
+  /** 目标目录（绝对路径，必须落在应用自己的数据目录之外） */
+  dir: string
+  /** 保留份数 */
+  keep: number
+}
+
+/** 计划备份最近一次的执行结果 */
+export interface BackupRunState {
+  at: string
+  ok: boolean
+  /** 由「立即执行一次」触发 */
+  manual?: boolean
+  file?: string
+  size?: number
+  pruned?: number
+  error?: string
+}
+
+/** 目标目录里的一份备份副本 */
+export interface BackupPlanFile {
+  name: string
+  size: number
+  mod_time: string
+}
+
+/** 计划备份的完整状态 */
+export interface BackupPlanStatus {
+  plan: BackupPlan
+  last?: BackupRunState
+  since?: string
+  next_at?: string
+  files: BackupPlanFile[]
+  dir_ok: boolean
+  dir_note?: string
+  /** 用户在飞牛里授权给本应用的目录（目标目录只能从这里面选） */
+  authorized_dirs: string[]
+  /** 是否必须从上面那份清单里选（开发模式为 false） */
+  auth_required: boolean
+  /** 配置解析出来的实际落盘目录：目标选「应用自己的备份目录」时就是它 */
+  resolved_dir: string
+}
+
+/**
+ * 巡检里的一条结论。
+ *
+ * level 为 ok 的是「检查且通过」的记录：界面上的异常清单会过滤掉它们，
+ * 但报告会留着 —— 一份只记异常的报告看不出「到底查了没有」。
+ */
+export interface InspectItem {
+  /** 稳定标识（界面据此去重，也用来对比「上次这条还在不在」） */
+  key: string
+  level: 'ok' | 'warning' | 'error'
+  title: string
+  detail: string
+  fix?: string
+  /** 能否在「系统维护」里一键修好 */
+  repairable?: boolean
+  /** 需要用户去别的页面处理时的目标路由名 */
+  to?: string
+}
+
+/** 一次巡检的完整结论 */
+export interface InspectReport {
+  at: string
+  /** 由用户点「立即巡检一次」触发（与按日程区分） */
+  manual?: boolean
+  items: InspectItem[]
+  errors: number
+  warnings: number
+  passed: number
+}
+
+/** 巡检计划：开关 + 日程 + 保留报告份数 */
+export interface InspectPlan {
+  enabled: boolean
+  freq: 'daily' | 'weekly'
+  at: string
+  /** 1=周一 … 7=周日（仅每周执行时有效） */
+  weekday: number
+  keep: number
+}
+
+/** 巡检的对外状态 */
+export interface InspectStatus {
+  plan: InspectPlan
+  /** 最近一次报告；从没跑过时为空 */
+  last?: InspectReport
+  /** 历史报告（含最近一次），新的在前 */
+  reports: InspectReport[]
+  since?: string
+  next_at?: string
+}
+
+/** 此刻的判定结论（顶栏与各页的异常清单读它，含通过项） */
+export interface InspectChecks {
+  at: string
+  items: InspectItem[]
+}
+
+/** 多 NAS 互联：生成邀请的入参 */
+export interface InterconnectInput {
+  peer_name: string
+  /** 对端（要互联的那一侧）的局域网网段 */
+  peer_lan_subnets: string[]
+  /** 对端的对外地址 host:port，可留空 */
+  peer_endpoint: string
+  /** 本机暴露给对端的网段，留空用探测到的家里网段 */
+  local_lan_subnets: string[]
+}
+
+/** 多 NAS 互联：生成邀请的结果 */
+export interface InterconnectCreated {
+  interface_id: number
+  interface_name: string
+  peer_id: number
+  tunnel_subnet: string
+  peer_tunnel_address: string
+  /** 交给对端的邀请文本（含对端私钥，等同于密码） */
+  invite_json: string
+  /** 对端不装本应用时可用的 wg-quick 配置 */
+  peer_conf: string
+  warnings: string[]
+}
+
+/** 多 NAS 互联：导入邀请的结果 */
+export interface InterconnectImported {
+  interface_id: number
+  interface_name: string
+  peer_id: number
+  peer_name: string
+  tunnel_address: string
+  tunnel_subnet: string
+  allowed_ips: string[]
+  client_allowed_ips: string[]
+  warnings: string[]
+}
+
+/** 拓扑图上的一个节点 */
+export interface TopologyNode {
+  id: string
+  /** nas（本机）/ lan（内网网段）/ host（内网设备）/ device（隧道设备）/ site（对端 NAS）/ site-lan（对端内网）/ foreign（疑似残留网卡） */
+  kind: string
+  label: string
+  sublabel?: string
+  /** ok / warn / off */
+  status: string
+  /** 「内网域名」里登记的备注（没登记则为空） */
+  note?: string
+  /** 用户配置的设备类型（空 = 按名称自动判断） */
+  device_kind?: string
+  details: { key: string; value: string }[]
+}
+
+/** 拓扑图上的一条连线 */
+export interface TopologyLink {
+  from: string
+  to: string
+  kind: string
+  label?: string
+  status: string
+  /** 当前速率（字节/秒），界面据此决定流动动画的快慢 */
+  rate?: number
+}
+
+/** 一次拓扑快照 */
+export interface TopologyGraph {
+  at: string
+  host_name: string
+  nodes: TopologyNode[]
+  links: TopologyLink[]
+  /** 必须让用户知道的说明（数据来自哪里、哪一部分没读到） */
+  notes: string[]
 }

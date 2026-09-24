@@ -48,7 +48,7 @@ func (s *Store) scanUser(sc interface{ Scan(...any) error }) (*model.User, error
 		lastLoginAt sql.NullString
 		createdAt   string
 	)
-	if err := sc.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.TOTPSecret, &u.Role, &u.Status, &lastLoginAt, &createdAt); err != nil {
+	if err := sc.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.TOTPSecret, &u.Role, &u.Status, &lastLoginAt, &createdAt, &u.TrimUID, &u.TrimName); err != nil {
 		return nil, err
 	}
 	u.LastLoginAt = parseTSNull(lastLoginAt)
@@ -60,7 +60,7 @@ func (s *Store) scanUser(sc interface{ Scan(...any) error }) (*model.User, error
 // ListUsers 返回全部账号。
 func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id,username,password_hash,totp_secret,role,status,last_login_at,created_at FROM sys_user ORDER BY id`)
+		`SELECT id,username,password_hash,totp_secret,role,status,last_login_at,created_at,COALESCE(trim_uid,0),COALESCE(trim_name,'') FROM sys_user ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +79,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
 // GetUserByUsername 按用户名查询。
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*model.User, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id,username,password_hash,totp_secret,role,status,last_login_at,created_at FROM sys_user WHERE username=?`, username)
+		`SELECT id,username,password_hash,totp_secret,role,status,last_login_at,created_at,COALESCE(trim_uid,0),COALESCE(trim_name,'') FROM sys_user WHERE username=?`, username)
 	u, err := s.scanUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -90,7 +90,7 @@ func (s *Store) GetUserByUsername(ctx context.Context, username string) (*model.
 // GetUser 按主键查询。
 func (s *Store) GetUser(ctx context.Context, id int64) (*model.User, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id,username,password_hash,totp_secret,role,status,last_login_at,created_at FROM sys_user WHERE id=?`, id)
+		`SELECT id,username,password_hash,totp_secret,role,status,last_login_at,created_at,COALESCE(trim_uid,0),COALESCE(trim_name,'') FROM sys_user WHERE id=?`, id)
 	u, err := s.scanUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -101,8 +101,8 @@ func (s *Store) GetUser(ctx context.Context, id int64) (*model.User, error) {
 // UpdateUser 更新账号基本信息。
 func (s *Store) UpdateUser(ctx context.Context, u *model.User) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE sys_user SET password_hash=?,totp_secret=?,role=?,status=? WHERE id=?`,
-		u.PasswordHash, u.TOTPSecret, u.Role, u.Status, u.ID)
+		`UPDATE sys_user SET password_hash=?,totp_secret=?,role=?,status=?,trim_name=? WHERE id=?`,
+		u.PasswordHash, u.TOTPSecret, u.Role, u.Status, u.TrimName, u.ID)
 	return err
 }
 
@@ -792,4 +792,58 @@ func (s *Store) ListBackupsByKind(ctx context.Context, kinds ...string) ([]Backu
 func (s *Store) DeleteBackupRecord(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM backup_record WHERE id=?`, id)
 	return err
+}
+
+// GetUserByTrimUID 按飞牛用户 UID 查账号 —— 免密登录的对应关系就靠它。
+func (s *Store) GetUserByTrimUID(ctx context.Context, uid int64) (*model.User, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id,username,password_hash,totp_secret,role,status,last_login_at,created_at,COALESCE(trim_uid,0),COALESCE(trim_name,'') FROM sys_user WHERE trim_uid=?`, uid)
+	u, err := s.scanUser(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return u, err
+}
+
+// CreateGatewayUser 为飞牛用户建一个本应用账号。
+//
+// passwordPlaceholder 由调用方给一个**格式非法**的值：VerifyPassword 解析失败即返回 false，
+// 于是这类账号永远不可能用密码登录 —— 这不靠额外判断，是校验逻辑自带的性质。
+func (s *Store) CreateGatewayUser(ctx context.Context, uid int64, username, name, passwordPlaceholder, role string) (*model.User, error) {
+	now := time.Now()
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO sys_user(username,password_hash,totp_secret,role,status,created_at,trim_uid,trim_name) VALUES(?,?,'',?,1,?,?,?)`,
+		username, passwordPlaceholder, role, ts(now), uid, name)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &model.User{
+		ID: id, Username: username, PasswordHash: passwordPlaceholder,
+		Role: role, Status: 1, CreatedAt: now, TrimUID: uid, TrimName: name,
+	}, nil
+}
+
+// FreeUsername 找一个没被占用的账号名：先用首选名，被占用时依次加后缀。
+//
+// 为什么需要它：飞牛账号的账号名优先用「飞牛用户名」，而这个名字完全可能与已有账号重名
+// （尤其是一个叫 admin 的飞牛普通用户，与本地管理员同名）。此时唯一安全的做法是**另起一个名字** ——
+// 复用别人的账号等于把别人的权限交给这个飞牛用户。
+func (s *Store) FreeUsername(ctx context.Context, want, suffix string) (string, error) {
+	for i := 0; i < 50; i++ {
+		candidate := want
+		if i == 1 {
+			candidate = want + "-" + suffix
+		} else if i > 1 {
+			candidate = fmt.Sprintf("%s-%s-%d", want, suffix, i)
+		}
+		var n int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM sys_user WHERE username=?`, candidate).Scan(&n); err != nil {
+			return "", err
+		}
+		if n == 0 {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("无法为飞牛账号生成可用的账号名")
 }

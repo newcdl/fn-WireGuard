@@ -38,13 +38,13 @@ func TestDiagnoseAccessConflicts(t *testing.T) {
 
 	lanOff := false
 	wg0, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true, AllowLAN: &lanOff,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true), AllowLAN: &lanOff,
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wg1, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg1", Addresses: []string{"10.11.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg1", Addresses: []string{"10.11.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestDiagnoseAccessConflicts(t *testing.T) {
 	// ① 设备在「只访问家里设备」模式下（范围自动包含家里网段），但连接的内网访问开关是关的
 	if _, err := svc.CreatePeer(ctx, service.PeerInput{
 		InterfaceID: wg0.ID, Name: "手机", GenerateKeys: true, AutoAddress: true,
-		RouteMode: model.RouteModeLAN, Enabled: true,
+		RouteMode: model.RouteModeLAN, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestDiagnoseAccessConflicts(t *testing.T) {
 	}
 	if _, err := svc.CreatePeer(ctx, service.PeerInput{
 		InterfaceID: wg0.ID, Name: "平板", GenerateKeys: true, AutoAddress: true,
-		RouteMode: model.RouteModeCustom, ClientAllowedIPs: []string{"10.10.0.0/24"}, Enabled: true,
+		RouteMode: model.RouteModeCustom, ClientAllowedIPs: []string{"10.10.0.0/24"}, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestDiagnoseAccessConflicts(t *testing.T) {
 	//     直接改库模拟升级上来的数据。
 	legacy, err := svc.CreatePeer(ctx, service.PeerInput{
 		InterfaceID: wg1.ID, Name: "旧手机", GenerateKeys: true, AutoAddress: true,
-		RouteMode: model.RouteModeCustom, ClientAllowedIPs: []string{"172.30.0.0/24"}, Enabled: true,
+		RouteMode: model.RouteModeCustom, ClientAllowedIPs: []string{"172.30.0.0/24"}, Enabled: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -151,14 +151,14 @@ func TestDiagnoseAccessNoFalsePositives(t *testing.T) {
 		t.Fatal(err)
 	}
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// 内网访问默认开启；设备用默认的「只访问家里设备」；没开隔离
 	if _, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, Name: "手机", GenerateKeys: true, AutoAddress: true, Enabled: true,
+		InterfaceID: it.ID, Name: "手机", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatal(err)
 	}

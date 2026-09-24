@@ -11,12 +11,16 @@
       <el-button :icon="Download" @click="exportAll">导出连接配置</el-button>
       <el-button v-if="session.can('iface.write')" :icon="Refresh" @click="applyNow">立即应用</el-button>
       <el-button :icon="Reading" @click="helpVisible = true">配置说明</el-button>
+      <el-button v-if="session.can('iface.write')" :icon="Connection" @click="interconnectVisible = true">
+        与另一台 NAS 互联
+      </el-button>
       <div style="flex: 1"></div>
+      <ViewSwitch v-model="viewMode" />
       <el-tag size="small" type="info" effect="plain">共 {{ list.length }} 条连接</el-tag>
     </div>
 
-    <!-- 桌面端：表格 -->
-    <div v-if="!isMobile" class="fnwg-card">
+    <!-- 表格视图（原来只在桌面端显示，现在由右上角的切换决定） -->
+    <div v-if="isTable" class="fnwg-card">
       <el-table :data="list" v-loading="loading" empty-text="还没有连接，点击「新建连接」开始">
         <el-table-column label="连接" width="140">
           <template #default="{ row }">
@@ -107,6 +111,7 @@
 
     <!-- 移动端：卡片列表 -->
     <div v-else v-loading="loading">
+      <div class="fnwg-card-grid">
       <ItemCard
         v-for="row in list"
         :key="row.id"
@@ -187,6 +192,7 @@
           </el-dropdown>
         </template>
       </ItemCard>
+      </div>
       <div v-if="!list.length && !loading" class="fnwg-empty">还没有连接，点击上方「新建连接」开始</div>
     </div>
 
@@ -371,6 +377,9 @@
       </template>
     </el-dialog>
 
+    <!-- 多 NAS 互联：引导式生成邀请 / 导入邀请，建好后刷新列表 -->
+    <InterconnectDialog v-model="interconnectVisible" @done="load" />
+
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
@@ -379,13 +388,16 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Upload, Download, Refresh, ArrowDown, Reading } from '@element-plus/icons-vue'
+import { Plus, Upload, Download, Refresh, ArrowDown, Reading, Connection } from '@element-plus/icons-vue'
 import { api, download } from '@/api/client'
 import type { WgInterface } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import InterconnectDialog from '@/components/InterconnectDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
 import ScenarioPicker from '@/components/ScenarioPicker.vue'
 import { allHelpGroups, interfaceFields, interfacePresets } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
@@ -400,6 +412,8 @@ const router = useRouter()
 const session = useSession()
 const realtime = useRealtime()
 const { isMobile, drawerSize, dialogWidth } = useBreakpoint()
+// 表格 / 卡片视图：由用户决定并记住（默认仍是手机卡片、桌面表格，与改动前一致）
+const { mode: viewMode, isTable } = useViewMode('interfaces')
 
 const F = interfaceFields
 const helpGroups = allHelpGroups
@@ -416,6 +430,7 @@ const confVisible = ref(false)
 const confTitle = ref('')
 const confText = ref('')
 const helpVisible = ref(false)
+const interconnectVisible = ref(false)
 const scenario = ref('home')
 
 // 连接级异常提示：与全局「系统状态」同源，避免连接页与总览给出互相矛盾的结论

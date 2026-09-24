@@ -25,6 +25,237 @@ body,
   padding: 0;
 }
 
+/* ==========================================================================
+   入口页（登录 / 初始化）的共用外观
+   --------------------------------------------------------------------------
+   两个页面是同一类东西：一张居中卡片 + 一句说清「现在是什么情况」。
+   样式放在这里共用，避免各写一套之后慢慢走形；具体页面只负责自己的内容。
+   ========================================================================== */
+.fnwg-auth-page {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: hidden;
+  background: var(--fnwg-bg);
+}
+
+/* 两团柔光：打破大片纯色的呆板，透明度刻意压得很低 —— 第一要务是让人看清表单 */
+.fnwg-auth-glow {
+  position: absolute;
+  width: 560px;
+  height: 560px;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.5;
+  pointer-events: none;
+}
+.fnwg-auth-glow-a {
+  top: -180px;
+  right: -120px;
+  background: rgba(64, 158, 255, 0.22);
+}
+.fnwg-auth-glow-b {
+  bottom: -200px;
+  left: -140px;
+  background: rgba(103, 194, 58, 0.14);
+}
+html.dark .fnwg-auth-glow-a {
+  opacity: 0.3;
+}
+html.dark .fnwg-auth-glow-b {
+  opacity: 0.2;
+}
+
+.fnwg-auth-shell {
+  position: relative;
+  width: min(460px, 100%);
+  padding: 32px 34px;
+  border-radius: 18px;
+  background: var(--fnwg-card);
+  border: 1px solid var(--fnwg-border);
+  box-shadow:
+    0 20px 60px rgba(0, 0, 0, 0.12),
+    0 4px 16px rgba(0, 0, 0, 0.06);
+}
+
+.fnwg-auth-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+/* 白衬底：应用图标本身是彩色的，直接贴深色背景会糊成一团 */
+.fnwg-auth-logo {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  padding: 5px;
+  border-radius: 11px;
+  background: #fff;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.16);
+}
+.fnwg-auth-brand {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--el-text-color-primary);
+}
+.fnwg-auth-sub {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: var(--el-text-color-secondary);
+}
+
+.fnwg-auth-note {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--el-text-color-regular);
+  background: var(--el-fill-color-light);
+  border: 1px solid var(--el-border-color-lighter);
+}
+
+.fnwg-auth-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--el-text-color-secondary);
+}
+
+.fnwg-auth-submit {
+  width: 100%;
+  margin-top: 4px;
+  font-size: 15px;
+  letter-spacing: 2px;
+}
+
+/* ---- 「二选一」的选项卡式按钮 ----
+   用真正的 button 而不是 radio：需要放图标 + 两行文字，radio 的样式改起来
+   既费劲又容易在某个主题下走形（此前就出现过「一个像实心按钮、一个像裸文字」）。 */
+.fnwg-auth-choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.fnwg-auth-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 12px;
+  font: inherit;
+  text-align: left;
+  color: var(--el-text-color-primary);
+  background: var(--fnwg-card);
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  cursor: pointer;
+  transition:
+    border-color 0.16s,
+    background 0.16s,
+    box-shadow 0.16s;
+}
+.fnwg-auth-choice:hover {
+  border-color: var(--el-color-primary-light-5);
+}
+.fnwg-auth-choice.is-active {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  box-shadow: 0 0 0 3px var(--el-color-primary-light-9);
+}
+html.dark .fnwg-auth-choice.is-active {
+  background: rgba(64, 158, 255, 0.12);
+  box-shadow: none;
+}
+.fnwg-auth-choice-icon {
+  flex: 0 0 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  border-radius: 8px;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+}
+html.dark .fnwg-auth-choice-icon {
+  background: rgba(64, 158, 255, 0.14);
+}
+.fnwg-auth-choice-title {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.fnwg-auth-choice-desc {
+  display: block;
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--el-text-color-secondary);
+}
+.fnwg-auth-choice-check {
+  margin-left: auto;
+  color: var(--el-color-primary);
+}
+
+/* 窄屏：单列、内边距收紧，柔光也不必占资源 */
+@media (max-width: 767px) {
+  .fnwg-auth-page {
+    padding: 14px;
+    align-items: flex-start;
+    padding-top: max(20px, env(safe-area-inset-top));
+  }
+  .fnwg-auth-shell {
+    padding: 24px 20px 26px;
+    margin-top: 3vh;
+  }
+  .fnwg-auth-glow {
+    width: 320px;
+    height: 320px;
+    filter: blur(70px);
+  }
+  .fnwg-auth-choices {
+    grid-template-columns: 1fr;
+  }
+}
+
+/*
+ * Element 给下拉组件写死了 `vertical-align: top`，而同一排的普通按钮是按基线对齐的 ——
+ * 界面上的表现是「一排操作里那个『更多』比旁边的高一点点」（用户反馈）。
+ * 统一成居中，全应用所有「一排按钮 + 下拉」的地方一起对齐。
+ */
+.el-dropdown {
+  vertical-align: middle;
+}
+
+/*
+ * 卡片视图的网格：卡片本身比表格窄，一条一行在电脑上会浪费大半个屏幕 ——
+ * 因此按可用宽度自动分列（每列至少 340px，放得下就多来一列），手机上仍是一条一行。
+ * 用 auto-fill 而不是写死列数：侧边栏收起/展开、窗口缩放都能自己适应。
+ */
+.fnwg-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+}
+
+/* 网格靠 gap 控间距，卡片自己的下边距会叠成两倍空隙 */
+.fnwg-card-grid .fnwg-item-card {
+  margin-bottom: 0;
+}
+
+@media (max-width: 767px) {
+  .fnwg-card-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 body {
   background: var(--fnwg-bg);
   font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
@@ -280,7 +511,9 @@ body {
 }
 
 .fnwg-qr img {
-  width: 220px;
+  /* 240 → 280：二维码里装的是整份配置，模块数不少（EC 级 H 更密），
+     屏幕上给足像素才扫得动；再小一点手机上要凑很近才认。 */
+  width: 280px;
   max-width: 70vw;
   height: auto;
   background: #fff;

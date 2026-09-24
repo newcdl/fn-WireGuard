@@ -183,6 +183,42 @@ func (c *Config) ShareDir() string {
 	return filepath.Join(c.VarDir, "share")
 }
 
+// AuthorizedDirs 返回用户在飞牛里授予本应用访问权限的目录。
+//
+// 它和 config/resource 里声明的 data-share 不是一回事：那是「本应用把自己的数据暴露出去」，
+// 这里是「用户允许本应用碰他的哪些目录」。应用只能写进这两类目录，别处一律 permission denied——
+// 所以计划备份的目标目录只能从这份清单里选：让用户手填一个看起来对、实际写不进去的路径，
+// 结果就是开关打开、每天失败一次，而界面上什么都看不出来。
+//
+// 两个来源，按顺序取：
+//  1. TRIM_DATA_ACCESSIBLE_PATHS —— 官方变量，只在「飞牛调用我们脚本」的那个环境里有；
+//  2. FNWG_AUTHORIZED_DIRS —— 我们自己转写的同名值，写进 systemd 单元（见 cmd/common 的
+//     fnwg_authorized_env_line）。**服务进程必须要它**：systemd 拉起的进程不继承
+//     调用者的环境，只看第 1 个来源的话，服务永远读到空值，用户就会看到
+//     「明明授权了、也重启了，界面里还是一个目录都没有」。
+//
+// 变量按官方约定用半角冒号分隔、不是 JSON，可能为空或含空项（例如结尾多一个冒号），都要挡住。
+func (c *Config) AuthorizedDirs() []string {
+	raw := strings.TrimSpace(os.Getenv("TRIM_DATA_ACCESSIBLE_PATHS"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("FNWG_AUTHORIZED_DIRS"))
+	}
+	if raw == "" {
+		return nil
+	}
+	out := make([]string, 0, 4)
+	seen := map[string]bool{}
+	for _, p := range strings.Split(raw, ":") {
+		p = strings.TrimSpace(p)
+		if p == "" || !filepath.IsAbs(p) || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, filepath.Clean(p))
+	}
+	return out
+}
+
 // EnsureDirs 创建所有必需目录。
 func (c *Config) EnsureDirs() error {
 	for _, d := range []string{c.VarDir, c.EtcDir, c.HomeDir, c.LogDir(), c.ShareDir()} {

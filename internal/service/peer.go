@@ -15,6 +15,7 @@ import (
 	"fnwg/internal/wgback"
 	"fnwg/internal/wgconf"
 	"fnwg/internal/wgkey"
+	"sync"
 )
 
 // ListPeers 返回节点列表（interfaceID<=0 表示全部）。敏感字段默认不下发。
@@ -49,23 +50,29 @@ func (s *Service) GetPeer(ctx context.Context, id int64) (*model.Peer, error) {
 
 // PeerInput 是节点新增/编辑入参。
 type PeerInput struct {
-	InterfaceID      int64      `json:"interface_id"`
-	Name             string     `json:"name"`
-	PublicKey        string     `json:"public_key"`
-	PresharedKey     string     `json:"preshared_key"`
-	ClientPrivateKey string     `json:"client_private_key"`
-	RouteMode        string     `json:"route_mode"`
-	ClientAllowedIPs []string   `json:"client_allowed_ips"`
-	EndpointHost     string     `json:"endpoint_host"`
-	EndpointPort     int        `json:"endpoint_port"`
-	AllowedIPs       []string   `json:"allowed_ips"`
-	Keepalive        int        `json:"persistent_keepalive"`
-	GroupTag         string     `json:"group_tag"`
-	Remark           string     `json:"remark"`
-	QuotaRx          int64      `json:"quota_rx"`
-	QuotaTx          int64      `json:"quota_tx"`
-	ExpireAt         *time.Time `json:"expire_at"`
-	Enabled          bool       `json:"enabled"`
+	InterfaceID      int64    `json:"interface_id"`
+	Name             string   `json:"name"`
+	PublicKey        string   `json:"public_key"`
+	PresharedKey     string   `json:"preshared_key"`
+	ClientPrivateKey string   `json:"client_private_key"`
+	RouteMode        string   `json:"route_mode"`
+	ClientAllowedIPs []string `json:"client_allowed_ips"`
+	EndpointHost     string   `json:"endpoint_host"`
+	EndpointPort     int      `json:"endpoint_port"`
+	AllowedIPs       []string `json:"allowed_ips"`
+	// LANPolicy / LANTargets 是「这台设备能访问内网的哪些目标」（见 model.Peer.LANPolicy）。
+	// 它们落在服务端的转发规则上，设备侧改不了 —— 与设备侧的通行范围是两件事。
+	LANPolicy  string     `json:"lan_policy"`
+	LANTargets []string   `json:"lan_targets"`
+	Keepalive  int        `json:"persistent_keepalive"`
+	GroupTag   string     `json:"group_tag"`
+	Remark     string     `json:"remark"`
+	QuotaRx    int64      `json:"quota_rx"`
+	QuotaTx    int64      `json:"quota_tx"`
+	ExpireAt   *time.Time `json:"expire_at"`
+	// Enabled 用指针表达「有没有指定」：新建时为 nil 表示按默认（不启用），编辑时为 nil 表示保持原值。
+	// 与连接的入参同理：非指针布尔会让部分更新静默把设备停用。
+	Enabled *bool `json:"enabled"`
 	// GenerateKeys 为 true 时自动生成密钥对并托管私钥。
 	GenerateKeys bool `json:"generate_keys"`
 	// GeneratePSK 为 true 时生成预共享密钥。
@@ -102,6 +109,10 @@ func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model
 	if in.RouteMode == "" {
 		in.RouteMode = model.RouteModeLAN
 	}
+	policy, lanTargets, err := normalizePeerLANAccess(in.LANPolicy, in.LANTargets)
+	if err != nil {
+		return nil, err
+	}
 	p := &model.Peer{
 		InterfaceID:      in.InterfaceID,
 		Name:             strings.TrimSpace(in.Name),
@@ -112,13 +123,15 @@ func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model
 		EndpointHost:     strings.TrimSpace(in.EndpointHost),
 		EndpointPort:     in.EndpointPort,
 		AllowedIPs:       in.AllowedIPs,
+		LANPolicy:        policy,
+		LANTargets:       lanTargets,
 		Keepalive:        in.Keepalive,
 		GroupTag:         in.GroupTag,
 		Remark:           in.Remark,
 		QuotaRx:          in.QuotaRx,
 		QuotaTx:          in.QuotaTx,
 		ExpireAt:         in.ExpireAt,
-		Enabled:          in.Enabled,
+		Enabled:          in.Enabled != nil && *in.Enabled,
 	}
 
 	if in.GenerateKeys || p.PublicKey == "" {
@@ -225,7 +238,7 @@ func (s *Service) ImportPeers(ctx context.Context, ifaceID int64, rows []PeerImp
 			Remark:      strings.TrimSpace(r.Remark),
 			GroupTag:    strings.TrimSpace(r.GroupTag),
 			Keepalive:   25,
-			Enabled:     true,
+			Enabled:     boolPtr(true),
 			AutoAddress: true,
 			// 没给识别码的就自动生成密钥对（等同于在界面点「自动生成」）
 			GenerateKeys: pub == "",
@@ -272,12 +285,26 @@ func (s *Service) UpdatePeer(ctx context.Context, id int64, in PeerInput, a Acto
 	p.EndpointHost = strings.TrimSpace(in.EndpointHost)
 	p.EndpointPort = in.EndpointPort
 	p.AllowedIPs = in.AllowedIPs
+	policy, lanTargets, err := normalizePeerLANAccess(in.LANPolicy, in.LANTargets)
+	if err != nil {
+		return nil, err
+	}
+	p.LANPolicy, p.LANTargets = policy, lanTargets
 	p.Keepalive = in.Keepalive
 	p.GroupTag = in.GroupTag
 	p.Remark = in.Remark
 	p.QuotaRx, p.QuotaTx = in.QuotaRx, in.QuotaTx
 	p.ExpireAt = in.ExpireAt
-	p.Enabled = in.Enabled
+	// 只有显式给出才改动（理由见 PeerInput.Enabled 的说明）。
+	if in.Enabled != nil {
+		// 用户显式启停时清掉「自动停用原因」。
+		//
+		// 两个方向都必要：手工停用的设备必须与「因额度停用」区分开，否则月初的自动恢复
+		// 会把它悄悄放开；手工启用的设备也不该留着一个已经不成立的原因。
+		// 真因额度用尽被停用时，引擎会重新把原因写上。
+		p.Enabled = *in.Enabled
+		p.DisabledReason = ""
+	}
 	if in.GenerateKeys {
 		priv, pub, err := wgkey.Generate()
 		if err != nil {
@@ -533,11 +560,36 @@ func (s *Service) RevealPeerSecrets(ctx context.Context, id int64, a Actor) (map
 }
 
 // serverEndpoint 解析服务端对外地址。
+// 自动探测到的本机地址要做缓存。
+//
+// 为什么必须缓存：这个地址会进「设备配置指纹」的比对（见 baselineFor / peerConfigFingerprint）。
+// 若每次请求都重新探测，多网卡机器（家里的 NAS 很常见：eth0 与 docker0 / 网桥并存）可能这次选到这张、
+// 下次选到那张，指纹就跟着变 —— 表现是设备列表里「需重新扫码」怎么重新导入都清不掉（用户实际遇到过）。
+// 缓存期内指纹必然一致；地址真的变了（超过缓存期）仍会被识别为需要重新导入，这正是该标记的用途。
+var localIPv4Cache struct {
+	sync.Mutex
+	at  time.Time
+	val string
+}
+
+const localIPv4TTL = 10 * time.Minute
+
+func cachedLocalIPv4() string {
+	localIPv4Cache.Lock()
+	defer localIPv4Cache.Unlock()
+	if !localIPv4Cache.at.IsZero() && time.Since(localIPv4Cache.at) < localIPv4TTL {
+		return localIPv4Cache.val
+	}
+	v := detectLocalIPv4()
+	localIPv4Cache.at, localIPv4Cache.val = time.Now(), v
+	return v
+}
+
 func (s *Service) serverEndpoint(ctx context.Context, it *model.Interface) (string, string) {
 	if v := s.Store.GetSetting(ctx, "server_endpoint", ""); v != "" {
 		return v, ""
 	}
-	ip := detectLocalIPv4()
+	ip := cachedLocalIPv4()
 	if ip == "" {
 		return "", "尚未配置「服务端对外地址」，二维码中的 Endpoint 为空，请到系统设置中填写公网域名或 IP"
 	}

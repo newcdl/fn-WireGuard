@@ -55,6 +55,12 @@ func newTestEnvWithDir(t *testing.T) (*service.Service, *store.Store, string) {
 	return svc, st, dir
 }
 
+// boolPtr 构造「已显式指定」的指针布尔入参。
+//
+// 连接的 Enabled/Autostart 与设备的 Enabled 都是 *bool：nil 表示「不指定」（新建按默认、
+// 编辑保持原值），与「显式设为 false」是两件事，所以字面量取址不能省。
+func boolPtr(b bool) *bool { return &b }
+
 func TestInterfaceAndPeerLifecycle(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()
@@ -64,8 +70,8 @@ func TestInterfaceAndPeerLifecycle(t *testing.T) {
 		Name:      "wg0",
 		Addresses: []string{"10.10.0.1/24"},
 		DNS:       []string{"223.5.5.5"},
-		Enabled:   true,
-		Autostart: true,
+		Enabled:   boolPtr(true),
+		Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatalf("创建接口失败: %v", err)
@@ -96,7 +102,7 @@ func TestInterfaceAndPeerLifecycle(t *testing.T) {
 		GeneratePSK:  true,
 		AutoAddress:  true,
 		Keepalive:    25,
-		Enabled:      true,
+		Enabled:      boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatalf("创建节点失败: %v", err)
@@ -110,7 +116,7 @@ func TestInterfaceAndPeerLifecycle(t *testing.T) {
 
 	// 第二个节点应分配到下一个空闲地址
 	p2, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, Name: "笔记本", GenerateKeys: true, AutoAddress: true, Enabled: true,
+		InterfaceID: it.ID, Name: "笔记本", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -142,8 +148,8 @@ func TestInterfaceAndPeerLifecycle(t *testing.T) {
 		Addresses:  []string{"10.10.0.1/24"},
 		DNSMode:    "client",
 		RouteTable: "auto",
-		Enabled:    true,
-		Autostart:  true,
+		Enabled:    boolPtr(true),
+		Autostart:  boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatalf("更新接口失败: %v", err)
@@ -203,6 +209,75 @@ func TestInterfaceAndPeerLifecycle(t *testing.T) {
 	}
 }
 
+// TestUpdateKeepsUnspecifiedBooleans 锁定「部分更新不会顺手关掉别的开关」。
+//
+// 连接的 enabled/autostart 与设备的 enabled 原先是非指针布尔，于是只传一个无关字段
+// （例如 {"allow_lan": true}）就会把它们一并置为 false：一条正在运行的连接被停用，
+// 而操作者改的是一个完全无关的开关 —— 现象与操作对不上，排查代价很高。
+// 界面编辑抽屉总是提交完整对象，所以这条只有脚本与自动化会踩；也正因如此它最容易长期潜伏。
+func TestUpdateKeepsUnspecifiedBooleans(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+
+	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name:      "wg0",
+		Addresses: []string{"10.10.0.1/24"},
+		Enabled:   boolPtr(true),
+		Autostart: boolPtr(true),
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !it.Enabled || !it.Autostart {
+		t.Fatal("新建时应按显式给出的开关落库")
+	}
+
+	// 只改内网访问开关，其余字段一律不传：两个开关必须原样保留
+	off := false
+	got, err := svc.UpdateInterface(ctx, it.ID, service.CreateInterfaceInput{AllowLAN: &off}, actor)
+	if err != nil {
+		t.Fatalf("局部更新失败: %v", err)
+	}
+	if !got.Enabled || !got.Autostart {
+		t.Fatalf("局部更新不应改动未指定的开关（enabled=%v autostart=%v）", got.Enabled, got.Autostart)
+	}
+	if got.AllowLAN {
+		t.Fatal("显式给出的字段必须生效")
+	}
+
+	// 显式指定时照样生效，包括显式关闭
+	if got, err = svc.UpdateInterface(ctx, it.ID, service.CreateInterfaceInput{Enabled: &off}, actor); err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled {
+		t.Fatal("显式指定 enabled=false 时必须生效")
+	}
+
+	// 设备同理：更新时不传 enabled，不能把设备停用
+	p, err := svc.CreatePeer(ctx, service.PeerInput{
+		InterfaceID: it.ID, Name: "我的手机", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 注意这里传的是「界面上会提交的完整对象」减去 enabled —— 更新路径对上网方式等字段
+	// 仍按完整替换处理（界面总是提交完整对象），本条只锁定布尔字段的「保持原值」语义。
+	pu, err := svc.UpdatePeer(ctx, p.ID, service.PeerInput{
+		InterfaceID: it.ID, Name: "我的手机", Keepalive: 25, AllowedIPs: p.AllowedIPs,
+		RouteMode: p.RouteMode, ClientAllowedIPs: p.ClientAllowedIPs, Remark: "改个备注",
+	}, actor)
+	if err != nil {
+		t.Fatalf("更新设备失败: %v", err)
+	}
+	if !pu.Enabled {
+		t.Fatal("更新设备时未指定 enabled，不应把设备停用")
+	}
+	if pu.Remark != "改个备注" {
+		t.Fatal("显式给出的备注必须生效")
+	}
+}
+
 func TestValidation(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()
@@ -219,7 +294,7 @@ func TestValidation(t *testing.T) {
 		t.Fatal("非法网段应被拒绝")
 	}
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +305,7 @@ func TestValidation(t *testing.T) {
 		t.Fatal("重名接口应被拒绝")
 	}
 	if _, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, PublicKey: "not-a-key", Enabled: true,
+		InterfaceID: it.ID, PublicKey: "not-a-key", Enabled: boolPtr(true),
 	}, actor); err == nil {
 		t.Fatal("非法公钥应被拒绝")
 	}
@@ -245,7 +320,7 @@ func TestInterfaceCrossConnectionConflicts(t *testing.T) {
 
 	first, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
 		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, ListenPort: 51820,
-		Enabled: true, Autostart: true,
+		Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +329,7 @@ func TestInterfaceCrossConnectionConflicts(t *testing.T) {
 	// 端口与已有连接重复：提示应点名占用的连接
 	_, err = svc.CreateInterface(ctx, service.CreateInterfaceInput{
 		Name: "wg1", Addresses: []string{"10.11.0.1/24"}, ListenPort: 51820,
-		Enabled: true, Autostart: true,
+		Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err == nil || !strings.Contains(err.Error(), "51820") || !strings.Contains(err.Error(), "wg0") {
 		t.Fatalf("端口重复应被拒绝并提示占用的连接，实际: %v", err)
@@ -263,7 +338,7 @@ func TestInterfaceCrossConnectionConflicts(t *testing.T) {
 	// 内部地址网段与已有连接重叠
 	_, err = svc.CreateInterface(ctx, service.CreateInterfaceInput{
 		Name: "wg1", Addresses: []string{"10.10.0.5/24"}, ListenPort: 51821,
-		Enabled: true, Autostart: true,
+		Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err == nil || !strings.Contains(err.Error(), "重叠") {
 		t.Fatalf("网段重叠应被拒绝，实际: %v", err)
@@ -272,7 +347,7 @@ func TestInterfaceCrossConnectionConflicts(t *testing.T) {
 	// 不同协议族不算冲突（V6 网段与 V4 网段永远不重叠）
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
 		Name: "wg1", Addresses: []string{"fd00::1/64"}, ListenPort: 51821,
-		Enabled: true, Autostart: true,
+		Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("不同协议族不应判定为冲突: %v", err)
 	}
@@ -280,7 +355,7 @@ func TestInterfaceCrossConnectionConflicts(t *testing.T) {
 	// 更新连接时不应与自身判定为冲突
 	if _, err := svc.UpdateInterface(ctx, first.ID, service.CreateInterfaceInput{
 		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, ListenPort: 51820,
-		MTU: 1420, DNSMode: "client", RouteTable: "off", Enabled: true, Autostart: true,
+		MTU: 1420, DNSMode: "client", RouteTable: "off", Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatalf("更新自身不应报冲突: %v", err)
 	}
@@ -294,7 +369,7 @@ func TestInterfaceAutoAllocation(t *testing.T) {
 	actor := service.Actor{Username: "tester"}
 
 	// 名称、地址、端口全部留空 → 自动分配 wg0 / 10.10.0.1/24 / 51820
-	first, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: true, Autostart: true}, actor)
+	first, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: boolPtr(true), Autostart: boolPtr(true)}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +378,7 @@ func TestInterfaceAutoAllocation(t *testing.T) {
 	}
 
 	// 第二条同样留空 → 名称顺延为 wg1，地址与端口同步递增，从源头避开冲突
-	second, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: true, Autostart: true}, actor)
+	second, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: boolPtr(true), Autostart: boolPtr(true)}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +388,7 @@ func TestInterfaceAutoAllocation(t *testing.T) {
 
 	// 指定名称 wg5、地址与端口留空 → 按名称序号给出 10.15.0.1/24 + 51825
 	third, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg5", Enabled: true, Autostart: true,
+		Name: "wg5", Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +399,7 @@ func TestInterfaceAutoAllocation(t *testing.T) {
 
 	// 非 wgN 命名从 0 号位起顺延，跳过已被占用的端口与网段，而不是直接报冲突
 	fourth, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "office", Enabled: true, Autostart: true,
+		Name: "office", Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -336,7 +411,7 @@ func TestInterfaceAutoAllocation(t *testing.T) {
 	// 用户显式指定的取值必须原样保留，不被自动分配覆盖
 	fifth, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
 		Name: "custom", ListenPort: 52000, Addresses: []string{"172.20.0.1/24"},
-		Enabled: true, Autostart: true,
+		Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -494,7 +569,7 @@ func TestBackupImportDownload(t *testing.T) {
 	dir := t.TempDir()
 
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.9.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.9.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +620,7 @@ func TestImportPeersBatch(t *testing.T) {
 	actor := service.Actor{Username: "tester"}
 
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.20.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.20.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -591,13 +666,13 @@ func TestImportPeersRejectsDuplicateKey(t *testing.T) {
 	actor := service.Actor{Username: "tester"}
 
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.21.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.21.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, Name: "已有设备", AutoAddress: true, Enabled: true,
+		InterfaceID: it.ID, Name: "已有设备", AutoAddress: true, Enabled: boolPtr(true),
 		GenerateKeys: true, GeneratePSK: true,
 	}, actor)
 	if err != nil {
@@ -714,7 +789,7 @@ func TestAuthAndAudit(t *testing.T) {
 
 	// 写操作应产生审计记录，且哈希链完整
 	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, service.Actor{UserID: user.ID, Username: user.Username, SrcIP: "127.0.0.1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -748,19 +823,19 @@ func TestPeerAllowedIPsRejectsDefaultRoute(t *testing.T) {
 	actor := service.Actor{Username: "tester"}
 
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, Name: "危险配置", GenerateKeys: true, Enabled: true,
+		InterfaceID: it.ID, Name: "危险配置", GenerateKeys: true, Enabled: boolPtr(true),
 		AllowedIPs: []string{"0.0.0.0/0", "::/0"},
 	}, actor); err == nil {
 		t.Fatal("准入地址含 0.0.0.0/0 时必须被拒绝")
 	}
 	if _, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, Name: "正常配置", GenerateKeys: true, Enabled: true,
+		InterfaceID: it.ID, Name: "正常配置", GenerateKeys: true, Enabled: boolPtr(true),
 		AllowedIPs: []string{"10.10.0.2/32"}, RouteMode: model.RouteModeLAN,
 	}, actor); err != nil {
 		t.Fatalf("正常配置应被接受: %v", err)
@@ -775,7 +850,7 @@ func TestClientAllowedIPsByRouteMode(t *testing.T) {
 	actor := service.Actor{Username: "tester"}
 
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
@@ -792,7 +867,7 @@ func TestClientAllowedIPsByRouteMode(t *testing.T) {
 	}
 	for _, c := range cases {
 		p, err := svc.CreatePeer(ctx, service.PeerInput{
-			InterfaceID: it.ID, Name: "设备-" + c.mode, GenerateKeys: true, Enabled: true,
+			InterfaceID: it.ID, Name: "设备-" + c.mode, GenerateKeys: true, Enabled: boolPtr(true),
 			RouteMode: c.mode, ClientAllowedIPs: c.custom,
 		}, actor)
 		if err != nil {
@@ -819,13 +894,13 @@ func TestOverviewAndReconcile(t *testing.T) {
 	actor := service.Actor{Username: "tester"}
 
 	it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
-		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: true, Autostart: true,
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.CreatePeer(ctx, service.PeerInput{
-		InterfaceID: it.ID, Name: "节点A", GenerateKeys: true, AutoAddress: true, Enabled: true,
+		InterfaceID: it.ID, Name: "节点A", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
 	}, actor); err != nil {
 		t.Fatal(err)
 	}

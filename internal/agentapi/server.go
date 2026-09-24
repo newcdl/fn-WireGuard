@@ -172,6 +172,14 @@ func (s *Server) dispatch(conn net.Conn, req *Request) Response {
 		resp.OK = true
 		resp.Result = mustJSON(rep)
 		return resp
+	case MethodLANDevices:
+		rep, err := s.handler.LANDevices(ctx)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(rep)
+		return resp
 	case MethodNetRepair:
 		actions, err := s.handler.RepairNetwork(ctx)
 		if err != nil {
@@ -187,6 +195,66 @@ func (s *Server) dispatch(conn net.Conn, req *Request) Response {
 		}
 		resp.OK = true
 		resp.Result = mustJSON(map[string]any{"actions": actions})
+		return resp
+	case MethodInspectRun:
+		var p InspectRunParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(resp, errors.New("参数解析失败"))
+		}
+		res, err := s.handler.RunInspect(ctx, p.UserID, p.Username, p.SrcIP)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(res)
+		return resp
+	case MethodBackupRun:
+		var p BackupRunParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(resp, errors.New("参数解析失败"))
+		}
+		res, err := s.handler.RunBackupPlan(ctx, p.UserID, p.Username, p.SrcIP)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(res)
+		return resp
+	case MethodBackupDirInspect:
+		var p BackupDirParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(resp, errors.New("参数解析失败"))
+		}
+		info, err := s.handler.InspectBackupDir(ctx, p.Dir)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(info)
+		return resp
+	case MethodBackupCopyRead:
+		var p BackupCopyReadParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(resp, errors.New("参数解析失败"))
+		}
+		raw, err := s.handler.ReadBackupCopy(ctx, p.Dir, p.Name)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(BackupCopyRawResult{Raw: raw})
+		return resp
+	case MethodBackupCopyWrite:
+		var p BackupCopyWriteParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(resp, errors.New("参数解析失败"))
+		}
+		name, err := s.handler.WriteBackupCopy(ctx, p.Dir, p.BackupID, p.UserID, p.Username, p.SrcIP)
+		if err != nil {
+			return fail(resp, err)
+		}
+		resp.OK = true
+		resp.Result = mustJSON(BackupCopyWriteResult{Name: name})
 		return resp
 	case MethodNetDeleteForeign:
 		var p DeleteForeignInterfaceParams

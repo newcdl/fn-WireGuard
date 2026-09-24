@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"fnwg/internal/model"
+	"fnwg/internal/service"
 )
 
 // 本文件管的是网关入口（飞牛桌面点图标那条通道）在**运行期**的存活。
@@ -100,6 +101,9 @@ type GatewayKeeper struct {
 
 	mu      sync.Mutex
 	current *GatewayListener
+	// lastFact 记录上一次登记进库的入口状态（见 recordFact），
+	// 避免每 15 秒都去比对一次数据库。
+	lastFact *model.GatewayEntry
 	// lastProblem 记录上一次的失败原因，用于「只在变化时告警」。
 	// 少了它，一个持续存在的故障会每 15 秒刷一条同样的日志，把真正有用的那一条淹掉。
 	lastProblem string
@@ -121,6 +125,8 @@ func (k *GatewayKeeper) Run(ctx context.Context) error {
 	} else {
 		k.log.Info("飞牛统一网关入口已就绪", "socket", k.path)
 	}
+	// 启动时先登记一次：定期巡检的报告要能读到它，而报告可能在任何时刻生成。
+	k.recordFact(ctx)
 
 	t := time.NewTicker(gatewayProbeInterval)
 	defer t.Stop()
@@ -143,6 +149,10 @@ func (k *GatewayKeeper) Run(ctx context.Context) error {
 
 // patrol 是巡检的一次执行：入口不在就重建。
 func (k *GatewayKeeper) patrol(ctx context.Context) {
+	// 无论这次有没有重建，都把当前状态登记进库（只在变化时真正写）：
+	// 定期巡检跑在代理进程，它看不到这个 socket，只能读这条记录。
+	defer k.recordFact(ctx)
+
 	st := probeGatewaySocket(k.path)
 	if st == gatewaySocketOK {
 		if k.lastProblem != "" {
@@ -170,6 +180,23 @@ func (k *GatewayKeeper) patrol(ctx context.Context) {
 	k.log.Warn("飞牛统一网关入口曾失效，已就地重建（此前从飞牛桌面点图标会显示 502）",
 		"socket", k.path, "原因", reason)
 	k.lastProblem = ""
+}
+
+// recordFact 把入口状态登记进库，供定期巡检报告判定这一项。
+//
+// 为什么要落库：入口 socket 只存在于本进程（界面进程）里，而定期巡检跑在代理进程 ——
+// 它判不了这件事。登记之后，报告里既有这一项、判定又仍然只有一份。
+// 状态没变就不写：平时这里一个字节都不会落盘。
+func (k *GatewayKeeper) recordFact(ctx context.Context) {
+	if k.srv == nil || k.srv.svc == nil {
+		return
+	}
+	entry := k.srv.gatewayEntryStatus()
+	if k.lastFact != nil && *k.lastFact == entry {
+		return
+	}
+	k.lastFact = &entry
+	service.SaveGatewayFact(ctx, k.srv.svc.Store, entry, time.Now())
 }
 
 // bind 建立（或重建）入口监听并开始服务。

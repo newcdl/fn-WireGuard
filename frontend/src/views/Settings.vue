@@ -160,19 +160,49 @@
           </template>
         </el-alert>
 
+        <!--
+          敏感操作二次验证：**默认关**。
+          「从飞牛桌面点开就进去」是这套功能的意义所在，要不要在此基础上再要一次动态口令，
+          交给用户自己决定 —— 默认不给谁加坎。
+        -->
+        <div class="fnwg-card" style="margin-bottom: 12px">
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+            <div style="flex: 1; min-width: 240px">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px">
+                <strong>敏感操作二次验证</strong>
+                <el-tag size="small" :type="stepUpEnabled ? 'success' : 'info'" effect="plain">
+                  {{ stepUpEnabled ? '已开启' : '未开启' }}
+                </el-tag>
+              </div>
+              <div class="fnwg-hint">
+                开启后，从飞牛桌面进来（以飞牛账号登录）的身份在做敏感操作前要多输一次动态口令：
+                查看本机密钥、用备份还原、管理账号。验证后 10 分钟内不必重复输入。
+                用账号密码从端口进来时不受影响——那是万一被挡在门外时的退路。
+                飞牛账号还没有绑定动态口令的，第一次做这些操作时会被引导去绑定。
+              </div>
+            </div>
+            <el-switch v-model="stepUpEnabled" :loading="savingStepUp" @change="saveStepUp" />
+          </div>
+        </div>
+
         <!-- 应急安全码：不是账号，是实例级的最后入口，因此单独一张卡说明 -->
         <div class="fnwg-card" style="margin-bottom: 12px">
           <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
             <div style="flex: 1; min-width: 240px">
               <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px">
                 <strong>应急安全码</strong>
-                <el-tag size="small" :type="securityCodeConfigured ? 'success' : 'danger'" effect="plain">
-                  {{ securityCodeConfigured ? '已设置' : '未设置' }}
+                <el-tag
+                  size="small"
+                  :type="securityCodeState === 'yes' ? 'success' : securityCodeState === 'no' ? 'danger' : 'info'"
+                  effect="plain"
+                >
+                  {{ securityCodeState === 'yes' ? '已设置' : securityCodeState === 'no' ? '未设置' : '读取失败' }}
                 </el-tag>
               </div>
               <div class="fnwg-hint">
                 当管理员忘记密码、手机丢失且恢复码也遗失、或界面根本打不开时，
                 在登录页点「应急登录」输入它即可进入并重置密码或关闭二次验证。
+                它是**实例级**的、全部账号共用同一枚（谁设置的都一样），不随登录身份变化。
                 它只能使用一次，用过立即作废并下发新的一码；系统只存哈希，无法再次查看，请离线保存。
               </div>
             </div>
@@ -184,11 +214,18 @@
           <el-button type="primary" :icon="Plus" @click="openUserDialog">新建账号</el-button>
         </div>
 
-        <div v-if="!isMobile" class="fnwg-card">
+        <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+        <ViewSwitch v-model="usersViewMode" />
+
+        <div v-if="usersIsTable" class="fnwg-card">
           <el-table :data="users" size="small" empty-text="暂无账号">
-            <el-table-column label="登录账号" min-width="200">
+            <el-table-column label="登录账号" min-width="250">
               <template #default="{ row }">
                 <span>{{ row.username }}</span>
+                <!-- 飞牛账号的账号名由飞牛 UID 生成（nas:<uid>），身份来自飞牛账号本身 -->
+                <el-tag v-if="row.trim_uid" size="small" type="info" effect="plain" style="margin-left: 6px">
+                  飞牛账号
+                </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="权限" width="120">
@@ -215,23 +252,36 @@
             </el-table-column>
             <el-table-column label="操作" width="340">
               <template #default="{ row }">
-                <el-button link type="primary" @click="toggleUser(row)">
+                <!-- 自己这一行不给停用/删除：点了会把自己（可能还有唯一的入口）锁在外面。
+                     服务端也会拒绝，但界面不该把一个注定失败的按钮摆在人眼前。 -->
+                <el-tooltip v-if="row.id === session.user?.id" content="不能停用或删除当前登录的账号">
+                  <span class="fnwg-hint">当前账号</span>
+                </el-tooltip>
+                <el-button v-else link type="primary" @click="toggleUser(row)">
                   {{ row.status === 1 ? '停用' : '启用' }}
                 </el-button>
-                <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
+                <el-button v-if="!row.trim_uid" link type="primary" @click="resetPassword(row)">
+                  重置密码
+                </el-button>
+                <el-tooltip v-else content="飞牛账号的登录由飞牛身份决定，没有本应用口令可以重置">
+                  <span class="fnwg-hint">无本应用密码</span>
+                </el-tooltip>
                 <el-button v-if="!row.totp_enabled" link type="primary" @click="openAdminTOTP(row)">
                   开启二次验证
                 </el-button>
                 <el-button v-else link type="warning" @click="resetUserTOTP(row)">
                   重置二次验证
                 </el-button>
-                <el-button link type="danger" @click="removeUser(row)">删除</el-button>
+                <el-button v-if="row.id !== session.user?.id" link type="danger" @click="removeUser(row)">
+                  删除
+                </el-button>
               </template>
             </el-table-column>
           </el-table>
         </div>
 
         <div v-else>
+          <div class="fnwg-card-grid">
           <ItemCard
             v-for="row in users"
             :key="row.id"
@@ -245,6 +295,10 @@
               <span class="fnwg-kv-key">状态</span>
               <span class="fnwg-kv-val">{{ row.status === 1 ? '可登录' : '已停用' }}</span>
             </div>
+            <div v-if="row.trim_uid" class="fnwg-kv">
+              <span class="fnwg-kv-key">来源</span>
+              <span class="fnwg-kv-val">飞牛账号（UID {{ row.trim_uid }}），登录由飞牛身份决定</span>
+            </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">二次验证</span>
               <span class="fnwg-kv-val">{{ row.totp_enabled ? '已开启' : '未开启' }}</span>
@@ -254,15 +308,22 @@
               <span class="fnwg-kv-val">{{ formatTime(row.last_login_at) }}</span>
             </div>
             <template #actions>
-              <el-button size="small" @click="toggleUser(row)">{{ row.status === 1 ? '停用' : '启用' }}</el-button>
-              <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
+              <span v-if="row.id === session.user?.id" class="fnwg-hint">当前登录的账号，不能停用或删除</span>
+              <el-button v-else size="small" @click="toggleUser(row)">
+                {{ row.status === 1 ? '停用' : '启用' }}
+              </el-button>
+              <el-button v-if="!row.trim_uid" size="small" @click="resetPassword(row)">重置密码</el-button>
+              <span v-else class="fnwg-hint">飞牛账号无本应用密码</span>
               <el-button v-if="!row.totp_enabled" size="small" @click="openAdminTOTP(row)">
                 开启二次验证
               </el-button>
               <el-button v-else size="small" @click="resetUserTOTP(row)">重置二次验证</el-button>
-              <el-button size="small" @click="removeUser(row)">删除</el-button>
+              <el-button v-if="row.id !== session.user?.id" size="small" @click="removeUser(row)">
+                删除
+              </el-button>
             </template>
           </ItemCard>
+          </div>
         </div>
       </el-tab-pane>
 
@@ -328,13 +389,28 @@
           </el-button>
           <el-button :icon="Refresh" @click="loadDNS">刷新</el-button>
           <div style="flex: 1"></div>
+          <ViewSwitch v-model="dnsViewMode" />
           <span class="fnwg-hint">共 {{ dnsRecords.length }} 条</span>
         </div>
 
-        <el-table :data="dnsRecords" size="small" empty-text="还没有域名记录">
+        <el-table v-if="dnsIsTable" :data="dnsRecords" size="small" empty-text="还没有域名记录">
           <el-table-column prop="name" label="主机名" min-width="160" />
           <el-table-column prop="ip" label="指向的地址" min-width="140" />
           <el-table-column prop="note" label="备注" min-width="140" />
+          <el-table-column label="设备类型" width="180">
+            <template #default="{ row }">
+              <el-select
+                :model-value="kindMap[row.ip] || ''"
+                size="small"
+                placeholder="自动判断"
+                clearable
+                @visible-change="loadKinds"
+                @change="(v: string) => setKind(row.ip, v)"
+              >
+                <el-option v-for="o in kindOptions" :key="o.value" :label="o.label" :value="o.value" />
+              </el-select>
+            </template>
+          </el-table-column>
           <el-table-column label="操作" width="140">
             <template #default="{ row }">
               <el-button v-if="session.can('iface.write')" link type="primary" @click="openDNSRecord(row)">
@@ -346,6 +422,48 @@
             </template>
           </el-table-column>
         </el-table>
+
+        <!-- 卡片视图：与表格显示同样的字段与操作；一条域名一块，手机上不用左右滚 -->
+        <div v-else class="fnwg-card-grid">
+          <ItemCard v-for="row in dnsRecords" :key="row.name + row.ip" :title="row.name">
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">指向的地址</span>
+              <span class="fnwg-kv-val fnwg-mono">{{ row.ip }}</span>
+            </div>
+            <div v-if="row.note" class="fnwg-kv">
+              <span class="fnwg-kv-key">备注</span>
+              <span class="fnwg-kv-val">{{ row.note }}</span>
+            </div>
+            <div class="fnwg-kv">
+              <span class="fnwg-kv-key">设备类型</span>
+              <span class="fnwg-kv-val">
+                <el-select
+                  :model-value="kindMap[row.ip] || ''"
+                  size="small"
+                  placeholder="自动判断"
+                  clearable
+                  style="width: 140px"
+                  @visible-change="loadKinds"
+                  @change="(v: string) => setKind(row.ip, v)"
+                >
+                  <el-option v-for="o in kindOptions" :key="o.value" :label="o.label" :value="o.value" />
+                </el-select>
+              </span>
+            </div>
+            <template #actions>
+              <el-button v-if="session.can('iface.write')" size="small" @click="openDNSRecord(row)">编辑</el-button>
+              <el-button
+                v-if="session.can('iface.write')"
+                size="small"
+                type="danger"
+                plain
+                @click="removeDNSRecord(row)"
+              >
+                删除
+              </el-button>
+            </template>
+          </ItemCard>
+        </div>
 
         <!-- 新增 / 编辑域名 -->
         <el-dialog v-model="dnsVisible" :title="dnsForm.id ? '编辑域名' : '添加域名'" :width="dialogWidth || '460px'">
@@ -373,82 +491,10 @@
 
       <!-- 备份与还原 -->
       <el-tab-pane label="备份还原" name="backup">
-        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
-          <template #title>
-            备份会保存全部连接、设备、系统设置与账号（含管理员密码与密钥），换机或误删后可一键完整还原。建议在每次大改动前先备份一次。
-          </template>
-        </el-alert>
-
-        <div class="fnwg-toolbar">
-          <el-button v-if="session.can('backup.restore')" type="primary" :icon="Plus" @click="createBackup">
-            立即备份
-          </el-button>
-          <el-button v-if="session.can('backup.restore')" :icon="Upload" @click="openImportBackup">
-            导入备份
-          </el-button>
-          <input
-            ref="backupFileInput"
-            type="file"
-            accept=".json,application/json"
-            style="display: none"
-            @change="onImportFile"
-          />
-          <div style="flex: 1"></div>
-          <span class="fnwg-hint">备份文件位置：{{ shareDir || '-' }}</span>
-        </div>
-
-        <div v-if="!isMobile" class="fnwg-card">
-          <el-table :data="backups" size="small" empty-text="还没有备份">
-            <el-table-column prop="filename" label="备份文件" min-width="240" />
-            <el-table-column label="大小" width="100">
-              <template #default="{ row }">{{ formatBytes(row.size) }}</template>
-            </el-table-column>
-            <el-table-column label="备份内容" width="110">
-              <template #default>
-                <el-tag size="small" type="warning" effect="plain">全量备份</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="备份时间" width="180">
-              <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
-            </el-table-column>
-            <el-table-column prop="note" label="备注" min-width="140" />
-            <el-table-column label="操作" width="200">
-              <template #default="{ row }">
-                <el-button v-if="session.can('backup.restore')" link type="primary" @click="restore(row)">还原</el-button>
-                <el-button v-if="session.can('backup.restore')" link type="primary" @click="downloadBackup(row)">下载</el-button>
-                <el-button v-if="session.can('backup.restore')" link type="danger" @click="removeBackup(row)">删除</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </div>
-
-        <div v-else>
-          <ItemCard v-for="row in backups" :key="row.id" :title="row.filename">
-            <template #extra>
-              <el-tag size="small" type="warning" effect="plain">全量备份</el-tag>
-            </template>
-            <div class="fnwg-kv">
-              <span class="fnwg-kv-key">备份时间</span>
-              <span class="fnwg-kv-val">{{ formatTime(row.created_at) }}</span>
-            </div>
-            <div class="fnwg-kv">
-              <span class="fnwg-kv-key">大小</span>
-              <span class="fnwg-kv-val">{{ formatBytes(row.size) }}</span>
-            </div>
-            <div v-if="row.note" class="fnwg-kv">
-              <span class="fnwg-kv-key">备注</span>
-              <span class="fnwg-kv-val">{{ row.note }}</span>
-            </div>
-            <template #actions>
-              <el-button v-if="session.can('backup.restore')" size="small" type="primary" @click="restore(row)">
-                还原
-              </el-button>
-              <el-button v-if="session.can('backup.restore')" size="small" @click="downloadBackup(row)">下载</el-button>
-              <el-button v-if="session.can('backup.restore')" size="small" @click="removeBackup(row)">删除</el-button>
-            </template>
-          </ItemCard>
-          <div v-if="!backups.length" class="fnwg-empty">还没有备份</div>
-        </div>
+        <!-- 整块交给组件：这里以前塞着「备份列表 + 计划备份 + 副本列表」三段，
+             加起来两百多行，而这个文件已经近两千行。备份相关的状态与动作一起搬走，
+             顺带能在页签打开时才去取数据（没打开就不请求）。 -->
+        <BackupPanel v-if="tab === 'backup'" />
       </el-tab-pane>
 
       <!-- 配置快照与一键回滚 -->
@@ -476,7 +522,10 @@
           <span class="fnwg-hint">共 {{ snapshots.length }} 份 · 保留上限 {{ snapshotKeep }} 份</span>
         </div>
 
-        <div v-if="!isMobile" class="fnwg-card">
+        <!-- 表格 / 卡片视图：由用户决定并记住（切一次，之后一直用这种） -->
+        <ViewSwitch v-model="snapshotsViewMode" />
+
+        <div v-if="snapshotsIsTable" class="fnwg-card">
           <el-table :data="snapshots" size="small" empty-text="还没有配置快照，改动一次配置就会自动生成">
             <el-table-column prop="filename" label="快照文件" min-width="240" />
             <el-table-column label="大小" width="100">
@@ -501,6 +550,7 @@
         </div>
 
         <div v-else>
+          <div class="fnwg-card-grid">
           <ItemCard v-for="row in snapshots" :key="row.id" :title="row.filename">
             <template #extra>
               <el-tag size="small" type="info" effect="plain">配置快照</el-tag>
@@ -525,6 +575,7 @@
               </el-button>
             </template>
           </ItemCard>
+          </div>
           <div v-if="!snapshots.length" class="fnwg-empty">还没有配置快照</div>
         </div>
       </el-tab-pane>
@@ -570,6 +621,33 @@
                   <strong>事件通知</strong>：设备上下线、连接中断、额度用尽等推送到钉钉 / 企业微信 / 自定义 Webhook。
                 </li>
               </ul>
+            </el-collapse-item>
+
+            <!--
+              法律与免责：随安装包分发的 LICENSE（安装时读的就是它）里有完整说明，
+              这里放一份要点，让用户不必去找文件、也不必等下次安装才看得到。
+            -->
+            <el-collapse-item title="法律与免责声明" name="legal">
+              <p class="fnwg-about-text">
+                本应用是通用的网络配置管理工具，请只在<strong>你拥有合法使用权的设备与网络</strong>上使用。
+              </p>
+              <p class="fnwg-about-text">
+                <strong>严禁用于任何违法用途</strong>：未经授权访问、控制、干扰或探测他人的网络与设备；
+                绕过网络管理、审计或计费；侵犯他人隐私、通信秘密、个人信息或知识产权；传播违法信息；
+                以及其他违反所在地法律法规的行为。
+              </p>
+              <p class="fnwg-about-text">
+                <strong>使用者须对使用本应用的全部行为及其后果自行承担全部责任。</strong>
+                作者不参与、无法知悉也无法控制使用者的具体用途与部署环境，因此不对使用者的任何行为承担连带责任。
+              </p>
+              <p class="fnwg-about-text">
+                本应用按「现状」提供，不附带任何明示或默示的担保；在适用法律允许的最大范围内，
+                作者与贡献者不对因使用或无法使用本应用而产生的任何直接、间接、附带、特殊或后果性损失承担责任。
+              </p>
+              <p class="fnwg-about-text">
+                完整说明见随安装包分发的《用户协议与隐私说明》（设备上应用目录下的 <code>LICENSE</code> 文件）。
+                若不同意其中任何内容，请停止使用并卸载本应用。
+              </p>
             </el-collapse-item>
           </el-collapse>
           <el-descriptions :column="1" border size="small">
@@ -771,15 +849,51 @@
       </template>
     </el-dialog>
 
+    <!-- 立即备份：备注 + 目标目录。
+         目标目录默认是「应用自己的备份目录」（与以前一样，备份出现在下面的列表里，可下载可还原）；
+         也可以顺手在你授权的共享文件夹里留一份副本 —— 那正是备份想防的「同一块盘一起坏」。 -->
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+
+/**
+ * 设备类型：让用户明确指定「这台机器是什么」，拓扑图上的图标就不再靠名字猜。
+ * 与拓扑图详情卡里的下拉是同一份数据（按 IP 存），两边任一处设置都会同步。
+ * 选项在打开下拉时才取（这里是设置页，不必为它多占一次首屏请求）。
+ */
+const kindOptions = ref<{ value: string; label: string }[]>([])
+const kindMap = ref<Record<string, string>>({})
+
+async function loadKinds(): Promise<void> {
+  if (kindOptions.value.length) return
+  try {
+    const res = await api.get<{ options: { value: string; label: string }[]; records: { ip: string; kind: string }[] }>(
+      '/device-kinds',
+    )
+    kindOptions.value = res?.options || []
+    const m: Record<string, string> = {}
+    for (const r of res?.records || []) m[r.ip] = r.kind
+    kindMap.value = m
+  } catch {
+    /* 取不到就暂时不给选，不影响域名列表本身 */
+  }
+}
+
+async function setKind(ip: string, kind: string): Promise<void> {
+  try {
+    await api.post('/device-kind', { ip, kind })
+    kindMap.value = { ...kindMap.value, [ip]: kind }
+    ElMessage.success(kind ? '设备类型已保存' : '已改回按名称自动判断')
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '保存失败')
+  }
+}
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Upload, Reading, Refresh, Document } from '@element-plus/icons-vue'
-import { api, download, postRaw } from '@/api/client'
+import { Plus, Reading, Refresh, Document } from '@element-plus/icons-vue'
+import { api } from '@/api/client'
 import type {
   BackupRecord,
   DNSRecord,
@@ -796,12 +910,20 @@ import AdminTOTPDialog from '@/components/AdminTOTPDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
+import BackupPanel from '@/components/BackupPanel.vue'
 import { allHelpGroups, settingFields, userFields } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { refreshSystemHealth, useSystemHealth } from '@/composables/useSystemHealth'
 import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes, formatTime } from '@/utils/format'
+import ViewSwitch from '@/components/ViewSwitch.vue'
+import { useViewMode } from '@/composables/useViewMode'
+
+// 表格 / 卡片视图：由用户决定并记住（每个列表各用一个键）
+const { mode: usersViewMode, isTable: usersIsTable } = useViewMode('settings-users')
+const { mode: snapshotsViewMode, isTable: snapshotsIsTable } = useViewMode('settings-snapshots')
+const { mode: dnsViewMode, isTable: dnsIsTable } = useViewMode('settings-dns')
 
 const session = useSession()
 const realtime = useRealtime()
@@ -837,10 +959,6 @@ const newUser = reactive({ username: '', password: '', role: 'viewer' })
 const adminTOTPDialog = ref(false)
 const adminTOTPUser = ref<User | null>(null)
 
-const backups = ref<BackupRecord[]>([])
-const shareDir = ref('')
-const backupFileInput = ref<HTMLInputElement | null>(null)
-
 // 配置快照：关键改动前自动留档，可看差异、可一键回滚。
 const snapshots = ref<BackupRecord[]>([])
 const snapshotKeep = ref(50)
@@ -867,6 +985,9 @@ const diffSections = computed<(SnapshotDiffSection & { label: string })[]>(() =>
 // 内网域名解析：开关走设置项，记录走独立接口；
 // 运行状态复用全局体检的同一份数据，避免「设置页说正常、维护页说异常」。
 const dnsEnabled = ref(false)
+// 敏感操作二次验证（默认关，见后端 service/stepup.go）
+const stepUpEnabled = ref(false)
+const savingStepUp = ref(false)
 const dnsRecords = ref<DNSRecord[]>([])
 const dnsVisible = ref(false)
 const dnsSaving = ref(false)
@@ -899,13 +1020,14 @@ async function loadAll() {
       ? kv.notify_format
       : 'json'
     dnsEnabled.value = kv.dns_resolve_enabled === '1'
+    stepUpEnabled.value = kv.gateway_step_up === '1'
   } catch {
     /* 忽略 */
   }
   await loadNotify()
   await loadHealth()
   if (session.isAdmin) await loadUsers()
-  await loadBackups()
+  // 备份与计划备份在各自的组件里按需取（见 BackupPanel）
   await loadSnapshots()
   await loadDNS()
   void refreshSystemHealth()
@@ -935,6 +1057,50 @@ function confirmDNSChange(): Promise<boolean> {
   )
     .then(() => true)
     .catch(() => false)
+}
+
+/**
+ * 开启后飞牛账号做敏感操作前要先输一次动态口令；关掉即恢复原样。
+ *
+ * 开启前必须先确认**当前账号自己**绑好了二次验证：这个开关要靠动态口令才过得去，
+ * 自己没绑就开启，等于把「看本机密钥、用备份还原、管账号」这些事一起锁掉，
+ * 而且弹出的验证框里根本没有可输入的口令（反过来会让人觉得是坏了）。
+ */
+async function saveStepUp() {
+  if (stepUpEnabled.value) {
+    try {
+      const st = await api.get<{ enabled: boolean }>('/auth/totp')
+      if (!st.enabled) {
+        stepUpEnabled.value = false
+        await ElMessageBox.alert(
+          '开启之前，请先给当前账号绑定二次验证：点右上角头像 → 二次验证。\n\n' +
+            '这个开关要求做敏感操作前输入一次动态口令。当前账号还没绑定，' +
+            '一旦开启，查看本机密钥、用备份还原、管理账号都会卡在「没有口令可输」上（那时只能再把开关关掉）。\n\n' +
+            '绑好之后再回来开启即可。',
+          '请先绑定二次验证',
+          { type: 'warning', confirmButtonText: '知道了' },
+        )
+        return
+      }
+    } catch (e) {
+      stepUpEnabled.value = false // 状态都问不到，就不能凭它开这个关
+      ElMessage.error('无法确认当前账号的二次验证状态：' + (e as Error).message)
+      return
+    }
+  }
+  savingStepUp.value = true
+  const v = stepUpEnabled.value ? '1' : '0'
+  try {
+    await api.put('/settings', { gateway_step_up: v })
+    ElMessage.success(
+      v === '1' ? '已开启：飞牛账号做敏感操作前需再验证一次身份' : '已关闭：飞牛账号做敏感操作不再额外验证',
+    )
+  } catch (e) {
+    stepUpEnabled.value = !stepUpEnabled.value // 保存失败要回滚，否则界面显示的开关状态是假的
+    ElMessage.error((e as Error).message)
+  } finally {
+    savingStepUp.value = false
+  }
 }
 
 async function saveDNSEnabled() {
@@ -1010,21 +1176,38 @@ async function loadHealth() {
   }
 }
 
-/** 应急安全码的状态与重新生成（只有管理员能看，因此接口本身也挂 user.manage 权限）。 */
-const securityCodeConfigured = ref(false)
+/**
+ * 应急安全码的状态与重新生成（只有管理员能看，因此接口本身也挂 user.manage 权限）。
+ *
+ * 用三态而不是布尔：这个码是**实例级**的（全部账号共用同一枚，谁设置都一样），
+ * 界面唯一要保证的是「别把不知道的事说成知道」——
+ * 原来失败被静默吞掉、非管理员直接 return，两种情况下界面都显示「未设置」，
+ * 于是一个已经设过码的实例会看起来像没设（用户实测撞上的就是这个）。
+ */
+const securityCodeState = ref<'yes' | 'no' | 'unknown'>('unknown')
+const securityCodeConfigured = computed(() => securityCodeState.value === 'yes')
 const securityCodeDialog = ref(false)
 const newSecurityCode = ref('')
 const savedSecurityCode = ref(false)
 
 async function loadSecurityCode() {
-  if (!session.isAdmin) return
   try {
     const res = await api.get<{ configured: boolean }>('/auth/security-code')
-    securityCodeConfigured.value = res.configured
+    securityCodeState.value = res.configured ? 'yes' : 'no'
   } catch {
-    /* 忽略 */
+    // 取不到就说「读取失败」——它既不是「设置了」也不是「没设置」，不能替服务端下结论
+    securityCodeState.value = 'unknown'
   }
 }
+
+// 会话是异步加载的：早于它就查会因为还没有权限而失败，界面于是显示成「未设置」（实测踩到）。
+// 等身份就绪（isAdmin 变真）再补查一次。
+watch(
+  () => session.isAdmin,
+  (admin) => {
+    if (admin) void loadSecurityCode()
+  },
+)
 
 async function regenerateSecurityCode() {
   try {
@@ -1041,7 +1224,7 @@ async function regenerateSecurityCode() {
     newSecurityCode.value = res.code
     savedSecurityCode.value = false
     securityCodeDialog.value = true
-    securityCodeConfigured.value = true
+    securityCodeState.value = 'yes' // 刚生成成功，状态是确定的，不必等下一次查询
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -1055,16 +1238,6 @@ async function loadUsers() {
     /* 忽略 */
   }
   await loadSecurityCode()
-}
-
-async function loadBackups() {
-  try {
-    const data = await api.get<{ items: BackupRecord[]; share_dir: string }>('/backups')
-    backups.value = data.items || []
-    shareDir.value = data.share_dir || ''
-  } catch {
-    /* 忽略 */
-  }
 }
 
 async function loadSnapshots() {
@@ -1320,71 +1493,6 @@ async function removeUser(row: User) {
     await loadUsers()
   } catch (e) {
     if (e !== 'cancel') ElMessage.error((e as Error).message)
-  }
-}
-
-async function createBackup() {
-  let note = ''
-  try {
-    const r = await ElMessageBox.prompt('给这次备份写个备注（可留空）', '立即备份', { inputValue: '' })
-    note = r.value
-  } catch {
-    return
-  }
-  try {
-    await api.post('/backups', { note })
-    ElMessage.success('备份已完成')
-    await loadBackups()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
-}
-
-async function restore(row: BackupRecord) {
-  try {
-    await ElMessageBox.confirm(
-      `还原将用备份「${row.filename}」覆盖当前的全部连接、设备、系统设置与账号（含管理员密码），现有配置会被替换。确认继续？`,
-      '还原备份',
-      { type: 'warning' },
-    )
-    const res = await api.post<{ restored_interfaces: number }>(`/backups/${row.id}/restore`)
-    ElMessage.success(`已还原 ${res.restored_interfaces} 条连接`)
-    await loadAll()
-  } catch (e) {
-    if (e !== 'cancel') ElMessage.error((e as Error).message)
-  }
-}
-
-async function removeBackup(row: BackupRecord) {
-  try {
-    await ElMessageBox.confirm(`确认删除备份「${row.filename}」？`, '删除备份', { type: 'warning' })
-    await api.del(`/backups/${row.id}`)
-    await loadBackups()
-  } catch (e) {
-    if (e !== 'cancel') ElMessage.error((e as Error).message)
-  }
-}
-
-function downloadBackup(row: BackupRecord) {
-  download(`/backups/${row.id}/download`)
-}
-
-function openImportBackup() {
-  backupFileInput.value?.click()
-}
-
-async function onImportFile(e: Event) {
-  const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
-  input.value = ''
-  if (!file) return
-  try {
-    const text = await file.text()
-    await postRaw(`/backups/import?filename=${encodeURIComponent(file.name)}`, text)
-    ElMessage.success('备份已导入，可在列表中选择「还原」')
-    await loadBackups()
-  } catch (err) {
-    ElMessage.error((err as Error).message)
   }
 }
 

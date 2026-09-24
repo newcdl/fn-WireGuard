@@ -52,3 +52,38 @@ func TestAppSockPathHonoursAbsoluteAppDest(t *testing.T) {
 		t.Fatalf("应使用显式给出的应用目录，want %q got %q", want, got)
 	}
 }
+
+// TestAuthorizedDirsParsesFnOSEnv 锁定飞牛「授权目录」环境变量的解析口径。
+//
+// 官方约定：TRIM_DATA_ACCESSIBLE_PATHS 是**冒号分隔**的纯路径列表，不是 JSON，
+// 可能为空、可能含空项（结尾多一个冒号最常见）。这里是它唯一的读取入口，
+// 解析错了的表现是「界面里一个授权目录都看不到」——而用户明明已经在飞牛里授权过了，
+// 这种「我做了但你没反应」最难自查，所以把边界值都钉住。
+func TestAuthorizedDirsParsesFnOSEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{"未设置", "", nil},
+		{"只有分隔符", ":", nil},
+		{"单个路径", "/vol1/1000/backup", []string{"/vol1/1000/backup"}},
+		{"多个路径", "/vol1/1000/a:/vol2/1000/b", []string{"/vol1/1000/a", "/vol2/1000/b"}},
+		{"含空项与空格", " /vol1/1000/a ::/vol2/1000/b: ", []string{"/vol1/1000/a", "/vol2/1000/b"}},
+		{"重复项去重", "/vol1/1000/a:/vol1/1000/a", []string{"/vol1/1000/a"}},
+		{"相对路径丢弃", "relative:/vol1/1000/a", []string{"/vol1/1000/a"}},
+		{"路径规整", "/vol1/1000/a/../b/", []string{"/vol1/1000/b"}},
+	}
+	for _, c := range cases {
+		t.Setenv("TRIM_DATA_ACCESSIBLE_PATHS", c.raw)
+		got := (&Config{}).AuthorizedDirs()
+		if len(got) != len(c.want) {
+			t.Fatalf("%s：want %v got %v", c.name, c.want, got)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("%s：第 %d 项 want %q got %q", c.name, i, c.want[i], got[i])
+			}
+		}
+	}
+}
