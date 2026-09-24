@@ -23,6 +23,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 需要 tag 历史才能用 git describe 找到上一个版本，用于在正文末尾生成
+          # 变更对比链接（关掉 generate_release_notes 后 GitHub 不再附这个链接）。
+          # 默认的 fetch-depth: 1 只取当前提交，describe 必然失败。
+          fetch-depth: 0
 
       - name: Verify tag matches manifest version
         if: startsWith(github.ref, 'refs/tags/')
@@ -79,22 +84,71 @@ jobs:
           path: dist/*.fpk
           if-no-files-found: error
 
+      - name: Prepare release body
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # Release 正文的来源优先是 docs/release-notes/<tag>.md。
+          #
+          # 为什么不在这里直接解析 manifest 的 changelog：那是给飞牛应用中心看的
+          # 单行 HTML（行尾用 <br> 表达换行），拿它反解析成 Markdown 等于猜格式 ——
+          # 猜错不会报错，只会生成一份排版乱的正文，属于典型的静默降级。
+          # 因此分工明确：manifest 只管应用中心，GitHub Release 用正经 Markdown 文件，
+          # 文件缺失时才回退并留下警告。
+          NOTES="docs/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTES" ]; then
+            cp "$NOTES" /tmp/release_body.md
+          else
+            echo "::warning::未找到 ${NOTES}，本次回退到 manifest 的 changelog 生成正文（排版会简化），请补写该文件"
+            {
+              echo "## 更新内容"
+              echo
+              # manifest 的 changelog 是单行 HTML（行尾用 <br> 表达换行），按 <br> 拆成列表。
+              # 用 awk 而不是 GNU sed 的 `s/<br>/\n/g`：那个写法只在 GNU sed 下成立，
+              # macOS 自带的 BSD sed 行为不同 —— 本地验证不出问题、CI 上才炸（或反过来），
+              # 属于「看起来验过了」的假安全感，不如用两边都成立的写法。
+              sed -n 's/^changelog[[:space:]]*=[[:space:]]*//p' apps/fn-wireguard/manifest \
+                | awk '{
+                    gsub(/<br>/, "\n")
+                    n = split($0, line, "\n")
+                    for (i = 1; i <= n; i++) {
+                      if (line[i] ~ /^(新增功能|修复问题|其它)：/) {
+                        sub(/：$/, "", line[i]); print "### " line[i]
+                      } else {
+                        # 编号后补一个空格，否则 Markdown 不会渲染成有序列表
+                        # （sub 必须带上第三个参数，缺省是改 $0，改不到当前这段）
+                        sub(/^[0-9]+\./, "& ", line[i]); print line[i]
+                      }
+                    }
+                  }'
+            } > /tmp/release_body.md
+          fi
+
+          # 正文里应当出现本版本的版本号：build.sh 产出的安装包名是
+          # fn-wireguard-<版本>-<架构>.fpk（不带 v 前缀），找不到多半是复制了上一版
+          # 的说明却忘了改版本号 —— 那会让用户照着一个不存在的文件名去找，必须提示。
+          grep -q "${GITHUB_REF_NAME#v}" /tmp/release_body.md \
+            || echo "::warning::正文中未出现 ${GITHUB_REF_NAME#v}，确认安装包文件名没有沿用旧版本"
+
+          # 关掉 generate_release_notes 后 GitHub 不再附 Full Changelog 链接，
+          # 这里用上一个 tag 自己拼一个 —— 想看代码差异的用户需要它。
+          PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "$PREV" ]; then
+            printf '\n完整变更对比：https://github.com/%s/compare/%s...%s\n' \
+              "${GITHUB_REPOSITORY}" "$PREV" "${GITHUB_REF_NAME}" >> /tmp/release_body.md
+          else
+            echo "未找到上一个版本 tag，正文中不含变更对比链接（首个版本属正常）"
+          fi
+
+          cat /tmp/release_body.md
+
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.fpk
-          generate_release_notes: true
-          body: |
-            ## 安装
-
-            在飞牛 **应用中心 → 手动上传应用** 中选择对应架构的安装包：
-
-            | 文件 | 适用架构 | 确认方式 |
-            |---|---|---|
-            | `${{ github.ref_name }}-amd64.fpk` | x86_64 | `uname -m` 输出 `x86_64` |
-            | `${{ github.ref_name }}-arm64.fpk` | ARM64 | `uname -m` 输出 `aarch64` |
-
-            > 使用前请在路由器上把 WireGuard 端口（默认 UDP 51820）转发到 NAS 的局域网地址。
-
-            详细说明见 [README](https://github.com/${{ github.repository }}#readme)。
+          # 正文改由文件承载：里面要写真实的安装包文件名与完整更新说明，
+          # 内联在这个 workflow 里的话，每个版本都得回来改这个文件。
+          body_path: /tmp/release_body.md
+          # 关掉自动生成的 What's Changed：正式说明已经完整，再叠一长串 commit
+          # 标题只会把「这个版本带来了什么」冲淡；上面的变更对比链接已补回 diff 入口。
+          generate_release_notes: false
