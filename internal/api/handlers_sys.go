@@ -40,6 +40,11 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 		// 是给安装/升级脚本用的：只看端口就报「安装成功」，
 		// 用户点桌面图标才发现是 502（见 apps/fn-wireguard/cmd/common 的 fnwg_gateway_check）。
 		"socket_ready": s.gatewaySocketReady(),
+		// 本次请求走的哪条通道、能不能用飞牛身份免密进入 —— 登录页据此决定要不要给指引
+		// （例如「免密只在从飞牛桌面打开时可用」「回飞牛桌面重新点开」）。
+		// 只回答「能不能」，不回答「你是谁」：登录前不该从这里拿到任何身份信息。
+		"channel":           channelOf(r),
+		"gateway_available": gatewayAvailable(r),
 	}
 	if !initialized {
 		writeJSON(w, http.StatusOK, out)
@@ -48,6 +53,16 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 	if u, err := s.svc.Authenticate(r.Context(), extractToken(r)); err == nil {
 		out["authenticated"] = true
 		out["user"] = u
+		out["identity"] = "session"
+	}
+	// 本次请求带着可用的飞牛身份就把用户名报出来，**与是否已登录无关**：
+	// 登录页要在「刚退出登录」那一刻仍然显示「飞牛账号 XXX」这个入口，
+	// 而那一刻恰好是没有登录的 —— 早先把它写在「未登录」分支里，退出后就再也拿不到了（真机反馈）。
+	if id, ok := gatewayIdentityIfTrusted(r); ok {
+		out["gateway_user"] = map[string]any{
+			"username": id.Username,
+			"is_admin": id.IsAdmin,
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -398,6 +413,8 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"user":        u,
 		"permissions": model.PermissionsOf(u.Role),
 		"version":     s.version,
+		// 这次身份是怎么来的（本应用会话 / 飞牛网关注入），界面据此决定能不能「退出登录」
+		"identity": identityKind(r),
 	})
 }
 

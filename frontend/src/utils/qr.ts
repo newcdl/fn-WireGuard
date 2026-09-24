@@ -54,6 +54,15 @@ const LOGO_MIN_MODULES = 6
  */
 const DOT_RADIUS = 0.5
 
+/**
+ * 等图标的**上限**：超时就先不带图标把码出出来。
+ *
+ * 起因是用户反馈「第一次点开启二次验证，二维码是空的」—— 界面那边即使拿不到码也是白的，
+ * 用户看到的只有「没反应」。图标只是装饰，**空白是不可用**，两者绝不能等价：
+ * 宁可先少个图标，也必须先把码画出来（图标准备好后会被缓存，下次自然就带上了）。
+ */
+const ICON_TIMEOUT_MS = 1500
+
 let iconCache: Promise<string> | null = null
 
 /**
@@ -138,7 +147,10 @@ export async function styledQrDataUrl(text: string, px = 480): Promise<string> {
 
   // 中心图标始终画（用户要求「不管怎么样都有图标」）：数据密的码多留一圈白来换可识别性。
   // 只有图标本身取不到时不画 —— 那时既不铺白块也不跳过模块，跳过而不画会留下一个空洞。
-  const icon = await iconDataUri()
+  const icon = await Promise.race([
+    iconDataUri(),
+    new Promise<string>((resolve) => setTimeout(() => resolve(''), ICON_TIMEOUT_MS)),
+  ])
   const dense = size > LOGO_SPARSE_MAX_MODULES
   const margin = dense ? LOGO_MARGIN_DENSE : LOGO_MARGIN_SPARSE
   const iconCap = dense ? LOGO_MAX_ICON_DENSE : LOGO_MAX_ICON_SPARSE

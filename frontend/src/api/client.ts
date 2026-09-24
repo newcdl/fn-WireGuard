@@ -8,13 +8,29 @@ const BASE = API_BASE
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  /** 服务端要求先做一次二次验证（见后端 service/stepup.go 的开关）：界面据此弹验证框，而不是当成「没权限」。 */
+  stepUp: boolean
+  constructor(status: number, message: string, stepUp = false) {
     super(message)
     this.status = status
+    this.stepUp = stepUp
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * 敏感操作遇到「需要先验证一次身份」时，交给界面弹框收验证码。
+ *
+ * 为什么放在这里、而不是每个敏感操作自己处理：那些操作（查看密钥、用备份还原、账号管理）
+ * 散落在各个页面，每处都写一遍「拦截 403 → 弹框 → 重试」不但啰嗦，而且**一定会漏**。
+ * 放在请求层，调用点一行都不用改。
+ */
+let stepUpHandler: (() => Promise<boolean>) | null = null
+
+export function registerStepUpHandler(fn: () => Promise<boolean>): void {
+  stepUpHandler = fn
+}
+
+async function request<T>(path: string, init: RequestInit = {}, retried = false): Promise<T> {
   const res = await fetch(BASE + path, {
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
@@ -31,7 +47,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (!res.ok) {
     const msg = payload?.message || `请求失败（HTTP ${res.status}）`
-    throw new ApiError(res.status, msg)
+    if (payload?.step_up_required && !retried && stepUpHandler) {
+      // 验证通过就原样重放这一次请求；没通过就照常把错误抛出去（不循环弹框）。
+      // 只重试一次（retried 标记）：否则验证失败会变成反复弹框。
+      if (await stepUpHandler()) return request<T>(path, init, true)
+    }
+    throw new ApiError(res.status, msg, !!payload?.step_up_required)
   }
   return (payload?.data ?? payload) as T
 }

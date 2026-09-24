@@ -160,19 +160,49 @@
           </template>
         </el-alert>
 
+        <!--
+          敏感操作二次验证：**默认关**。
+          「从飞牛桌面点开就进去」是这套功能的意义所在，要不要在此基础上再要一次动态口令，
+          交给用户自己决定 —— 默认不给谁加坎。
+        -->
+        <div class="fnwg-card" style="margin-bottom: 12px">
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+            <div style="flex: 1; min-width: 240px">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px">
+                <strong>敏感操作二次验证</strong>
+                <el-tag size="small" :type="stepUpEnabled ? 'success' : 'info'" effect="plain">
+                  {{ stepUpEnabled ? '已开启' : '未开启' }}
+                </el-tag>
+              </div>
+              <div class="fnwg-hint">
+                开启后，从飞牛桌面进来（以飞牛账号登录）的身份在做敏感操作前要多输一次动态口令：
+                查看本机密钥、用备份还原、管理账号。验证后 10 分钟内不必重复输入。
+                用账号密码从端口进来时不受影响——那是万一被挡在门外时的退路。
+                飞牛账号还没有绑定动态口令的，第一次做这些操作时会被引导去绑定。
+              </div>
+            </div>
+            <el-switch v-model="stepUpEnabled" :loading="savingStepUp" @change="saveStepUp" />
+          </div>
+        </div>
+
         <!-- 应急安全码：不是账号，是实例级的最后入口，因此单独一张卡说明 -->
         <div class="fnwg-card" style="margin-bottom: 12px">
           <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
             <div style="flex: 1; min-width: 240px">
               <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px">
                 <strong>应急安全码</strong>
-                <el-tag size="small" :type="securityCodeConfigured ? 'success' : 'danger'" effect="plain">
-                  {{ securityCodeConfigured ? '已设置' : '未设置' }}
+                <el-tag
+                  size="small"
+                  :type="securityCodeState === 'yes' ? 'success' : securityCodeState === 'no' ? 'danger' : 'info'"
+                  effect="plain"
+                >
+                  {{ securityCodeState === 'yes' ? '已设置' : securityCodeState === 'no' ? '未设置' : '读取失败' }}
                 </el-tag>
               </div>
               <div class="fnwg-hint">
                 当管理员忘记密码、手机丢失且恢复码也遗失、或界面根本打不开时，
                 在登录页点「应急登录」输入它即可进入并重置密码或关闭二次验证。
+                它是**实例级**的、全部账号共用同一枚（谁设置的都一样），不随登录身份变化。
                 它只能使用一次，用过立即作废并下发新的一码；系统只存哈希，无法再次查看，请离线保存。
               </div>
             </div>
@@ -189,9 +219,13 @@
 
         <div v-if="usersIsTable" class="fnwg-card">
           <el-table :data="users" size="small" empty-text="暂无账号">
-            <el-table-column label="登录账号" min-width="200">
+            <el-table-column label="登录账号" min-width="250">
               <template #default="{ row }">
                 <span>{{ row.username }}</span>
+                <!-- 飞牛账号的账号名由飞牛 UID 生成（nas:<uid>），身份来自飞牛账号本身 -->
+                <el-tag v-if="row.trim_uid" size="small" type="info" effect="plain" style="margin-left: 6px">
+                  飞牛账号
+                </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="权限" width="120">
@@ -218,17 +252,29 @@
             </el-table-column>
             <el-table-column label="操作" width="340">
               <template #default="{ row }">
-                <el-button link type="primary" @click="toggleUser(row)">
+                <!-- 自己这一行不给停用/删除：点了会把自己（可能还有唯一的入口）锁在外面。
+                     服务端也会拒绝，但界面不该把一个注定失败的按钮摆在人眼前。 -->
+                <el-tooltip v-if="row.id === session.user?.id" content="不能停用或删除当前登录的账号">
+                  <span class="fnwg-hint">当前账号</span>
+                </el-tooltip>
+                <el-button v-else link type="primary" @click="toggleUser(row)">
                   {{ row.status === 1 ? '停用' : '启用' }}
                 </el-button>
-                <el-button link type="primary" @click="resetPassword(row)">重置密码</el-button>
+                <el-button v-if="!row.trim_uid" link type="primary" @click="resetPassword(row)">
+                  重置密码
+                </el-button>
+                <el-tooltip v-else content="飞牛账号的登录由飞牛身份决定，没有本应用口令可以重置">
+                  <span class="fnwg-hint">无本应用密码</span>
+                </el-tooltip>
                 <el-button v-if="!row.totp_enabled" link type="primary" @click="openAdminTOTP(row)">
                   开启二次验证
                 </el-button>
                 <el-button v-else link type="warning" @click="resetUserTOTP(row)">
                   重置二次验证
                 </el-button>
-                <el-button link type="danger" @click="removeUser(row)">删除</el-button>
+                <el-button v-if="row.id !== session.user?.id" link type="danger" @click="removeUser(row)">
+                  删除
+                </el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -249,6 +295,10 @@
               <span class="fnwg-kv-key">状态</span>
               <span class="fnwg-kv-val">{{ row.status === 1 ? '可登录' : '已停用' }}</span>
             </div>
+            <div v-if="row.trim_uid" class="fnwg-kv">
+              <span class="fnwg-kv-key">来源</span>
+              <span class="fnwg-kv-val">飞牛账号（UID {{ row.trim_uid }}），登录由飞牛身份决定</span>
+            </div>
             <div class="fnwg-kv">
               <span class="fnwg-kv-key">二次验证</span>
               <span class="fnwg-kv-val">{{ row.totp_enabled ? '已开启' : '未开启' }}</span>
@@ -258,13 +308,19 @@
               <span class="fnwg-kv-val">{{ formatTime(row.last_login_at) }}</span>
             </div>
             <template #actions>
-              <el-button size="small" @click="toggleUser(row)">{{ row.status === 1 ? '停用' : '启用' }}</el-button>
-              <el-button size="small" @click="resetPassword(row)">重置密码</el-button>
+              <span v-if="row.id === session.user?.id" class="fnwg-hint">当前登录的账号，不能停用或删除</span>
+              <el-button v-else size="small" @click="toggleUser(row)">
+                {{ row.status === 1 ? '停用' : '启用' }}
+              </el-button>
+              <el-button v-if="!row.trim_uid" size="small" @click="resetPassword(row)">重置密码</el-button>
+              <span v-else class="fnwg-hint">飞牛账号无本应用密码</span>
               <el-button v-if="!row.totp_enabled" size="small" @click="openAdminTOTP(row)">
                 开启二次验证
               </el-button>
               <el-button v-else size="small" @click="resetUserTOTP(row)">重置二次验证</el-button>
-              <el-button size="small" @click="removeUser(row)">删除</el-button>
+              <el-button v-if="row.id !== session.user?.id" size="small" @click="removeUser(row)">
+                删除
+              </el-button>
             </template>
           </ItemCard>
           </div>
@@ -774,7 +830,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 /**
  * 设备类型：让用户明确指定「这台机器是什么」，拓扑图上的图标就不再靠名字猜。
@@ -902,6 +958,9 @@ const diffSections = computed<(SnapshotDiffSection & { label: string })[]>(() =>
 // 内网域名解析：开关走设置项，记录走独立接口；
 // 运行状态复用全局体检的同一份数据，避免「设置页说正常、维护页说异常」。
 const dnsEnabled = ref(false)
+// 敏感操作二次验证（默认关，见后端 service/stepup.go）
+const stepUpEnabled = ref(false)
+const savingStepUp = ref(false)
 const dnsRecords = ref<DNSRecord[]>([])
 const dnsVisible = ref(false)
 const dnsSaving = ref(false)
@@ -934,6 +993,7 @@ async function loadAll() {
       ? kv.notify_format
       : 'json'
     dnsEnabled.value = kv.dns_resolve_enabled === '1'
+    stepUpEnabled.value = kv.gateway_step_up === '1'
   } catch {
     /* 忽略 */
   }
@@ -970,6 +1030,50 @@ function confirmDNSChange(): Promise<boolean> {
   )
     .then(() => true)
     .catch(() => false)
+}
+
+/**
+ * 开启后飞牛账号做敏感操作前要先输一次动态口令；关掉即恢复原样。
+ *
+ * 开启前必须先确认**当前账号自己**绑好了二次验证：这个开关要靠动态口令才过得去，
+ * 自己没绑就开启，等于把「看本机密钥、用备份还原、管账号」这些事一起锁掉，
+ * 而且弹出的验证框里根本没有可输入的口令（反过来会让人觉得是坏了）。
+ */
+async function saveStepUp() {
+  if (stepUpEnabled.value) {
+    try {
+      const st = await api.get<{ enabled: boolean }>('/auth/totp')
+      if (!st.enabled) {
+        stepUpEnabled.value = false
+        await ElMessageBox.alert(
+          '开启之前，请先给当前账号绑定二次验证：点右上角头像 → 二次验证。\n\n' +
+            '这个开关要求做敏感操作前输入一次动态口令。当前账号还没绑定，' +
+            '一旦开启，查看本机密钥、用备份还原、管理账号都会卡在「没有口令可输」上（那时只能再把开关关掉）。\n\n' +
+            '绑好之后再回来开启即可。',
+          '请先绑定二次验证',
+          { type: 'warning', confirmButtonText: '知道了' },
+        )
+        return
+      }
+    } catch (e) {
+      stepUpEnabled.value = false // 状态都问不到，就不能凭它开这个关
+      ElMessage.error('无法确认当前账号的二次验证状态：' + (e as Error).message)
+      return
+    }
+  }
+  savingStepUp.value = true
+  const v = stepUpEnabled.value ? '1' : '0'
+  try {
+    await api.put('/settings', { gateway_step_up: v })
+    ElMessage.success(
+      v === '1' ? '已开启：飞牛账号做敏感操作前需再验证一次身份' : '已关闭：飞牛账号做敏感操作不再额外验证',
+    )
+  } catch (e) {
+    stepUpEnabled.value = !stepUpEnabled.value // 保存失败要回滚，否则界面显示的开关状态是假的
+    ElMessage.error((e as Error).message)
+  } finally {
+    savingStepUp.value = false
+  }
 }
 
 async function saveDNSEnabled() {
@@ -1045,21 +1149,38 @@ async function loadHealth() {
   }
 }
 
-/** 应急安全码的状态与重新生成（只有管理员能看，因此接口本身也挂 user.manage 权限）。 */
-const securityCodeConfigured = ref(false)
+/**
+ * 应急安全码的状态与重新生成（只有管理员能看，因此接口本身也挂 user.manage 权限）。
+ *
+ * 用三态而不是布尔：这个码是**实例级**的（全部账号共用同一枚，谁设置都一样），
+ * 界面唯一要保证的是「别把不知道的事说成知道」——
+ * 原来失败被静默吞掉、非管理员直接 return，两种情况下界面都显示「未设置」，
+ * 于是一个已经设过码的实例会看起来像没设（用户实测撞上的就是这个）。
+ */
+const securityCodeState = ref<'yes' | 'no' | 'unknown'>('unknown')
+const securityCodeConfigured = computed(() => securityCodeState.value === 'yes')
 const securityCodeDialog = ref(false)
 const newSecurityCode = ref('')
 const savedSecurityCode = ref(false)
 
 async function loadSecurityCode() {
-  if (!session.isAdmin) return
   try {
     const res = await api.get<{ configured: boolean }>('/auth/security-code')
-    securityCodeConfigured.value = res.configured
+    securityCodeState.value = res.configured ? 'yes' : 'no'
   } catch {
-    /* 忽略 */
+    // 取不到就说「读取失败」——它既不是「设置了」也不是「没设置」，不能替服务端下结论
+    securityCodeState.value = 'unknown'
   }
 }
+
+// 会话是异步加载的：早于它就查会因为还没有权限而失败，界面于是显示成「未设置」（实测踩到）。
+// 等身份就绪（isAdmin 变真）再补查一次。
+watch(
+  () => session.isAdmin,
+  (admin) => {
+    if (admin) void loadSecurityCode()
+  },
+)
 
 async function regenerateSecurityCode() {
   try {
@@ -1076,7 +1197,7 @@ async function regenerateSecurityCode() {
     newSecurityCode.value = res.code
     savedSecurityCode.value = false
     securityCodeDialog.value = true
-    securityCodeConfigured.value = true
+    securityCodeState.value = 'yes' // 刚生成成功，状态是确定的，不必等下一次查询
   } catch (e) {
     ElMessage.error((e as Error).message)
   }

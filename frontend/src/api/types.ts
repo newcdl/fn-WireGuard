@@ -112,6 +112,16 @@ export interface AuthState {
   initialized: boolean
   authenticated: boolean
   user: User | null
+  /** 本次请求走的通道：socket = 飞牛桌面经统一网关进来，port = 端口直连。 */
+  channel?: string
+  /** 本次请求是否带着可用的飞牛身份（即能不能免密进入）。 */
+  gateway_available?: boolean
+  /** 有飞牛身份却被挡住时的原因（例如账号已被停用），登录页直接显示。 */
+  gateway_blocked?: string
+  /** 这次身份是怎么来的：session = 本应用会话（可退出登录）；gateway = 飞牛网关注入的身份。 */
+  identity?: 'session' | 'gateway'
+  /** 本次请求带着的飞牛身份（登录页据此显示「以飞牛账号 XXX 登录」按钮）。 */
+  gateway_user?: { username: string; is_admin: boolean }
 }
 
 export interface Health {
@@ -133,6 +143,10 @@ export interface User {
   created_at: string
   /** 是否已开启二次验证（密钥本身不会下发，只给这个派生标志） */
   totp_enabled?: boolean
+  /** 非 0 表示这是飞牛账号（值即飞牛用户 UID）：不能用密码登录，用户名也不可改。 */
+  trim_uid?: number
+  /** 飞牛用户名的快照，仅用于展示。 */
+  trim_name?: string
 }
 
 /** 二次验证状态。 */

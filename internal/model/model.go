@@ -359,14 +359,20 @@ type StatSample struct {
 
 // User 是应用内账号。
 type User struct {
-	ID           int64      `json:"id"`
-	Username     string     `json:"username"`
-	PasswordHash string     `json:"-"`
-	TOTPSecret   string     `json:"-"`
-	Role         string     `json:"role"`
-	Status       int        `json:"status"` // 1 启用 0 禁用
-	LastLoginAt  *time.Time `json:"last_login_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"-"`
+	TOTPSecret   string `json:"-"`
+	// TrimUID 非 0 表示这个账号来自飞牛统一网关的免密登录，值就是飞牛用户 UID；0 表示自建账号。
+	// 用 UID 而不是用户名做对应关系：按名字匹配会让一个叫 admin 的飞牛普通用户
+	// 直接对上本地管理员账号，那是提权漏洞。
+	TrimUID int64 `json:"trim_uid,omitempty"`
+	// TrimName 是飞牛用户名的快照，**仅供展示**，永远不参与任何匹配。
+	TrimName    string     `json:"trim_name,omitempty"`
+	Role        string     `json:"role"`
+	Status      int        `json:"status"` // 1 启用 0 禁用
+	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 	// TOTPEnabled 是派生给人看的字段：TOTPSecret 本身必须用 `json:"-"` 隐藏
 	// （它落在 /users 响应里就等于把二次验证密钥泄给了任何能读账号列表的人），
 	// 但「这个账号有没有开二次验证」需要让管理员看得到。

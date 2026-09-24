@@ -39,6 +39,9 @@ func (s *Server) Router(assets fs.FS) http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(s.accessLog)
 	r.Use(securityHeaders)
+	// 端口通道上一律删掉网关注入的那几个身份头：官方没承诺网关会剥离客户端伪造的同名头，
+	// 这层删头让「在端口上伪造管理员」从结构上不可能（见 stripUntrustedIdentityHeaders）。
+	r.Use(s.stripUntrustedIdentityHeaders)
 
 	apiRouter := chi.NewRouter()
 	s.mountAPI(apiRouter)
@@ -60,6 +63,9 @@ func (s *Server) mountAPI(r chi.Router) {
 	r.Post("/auth/login/totp", s.handleLoginTOTP)
 	// 应急登录：用安全码进入，所有常规途径都失效时的最后入口
 	r.Post("/auth/emergency", s.handleEmergencyLogin)
+	// 用飞牛身份换会话：登录页那个「以飞牛账号 XXX 登录」按钮走这里。
+	// 允许匿名调用是因为此刻还没有会话，但它要求请求确实带着可核验的飞牛身份（见处理器注释）。
+	r.Post("/auth/gateway-login", s.handleGatewayLogin)
 
 	// 需要登录
 	r.Group(func(r chi.Router) {
@@ -70,6 +76,8 @@ func (s *Server) mountAPI(r chi.Router) {
 		// 不读磁盘、不依赖网络；登录后即可查看，不需要额外权限。
 		r.Get("/about/licenses", s.handleLicenses)
 		r.Post("/auth/logout", s.handleLogout)
+		// 步进验证：敏感操作前的二次验证（只在开关打开、且会话来自飞牛免密身份时才需要）
+		r.Post("/auth/step-up", s.handleStepUp)
 		r.Post("/auth/password", s.handleChangePassword)
 		// 二次验证：管理「自己的」账号，因此只要求登录、不额外要求 user.manage
 		r.Get("/auth/totp", s.handleTOTPStatus)
@@ -81,8 +89,12 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.Delete("/auth/trusted-devices", s.handleRevokeAllTrustedDevices)
 		r.Delete("/auth/trusted-devices/{id}", s.handleRevokeTrustedDevice)
 		// 应急安全码：属于实例级凭据，只有管理员能查看状态与重新生成
-		r.With(requirePerm(model.PermUserManage)).Get("/auth/security-code", s.handleSecurityCodeState)
-		r.With(requirePerm(model.PermUserManage)).Post("/auth/security-code", s.handleIssueSecurityCode)
+		r.With(s.requirePerm(model.PermUserManage)).Get("/auth/security-code", s.handleSecurityCodeState)
+		r.With(s.requirePerm(model.PermUserManage)).Post("/auth/security-code", s.handleIssueSecurityCode)
+
+		// 只读诊断：这次请求走的哪条通道、网关注入了哪些身份头。
+		// 接入飞牛账号登录之前，先用它把「头到底有没有、伪造的头到不到得了应用」问清楚（见处理器注释）。
+		r.With(s.requirePerm(model.PermUserManage)).Get("/auth/gateway-probe", s.handleGatewayProbe)
 
 		r.Get("/overview", s.handleOverview)
 		// 网络拓扑（只读）：以本机为中心，含内网设备、隧道设备与对端 NAS。
@@ -91,104 +103,104 @@ func (s *Server) mountAPI(r chi.Router) {
 		r.Get("/device-kinds", s.handleDeviceKinds)
 		// 内网资产台账：把邻居表观测沉淀下来，看「家里长期有哪些设备」
 		r.Get("/assets", s.handleAssets)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/assets/known", s.handleMarkAsset)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/device-kind", s.handleSetDeviceKind)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/assets/known", s.handleMarkAsset)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/device-kind", s.handleSetDeviceKind)
 		r.Get("/health", s.handleHealth)
 
 		// NAS 系统网络自检与修复（只处理本应用造成的残留，不触碰系统设置）
 		r.Get("/system/network", s.handleNetworkCheck)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/repair", s.handleNetworkRepair)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/cleanup", s.handleNetworkCleanup)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/system/network/repair", s.handleNetworkRepair)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/system/network/cleanup", s.handleNetworkCleanup)
 		// 清理「不是本应用创建的」WireGuard 网卡（疑似历史残留，需二次确认）
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/network/foreign-interface/delete", s.handleDeleteForeignInterface)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/system/network/foreign-interface/delete", s.handleDeleteForeignInterface)
 
 		// 多 NAS 互联（站点到站点）：一端生成邀请、另一端导入即配对。
 		// 生成即在本端建好连接与对端条目（隧道地址/端口走既有的自动分配），
 		// 两端的准入地址与通行范围都由同一份数据推导，免得两头手工填错一条就「不通」。
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interconnect", s.handleCreateInterconnect)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interconnect/import", s.handleImportInterconnect)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interconnect", s.handleCreateInterconnect)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interconnect/import", s.handleImportInterconnect)
 
 		// 配置漂移巡检：状态与「此刻的判定」只读；改计划与立即巡检要写权限。
 		// 判定在服务层只有一份实现（界面与定期报告读同一个函数），执行在代理进程 ——
 		// 这个接口只取结论，不自己判（详见 service.InspectChecks 的说明）。
 		r.Get("/system/inspect", s.handleInspectStatus)
 		r.Get("/system/inspect/checks", s.handleInspectChecks)
-		r.With(requirePerm(model.PermIfaceWrite)).Put("/system/inspect", s.handleSaveInspectPlan)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/inspect/run", s.handleRunInspect)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Put("/system/inspect", s.handleSaveInspectPlan)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/system/inspect/run", s.handleRunInspect)
 
 		// 事件通知：状态查询（含最近一次发送结果）与测试发送
 		r.Get("/system/notify", s.handleNotifyStatus)
-		r.With(requirePerm(model.PermUserManage)).Post("/system/notify/test", s.handleNotifyTest)
+		r.With(s.requirePerm(model.PermUserManage)).Post("/system/notify/test", s.handleNotifyTest)
 
 		// 接口
 		r.Get("/interfaces", s.handleListInterfaces)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces", s.handleCreateInterface)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interfaces", s.handleCreateInterface)
 		r.Get("/interfaces/{id}", s.handleGetInterface)
-		r.With(requirePerm(model.PermIfaceWrite)).Patch("/interfaces/{id}", s.handleUpdateInterface)
-		r.With(requirePerm(model.PermIfaceWrite)).Delete("/interfaces/{id}", s.handleDeleteInterface)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/toggle", s.handleToggleInterface)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Patch("/interfaces/{id}", s.handleUpdateInterface)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Delete("/interfaces/{id}", s.handleDeleteInterface)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/toggle", s.handleToggleInterface)
 		// 一键切换「允许设备访问家里内网」（不必进编辑表单）
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/lan-access", s.handleSetLanAccess)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/lan-access", s.handleSetLanAccess)
 		// 一键切换「设备间隔离」
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/isolate", s.handleSetPeerIsolation)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/apply", s.handleApplyInterface)
-		r.With(requirePerm(model.PermKeyReveal)).Post("/interfaces/{id}/reveal-key", s.handleRevealInterfaceKey)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/rotate-key", s.handleRotateInterfaceKey)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/isolate", s.handleSetPeerIsolation)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/apply", s.handleApplyInterface)
+		r.With(s.requirePerm(model.PermKeyReveal)).Post("/interfaces/{id}/reveal-key", s.handleRevealInterfaceKey)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interfaces/{id}/rotate-key", s.handleRotateInterfaceKey)
 		r.Get("/interfaces/{id}/conf", s.handleInterfaceConf)
 		r.Get("/interfaces/{id}/peers", s.handleInterfacePeers)
 
 		// 节点
 		r.Get("/peers", s.handleListPeers)
-		r.With(requirePerm(model.PermPeerWrite)).Post("/peers", s.handleCreatePeer)
-		r.With(requirePerm(model.PermPeerWrite)).Post("/peers/batch", s.handleBatchPeers)
-		r.With(requirePerm(model.PermPeerWrite)).Post("/peers/import", s.handleImportPeers)
+		r.With(s.requirePerm(model.PermPeerWrite)).Post("/peers", s.handleCreatePeer)
+		r.With(s.requirePerm(model.PermPeerWrite)).Post("/peers/batch", s.handleBatchPeers)
+		r.With(s.requirePerm(model.PermPeerWrite)).Post("/peers/import", s.handleImportPeers)
 		r.Get("/peers/{id}", s.handleGetPeer)
-		r.With(requirePerm(model.PermPeerWrite)).Patch("/peers/{id}", s.handleUpdatePeer)
-		r.With(requirePerm(model.PermPeerWrite)).Delete("/peers/{id}", s.handleDeletePeer)
+		r.With(s.requirePerm(model.PermPeerWrite)).Patch("/peers/{id}", s.handleUpdatePeer)
+		r.With(s.requirePerm(model.PermPeerWrite)).Delete("/peers/{id}", s.handleDeletePeer)
 		r.Get("/peers/{id}/config", s.handlePeerConfig)
-		r.With(requirePerm(model.PermKeyReveal)).Get("/peers/{id}/secrets", s.handlePeerSecrets)
+		r.With(s.requirePerm(model.PermKeyReveal)).Get("/peers/{id}/secrets", s.handlePeerSecrets)
 		r.Get("/peers/{id}/history", s.handlePeerHistory)
 
 		// 密钥
-		r.With(requirePerm(model.PermPeerWrite)).Post("/keys/pair", s.handleKeyPair)
-		r.With(requirePerm(model.PermPeerWrite)).Post("/keys/psk", s.handleKeyPSK)
+		r.With(s.requirePerm(model.PermPeerWrite)).Post("/keys/pair", s.handleKeyPair)
+		r.With(s.requirePerm(model.PermPeerWrite)).Post("/keys/psk", s.handleKeyPSK)
 
 		// 配置导入导出与备份
 		r.Post("/config/import", s.handleImportConfig)
 		r.Get("/config/export", s.handleExportAll)
 		r.Get("/config/export/{id}", s.handleExportInterface)
 		r.Get("/backups", s.handleListBackups)
-		r.With(requirePerm(model.PermBackupRestore)).Post("/backups", s.handleCreateBackup)
-		r.With(requirePerm(model.PermBackupRestore)).Post("/backups/import", s.handleImportBackup)
-		r.With(requirePerm(model.PermBackupRestore)).Get("/backups/{id}/download", s.handleDownloadBackup)
-		r.With(requirePerm(model.PermBackupRestore)).Delete("/backups/{id}", s.handleDeleteBackup)
-		r.With(requirePerm(model.PermBackupRestore)).Post("/backups/{id}/restore", s.handleRestoreBackup)
+		r.With(s.requirePerm(model.PermBackupRestore)).Post("/backups", s.handleCreateBackup)
+		r.With(s.requirePerm(model.PermBackupRestore)).Post("/backups/import", s.handleImportBackup)
+		r.With(s.requirePerm(model.PermBackupRestore)).Get("/backups/{id}/download", s.handleDownloadBackup)
+		r.With(s.requirePerm(model.PermBackupRestore)).Delete("/backups/{id}", s.handleDeleteBackup)
+		r.With(s.requirePerm(model.PermBackupRestore)).Post("/backups/{id}/restore", s.handleRestoreBackup)
 
 		// 计划备份：定时把备份写到用户授权的共享文件夹（在应用自己的数据目录之外）。
 		//
 		// 路径特意不用 /backups/plan：与 /backups/{id} 共处一棵路由树，
 		// 静态段虽然优先匹配，但少一层「谁赢」的推理，出错的可能就少一分。
 		// 全部要求备份还原权限：它能读取外部副本并覆盖整机配置，比「看备份列表」敏感得多。
-		r.With(requirePerm(model.PermBackupRestore)).Get("/backup-plan", s.handleBackupPlanStatus)
-		r.With(requirePerm(model.PermBackupRestore)).Put("/backup-plan", s.handleSaveBackupPlan)
-		r.With(requirePerm(model.PermBackupRestore)).Post("/backup-plan/run", s.handleRunBackupPlan)
-		r.With(requirePerm(model.PermBackupRestore)).Get("/backup-plan/download", s.handleDownloadPlanFile)
-		r.With(requirePerm(model.PermBackupRestore)).Post("/backup-plan/restore", s.handleRestorePlanFile)
+		r.With(s.requirePerm(model.PermBackupRestore)).Get("/backup-plan", s.handleBackupPlanStatus)
+		r.With(s.requirePerm(model.PermBackupRestore)).Put("/backup-plan", s.handleSaveBackupPlan)
+		r.With(s.requirePerm(model.PermBackupRestore)).Post("/backup-plan/run", s.handleRunBackupPlan)
+		r.With(s.requirePerm(model.PermBackupRestore)).Get("/backup-plan/download", s.handleDownloadPlanFile)
+		r.With(s.requirePerm(model.PermBackupRestore)).Post("/backup-plan/restore", s.handleRestorePlanFile)
 
 		// 配置快照与一键回滚：关键改动前自动留档，可看差异、可整体回滚。
 		// 查看类接口对所有登录用户开放（与备份列表一致）；
 		// 留档/回滚/删除会改动线上配置，需要备份还原权限。
 		r.Get("/snapshots", s.handleListSnapshots)
-		r.With(requirePerm(model.PermBackupRestore)).Post("/snapshots", s.handleCreateSnapshot)
+		r.With(s.requirePerm(model.PermBackupRestore)).Post("/snapshots", s.handleCreateSnapshot)
 		r.Get("/snapshots/{id}/diff", s.handleSnapshotDiff)
-		r.With(requirePerm(model.PermBackupRestore)).Post("/snapshots/{id}/rollback", s.handleRollbackSnapshot)
-		r.With(requirePerm(model.PermBackupRestore)).Delete("/snapshots/{id}", s.handleDeleteSnapshot)
+		r.With(s.requirePerm(model.PermBackupRestore)).Post("/snapshots/{id}/rollback", s.handleRollbackSnapshot)
+		r.With(s.requirePerm(model.PermBackupRestore)).Delete("/snapshots/{id}", s.handleDeleteSnapshot)
 
 		// 内网域名解析（设备用主机名访问家里设备）
 		r.Get("/dns/records", s.handleListDNSRecords)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/dns/records", s.handleCreateDNSRecord)
-		r.With(requirePerm(model.PermIfaceWrite)).Patch("/dns/records/{id}", s.handleUpdateDNSRecord)
-		r.With(requirePerm(model.PermIfaceWrite)).Delete("/dns/records/{id}", s.handleDeleteDNSRecord)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/dns/records", s.handleCreateDNSRecord)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Patch("/dns/records/{id}", s.handleUpdateDNSRecord)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Delete("/dns/records/{id}", s.handleDeleteDNSRecord)
 
 		// 审计与日志
 		r.Get("/audit", s.handleListAudit)
@@ -199,23 +211,23 @@ func (s *Server) mountAPI(r chi.Router) {
 		// 改保留天数会改变数据留存策略并影响磁盘占用，按系统设置对待。
 		r.Get("/traffic/report", s.handleTrafficReport)
 		r.Get("/traffic/export", s.handleTrafficExport)
-		r.With(requirePerm(model.PermUserManage)).Put("/traffic/retention", s.handleSetTrafficRetention)
+		r.With(s.requirePerm(model.PermUserManage)).Put("/traffic/retention", s.handleSetTrafficRetention)
 
 		// 设置
 		r.Get("/settings", s.handleGetSettings)
-		r.With(requirePerm(model.PermUserManage)).Put("/settings", s.handleUpdateSettings)
-		r.With(requirePerm(model.PermIfaceWrite)).Post("/system/reconcile", s.handleReconcile)
+		r.With(s.requirePerm(model.PermUserManage)).Put("/settings", s.handleUpdateSettings)
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/system/reconcile", s.handleReconcile)
 
 		// 用户
-		r.With(requirePerm(model.PermUserManage)).Get("/users", s.handleListUsers)
-		r.With(requirePerm(model.PermUserManage)).Post("/users", s.handleCreateUser)
-		r.With(requirePerm(model.PermUserManage)).Patch("/users/{id}", s.handleUpdateUser)
-		r.With(requirePerm(model.PermUserManage)).Delete("/users/{id}", s.handleDeleteUser)
+		r.With(s.requirePerm(model.PermUserManage)).Get("/users", s.handleListUsers)
+		r.With(s.requirePerm(model.PermUserManage)).Post("/users", s.handleCreateUser)
+		r.With(s.requirePerm(model.PermUserManage)).Patch("/users/{id}", s.handleUpdateUser)
+		r.With(s.requirePerm(model.PermUserManage)).Delete("/users/{id}", s.handleDeleteUser)
 		// 管理员重置某账号的二次验证（用户把自己锁在门外时的正规救法）
-		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/reset", s.handleResetUserTOTP)
+		r.With(s.requirePerm(model.PermUserManage)).Post("/users/{id}/totp/reset", s.handleResetUserTOTP)
 		// 管理员为某账号开启二次验证：账号主人自己操作不熟时的正规做法。
-		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/setup", s.handleAdminUserTOTPSetup)
-		r.With(requirePerm(model.PermUserManage)).Post("/users/{id}/totp/enable", s.handleAdminUserTOTPEnable)
+		r.With(s.requirePerm(model.PermUserManage)).Post("/users/{id}/totp/setup", s.handleAdminUserTOTPSetup)
+		r.With(s.requirePerm(model.PermUserManage)).Post("/users/{id}/totp/enable", s.handleAdminUserTOTPEnable)
 
 		// 实时推送
 		r.Get("/ws", s.handleWS)

@@ -41,6 +41,14 @@
           </div>
           <div class="tfa-bind">
             <img v-if="qr" :src="qr" class="tfa-qr" alt="二次验证二维码" />
+            <!--
+              码没出来时**不能什么都不画**：那样「生成失败」和「还没生成完」在界面上都是一片空白，
+              用户只会觉得功能坏了。这里明说，并给一条重试的路（密钥仍在右侧，随时可手动输入）。
+            -->
+            <div v-else class="tfa-qr tfa-qr-fallback">
+              <div class="fnwg-hint" style="text-align: center">二维码没生成出来</div>
+              <el-button size="small" @click="retryQr">重新生成二维码</el-button>
+            </div>
             <div class="tfa-secret">
               <div style="font-size: 12px; opacity: 0.65; margin-bottom: 4px">手动输入用的密钥</div>
               <code class="tfa-secret-text">{{ secret }}</code>
@@ -197,6 +205,8 @@ const password = ref('')
 const code = ref('')
 const secret = ref('')
 const qr = ref('')
+// 生成二维码用的 otpauth 地址：留着它，重试时不必再调一次接口（每次调用都会换一把新密钥）
+const otpauthUri = ref('')
 const recoveryCodes = ref<string[]>([])
 const devices = ref<TrustedDevice[]>([])
 
@@ -218,6 +228,7 @@ async function openDialog() {
   code.value = ''
   secret.value = ''
   qr.value = ''
+  otpauthUri.value = ''
   recoveryCodes.value = []
   devices.value = []
   loadError.value = ''
@@ -289,8 +300,8 @@ async function startBind() {
   try {
     const out = await api.post<TOTPSetup>('/auth/totp/setup', { password: password.value })
     secret.value = out.secret
-    // 与设备配置码同一套样式（圆点 + 中心图标）：绑定码内容短、模块少，余量比设备码还大
-    qr.value = await styledQrDataUrl(out.uri, 320)
+    otpauthUri.value = out.uri
+    await buildQr()
     code.value = ''
     step.value = 'bind'
   } catch (e) {
@@ -298,6 +309,22 @@ async function startBind() {
   } finally {
     busy.value = false
   }
+}
+
+/** 生成二维码；失败不抛出、也不留空白，交给模板上的重试按钮兜底。 */
+async function buildQr(): Promise<void> {
+  try {
+    // 与设备配置码同一套样式（圆点 + 中心图标）：绑定码内容短、模块少，余量比设备码还大
+    qr.value = await styledQrDataUrl(otpauthUri.value, 320)
+  } catch {
+    qr.value = ''
+  }
+  if (!qr.value) ElMessage.warning('二维码没生成出来，可手动输入密钥，或点「重新生成二维码」再试')
+}
+
+async function retryQr(): Promise<void> {
+  if (!otpauthUri.value) return
+  await buildQr()
 }
 
 async function confirmEnable() {
@@ -370,6 +397,18 @@ async function copy(text: string) {
   border-radius: 8px;
   background: #fff;
   padding: 6px;
+}
+
+/* 码没出来时的兜底块：同样的位置与尺寸，明确告诉人「没出来」并给重试按钮，不留空白 */
+.tfa-qr-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border: 1px dashed var(--el-border-color);
+  border-radius: 8px;
+  background: var(--el-fill-color-lighter);
 }
 .tfa-secret {
   flex: 1;

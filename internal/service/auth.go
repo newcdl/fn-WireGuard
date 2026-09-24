@@ -92,6 +92,8 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 	if username == "" {
 		return nil, errors.New("用户名不能为空")
 	}
+	// 早先为飞牛账号的 nas:<uid> 命名空间限制过用户名前缀；账号名改成用飞牛用户名之后，
+	// 身份键完全由 UID（trim_uid 字段）承担，这条限制就没有存在理由了，撤掉。
 
 	switch role {
 	case model.RoleAdmin, model.RoleOperator, model.RoleViewer:
@@ -120,6 +122,11 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role string, status 
 	u, err := s.Store.GetUser(ctx, id)
 	if err != nil {
 		return err
+	}
+	// 不许停用自己：这不是「小心一点」的事，而是会当场把自己（以及可能唯一的入口）锁在外面。
+	// 界面上也把这一项收起来，但服务端必须自己挡 —— 前端不显示不等于接口可以接受。
+	if status != 1 && a.UserID != 0 && a.UserID == id {
+		return errors.New("不能停用当前登录的账号")
 	}
 	if role != "" {
 		u.Role = role
@@ -155,15 +162,30 @@ func (s *Service) DeleteUser(ctx context.Context, id int64, a Actor) error {
 		return err
 	}
 	if u.Role == model.RoleAdmin {
-		users, _ := s.Store.ListUsers(ctx)
-		admins := 0
+		// 这里**不能吞掉查询错误**：一旦列表读不出来，下面就会数成 0 个管理员，
+		// 于是报「至少保留一个启用的管理员」——把一次读取失败说成一个业务限制，
+		// 用户按这个提示怎么查都查不出原因（真机上就是这么被误导的）。
+		users, err := s.Store.ListUsers(ctx)
+		if err != nil {
+			return err
+		}
+		// 判据是「删掉它之后**还剩几个**启用的管理员」，所以被删的这个不能算：
+		// 删一个本来就停用的账号，一个启用的管理员都不会少。
+		//（真机反馈：旧写法把被删的自己也数进去，于是要先把它「启用」才删得掉——荒唐。）
+		enabled := []string{}
 		for _, x := range users {
+			if x.ID == id {
+				continue
+			}
 			if x.Role == model.RoleAdmin && x.Status == 1 {
-				admins++
+				enabled = append(enabled, x.Username)
 			}
 		}
-		if admins <= 1 {
-			return errors.New("至少需要保留一个启用的管理员账号")
+		if len(enabled) == 0 {
+			// 提示里把「数到了谁」写出来：用户一看就知道是哪个账号没被算成管理员
+			// （角色不是管理员、或者被停用了），而不是对着一句结论猜。
+			return fmt.Errorf("删除后就没有启用的管理员能登录了：除了它自己，当前没有别的启用管理员。" +
+				"请先给另一个账号管理员角色并启用，或改用「停用」而不是删除")
 		}
 	}
 	if err := s.Store.DeleteUser(ctx, id); err != nil {

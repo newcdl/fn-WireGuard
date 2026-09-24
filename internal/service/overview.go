@@ -133,6 +133,9 @@ func (s *Service) SetSettings(ctx context.Context, kv map[string]string, a Actor
 	if err := rejectInspectPlanSettings(kv); err != nil {
 		return err
 	}
+	if err := normalizeStepUpSetting(kv); err != nil {
+		return err
+	}
 	// 只记键名不记取值：设置里包含通知地址这类带令牌的敏感内容，
 	// 写进审计等于把凭据交给每个能查审计的人。快照同理，备注里也只给键名。
 	changed := make([]string, 0, len(kv))

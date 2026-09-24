@@ -149,7 +149,12 @@ CREATE TABLE IF NOT EXISTS sys_user (
   role          TEXT    NOT NULL DEFAULT 'viewer',
   status        INTEGER NOT NULL DEFAULT 1,
   last_login_at TEXT,
-  created_at    TEXT    NOT NULL
+  created_at    TEXT    NOT NULL,
+  -- 飞牛统一网关免密登录：账号对应的飞牛用户 UID（NULL = 本应用自建账号）。
+  -- 单独加一列而不是新造映射表：账号管理、审计、会话都直接复用既有一套，少一条并行路径。
+  trim_uid      INTEGER,
+  -- 飞牛用户名的快照，仅用于展示（永不参与匹配）。
+  trim_name     TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sys_session (
@@ -291,10 +296,20 @@ func (s *Store) migrate() error {
 		// 设备的内网访问范围：默认 inherit=随连接，升级后行为与升级前完全一致。
 		{"wg_peer", "lan_policy", `ALTER TABLE wg_peer ADD COLUMN lan_policy TEXT NOT NULL DEFAULT 'inherit'`},
 		{"wg_peer", "lan_targets", `ALTER TABLE wg_peer ADD COLUMN lan_targets TEXT NOT NULL DEFAULT '[]'`},
+		// 飞牛统一网关免密登录：账号对应的飞牛用户 UID（NULL/0 表示自建账号）。
+		{"sys_user", "trim_uid", `ALTER TABLE sys_user ADD COLUMN trim_uid INTEGER`},
+		// 飞牛用户名的快照，仅用于展示。
+		{"sys_user", "trim_name", `ALTER TABLE sys_user ADD COLUMN trim_name TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := s.ensureColumn(c.table, c.column, c.ddl); err != nil {
 			return err
 		}
+	}
+	// 一个飞牛用户只对应一个本地账号：唯一索引是这条不变量的兜底 ——
+	// 两个请求同时首次进入时会同时发现「账号不存在」，靠它拦下重复创建，而不是靠时序运气。
+	// 放在迁移之后：新建库要等列建好，老库要等 ALTER 完成。
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_trim ON sys_user(trim_uid) WHERE trim_uid IS NOT NULL`); err != nil {
+		return err
 	}
 	if err := s.migrateNetworkSafety(); err != nil {
 		return err
