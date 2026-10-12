@@ -695,11 +695,12 @@ func (b *linuxBackend) syncRoutes(link netlink.Link, spec model.InterfaceSpec, p
 		allowedIPs = append(allowedIPs, p.AllowedIPs...)
 	}
 
-	hostNets, existing, err := b.hostRouteContext(idx)
+	facts, err := b.hostRouteContext(idx)
 	if err != nil {
 		diff.Append("读取系统路由失败，已跳过路由下发：%v", err)
 		return
 	}
+	hostNets := append([]string{}, facts.Nets...)
 	hostNets = append(hostNets, cidrStrings(protected)...)
 
 	plan := PlanRoutes(RoutePlanInput{
@@ -709,8 +710,20 @@ func (b *linuxBackend) syncRoutes(link netlink.Link, spec model.InterfaceSpec, p
 		InterfaceAddrs: spec.Addresses,
 		PeerAllowedIPs: allowedIPs,
 		HostNetworks:   hostNets,
-		ExistingRoutes: existing,
+		ExistingRoutes: facts.Routes,
 	})
+
+	// 把冲突网段「来自哪里」补进说明：只说「与 NAS 现有网段重叠」，
+	// 用户只能自己去满机找那张网卡/那条路由。
+	for i := range plan.Skip {
+		if plan.Skip[i].Conflict == "" {
+			continue
+		}
+		if src := facts.Sources[plan.Skip[i].Conflict]; src != "" {
+			plan.Skip[i].Reason += "（来自" + src + "）"
+		}
+	}
+
 	want := PlanPolicyRoutes(spec.Name, plan)
 
 	if opts.DryRun {
@@ -746,9 +759,14 @@ func (b *linuxBackend) applyPolicyRoutesLocked(dev string, want []PolicyRoute, l
 			diff.Append("%s", action)
 		}
 	}
-	// 再补齐
+	// 再补齐：**不只看状态记录**，还要核对内核里真的还在（见 PolicyRouteNeeded）。
+	//
+	// 只信记录的话，内核里那条 ip rule / 表内路由一旦被清掉（重启、系统网络服务重启、
+	// 其它工具清理），记录还在 → 永远不再补下发 → 异地组网静默失效，界面与日志都看不出。
 	for _, pr := range want {
-		if b.state.HasPolicyRoute(dev, pr.CIDR) {
+		recorded := b.state.HasPolicyRoute(dev, pr.CIDR)
+		live, checked := b.policyRouteLive(pr)
+		if !PolicyRouteNeeded(recorded, live, checked) {
 			continue
 		}
 		if err := b.addPolicyRoute(pr, linkIndex); err != nil {
@@ -756,9 +774,47 @@ func (b *linuxBackend) applyPolicyRoutesLocked(dev string, want []PolicyRoute, l
 			continue
 		}
 		b.state.MarkPolicyRoute(pr)
+		if recorded {
+			diff.Append("策略路由 %s 的记录还在、但内核里已丢失：已重新下发（此前会一直缺着，组网因此不通）", pr.CIDR)
+			continue
+		}
 		diff.Append("添加策略路由 %s dev %s（专用表 %d，未改动系统主路由表）", pr.CIDR, dev, pr.Table)
 	}
 	_ = b.state.Save()
+}
+
+// policyRouteLive 核对一条策略路由在内核里是否真的存在：ip rule 与专用表内的路由都要在。
+//
+// 第二个返回值表示这次核对是否可信：读内核失败时不可信，调用方据此退回「按状态记录判断」，
+// 而不是把一次读失败当成「路由没了」去重复下发。
+func (b *linuxBackend) policyRouteLive(pr PolicyRoute) (live, checked bool) {
+	normalized := normalizedCIDR(pr.CIDR)
+	if normalized == "" {
+		// 网段本身非法：当作不存在（add 里还会再解析一次并给出提示）
+		return false, true
+	}
+	fam := netlinkFamily(pr.Family)
+	rules, err := netlink.RuleList(fam)
+	if err != nil {
+		return false, false
+	}
+	views := make([]PolicyRuleView, 0, len(rules))
+	for i := range rules {
+		views = append(views, PolicyRuleView{Dst: maskedCIDR(rules[i].Dst), Table: rules[i].Table})
+	}
+	if !PolicyRulePresent(views, normalized, pr.Table) {
+		return false, true
+	}
+	// 只按表过滤、目标在 Go 里比对：不依赖库对「按目标过滤」的实现细节，读回来的数据也可直接核对。
+	routes, err := netlink.RouteListFiltered(fam, &netlink.Route{Table: pr.Table}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return false, false
+	}
+	dsts := make([]string, 0, len(routes))
+	for i := range routes {
+		dsts = append(dsts, maskedCIDR(routes[i].Dst))
+	}
+	return PolicyRoutePresent(dsts, normalized), true
 }
 
 // addPolicyRoute 下发一条策略路由：先补 ip rule，再写专用表。
@@ -883,12 +939,22 @@ func netlinkFamily(f int) int {
 	return netlink.FAMILY_V4
 }
 
+// HostFacts 是主机侧（排除本接口）的既有事实，供路由安全判定与提示点名使用。
+type HostFacts struct {
+	// Nets 既有网段（其它网卡的地址 + 既有路由的目标；**不含**默认路由）。
+	Nets []string
+	// Sources 既有网段 → 来源说明（「网卡 end0」/「既有路由」）。
+	Sources map[string]string
+	// Routes 既有路由，含默认路由（Dst 为空表示 dump 里省略了 RTA_DST）。
+	Routes []HostRoute
+}
+
 // hostRouteContext 收集主机上（排除本接口）的网段与既有路由。
-func (b *linuxBackend) hostRouteContext(excludeIdx int) ([]string, []HostRoute, error) {
-	nets := []string{}
+func (b *linuxBackend) hostRouteContext(excludeIdx int) (HostFacts, error) {
+	facts := HostFacts{Sources: map[string]string{}}
 	links, err := netlink.LinkList()
 	if err != nil {
-		return nil, nil, err
+		return facts, err
 	}
 	for _, l := range links {
 		if l.Attrs().Index == excludeIdx {
@@ -902,15 +968,21 @@ func (b *linuxBackend) hostRouteContext(excludeIdx int) ([]string, []HostRoute, 
 			if a.IPNet == nil || a.IPNet.IP.IsLinkLocalUnicast() {
 				continue
 			}
-			nets = append(nets, maskedCIDR(a.IPNet))
+			c := maskedCIDR(a.IPNet)
+			if c == "" {
+				continue
+			}
+			facts.Nets = append(facts.Nets, c)
+			if _, ok := facts.Sources[c]; !ok {
+				facts.Sources[c] = "网卡 " + l.Attrs().Name
+			}
 		}
 	}
 
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
 	if err != nil {
-		return nets, nil, err
+		return facts, err
 	}
-	out := make([]HostRoute, 0, len(routes))
 	for _, r := range routes {
 		if r.LinkIndex == excludeIdx {
 			continue
@@ -918,11 +990,20 @@ func (b *linuxBackend) hostRouteContext(excludeIdx int) ([]string, []HostRoute, 
 		dst := ""
 		if r.Dst != nil {
 			dst = r.Dst.String()
-			nets = append(nets, maskedCIDR(r.Dst))
+			// 默认路由（前缀长度 0）不算「既有网段」：它包含一切目标，
+			// 放进 Nets 会把每一条对端路由都判成冲突（见 PlanRoutes 的 nonDefaultCIDRs）。
+			if ones, _ := r.Dst.Mask.Size(); ones > 0 {
+				if c := maskedCIDR(r.Dst); c != "" {
+					facts.Nets = append(facts.Nets, c)
+					if _, ok := facts.Sources[c]; !ok {
+						facts.Sources[c] = "既有路由"
+					}
+				}
+			}
 		}
-		out = append(out, HostRoute{Dst: dst, LinkIndex: r.LinkIndex, HasGw: r.Gw != nil, Family: r.Family})
+		facts.Routes = append(facts.Routes, HostRoute{Dst: dst, LinkIndex: r.LinkIndex, HasGw: r.Gw != nil, Family: r.Family})
 	}
-	return nets, out, nil
+	return facts, nil
 }
 
 // eachRoute 遍历系统**全部路由表**中的路由。

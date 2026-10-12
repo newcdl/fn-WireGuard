@@ -87,7 +87,7 @@ func TestJudgeInspectAllGood(t *testing.T) {
 	// 每一项都必须有一条结论（含通过）：少一条就意味着那项检查根本没跑，
 	// 而报告看起来仍然「全部通过」—— 这正是最危险的失败方式。
 	for _, key := range []string{
-		"agent", "kernel", "net", "gateway", "iface-down", "nat", "isolate",
+		"agent", "kernel", "apply", "net", "gateway", "iface-down", "nat", "isolate",
 		"access", "foreign", "dns", "endpoint", "notify", "backup",
 	} {
 		it, ok := itemOf(items, key)
@@ -116,16 +116,28 @@ func TestJudgeInspectProblems(t *testing.T) {
 			level:  InspectError,
 		},
 		{
+			// 兼容模式功能正常，是一条**状态**而不是待办：它长期成立且用户无事可做，
+			// 报成警告会让顶栏永远是黄的、待处理清单永远挂着一条「无需手动操作」的项。
 			name:   "内核模块没有、兼容模式可用",
 			break_: func(f *inspectFacts) { f.Health.KernelModule = false },
 			key:    "compat",
-			level:  InspectWarning,
+			level:  InspectOK,
 		},
 		{
 			name:   "内核模块与兼容模式都不可用",
 			break_: func(f *inspectFacts) { f.Health.KernelModule = false; f.Health.TunDevice = false },
 			key:    "kernel",
 			level:  InspectError,
+		},
+		{
+			// 「配置看起来改好了、其实没写进内核」必须能看见：真机上它只躺在运行记录里，
+			// 用户遇到的是「重启后组网断了、界面一切正常、保存一下就恢复」，无从判断原因。
+			name: "最近一次配置下发失败",
+			break_: func(f *inspectFacts) {
+				f.Health.Error = "有 1 条连接未能下发 —— wg3：创建用户态接口失败"
+			},
+			key:   "apply",
+			level: InspectError,
 		},
 		{
 			name: "系统默认路由被本应用占用",
@@ -269,6 +281,10 @@ func TestJudgeInspectProblems(t *testing.T) {
 			}
 			if c.level == InspectWarning && (warns != 1 || errs != 0) {
 				t.Fatalf("警告项数不对：warns=%d errs=%d（items=%+v）", warns, errs, keysOf(items))
+			}
+			// 状态类结论（ok）无论如何都不该把报告染色，也不该进「待处理事项」
+			if c.level == InspectOK && (errs != 0 || warns != 0) {
+				t.Fatalf("状态类结论不该产生异常：warns=%d errs=%d（items=%+v）", warns, errs, keysOf(items))
 			}
 		})
 	}

@@ -797,9 +797,73 @@ P2-3 快照回滚    （独立，但 P3 报表可复用其快照数据）
   隧道网段与已有连接冲突（两端隧道网段必须一致，因此不能自动改，只能请对方换）、
   两端内网网段相同、对端公钥已被本机占用、邀请里的隧道地址不在声明的网段内、私钥/公钥格式不对。
   「重复导入同一份邀请」单独认出来并给一句能对上现象的解释（本机已有一条同隧道网段的互联连接）。
-- **一处诚实的边界**：两端内网里的**普通主机**互访，仍需要在局域网侧把对端网段的路由指到本机
-  （NAS 自身与连上隧道的设备不受影响）。这一点写在导入结果的提示里，也写进 README ——
-  不假装一条隧道就能替用户改掉他家里路由器的路由表。
+- **一处诚实的边界**：两端内网里的**普通主机**互访，仍需要在局域网侧把对端网段的路由指到本机。
+  这一点写在导入结果的提示里，也写进 README —— 不假装一条隧道就能替用户改掉他家里路由器的路由表。
+- **补做（缘起：用户问「电脑连上后能不能访问整个 C」）**：V13 当初只做到「两台 NAS 互访」，
+  连上隧道的设备其实**到不了**对端内网，而原文那句「连上隧道的设备不受影响」容易被读成「能访问」。
+  补齐分两处，缺一不可：
+  1. **设备配置自动并入对端内网**：`service.clientAllowedIPs` 在 `lan` 模式下把「站点条目的对端内网」
+     （推导与 `topology.siteSubnetsOf`、`wgback.peerSiteSubnets` 同一套）也写进设备通行范围；
+     否则设备根本不把发往对端内网的包送进隧道。副作用是既有设备会被标「需重新扫码」——这是应有的，
+     范围写死在设备那份配置里，不重新导入不会生效。
+  2. **站点间源地址改写（方案 B）**：设备 → 对端内网的流量在本机是「隧道进、隧道出」，源地址是设备的
+     隧道地址，而对端准入地址里只有「对面 NAS 的地址」，会被对端 cryptokey routing 直接丢弃。
+     现在由 `wgback.applySiteMasq` 产出一条 `ip saddr <本机隧道网段> ip daddr <对端内网> oifname <站点连接> masquerade`
+     写进应用自己的 nftables 表，改写后对端只需认识「对面 NAS」。
+     之所以选它而不是「把对端设备网段登记进准入地址」：后者要在两端来回同步、站点一多规则就爆炸，
+     且要处理「本机别把自己另一条隧道的路由指到站点链路」这类坑；代价是源地址不再可追溯、对端无法主动访问设备。
+     源取**全部**隧道网段（含站点连接自己那一段）：设备与站点链路常常在同一条连接上
+     （只有一条连接、设备就挂在它下面 —— 最常见的用法），若把站点连接自身的网段整段排除，
+     源会被排除光、一条规则都不下发（**首版即踩了这个坑**，真机表现为「设备能访问本机内网、
+     却访问不了对端内网」，回归用例 `TestPlanSiteMasqCoversDeviceOnSiteLink` 钉住它）。
+     包含该网段无副作用：NAS 自身流量的源就是站点连接的地址，改写等于原样放行；
+     局域网主机的源地址不在隧道网段里，因此「局域网主机互访」那一路行为完全不变。
+  - 用例：`TestPlanSiteMasqRules`、`TestPlanSiteMasqCoversDeviceOnSiteLink`（设备与站点同连接时必须下发改写规则）、
+    `TestPlanSiteMasqEmptyWithoutSite`、`TestPlanSiteMasqFingerprint`、`TestPlanNATDerivesSiteNAT`（linux 标签，
+    核对从连接期望态认出站点连接）、`TestDeviceScopeIncludesSiteLAN`、`TestDeviceOnSiteLinkScopeIncludesBothLANs`
+    （设备配置同时含本机与对端内网，且不含隧道网段）。
+- **另一处真机才暴露的缺陷：口令没随邀请交出去（本轮同时修）**。生成侧给对端条目自动生成了
+  「二次加密口令」（`GenerateKeys` 会连带生成 PSK），而 `InterconnectPeerParams` 里没有这个字段，
+  邀请 JSON 交出去时口令被丢掉 → 导入侧那条对端条目**没有口令**，两端口令不一致，
+  WireGuard **直接拒绝每一次握手**。现象极难自查：两端接口正常、流量计数在涨、
+  「最近通信」却永远是「从未」；端口映射、公网地址、FRP 全对也无济于事
+  （真机排查了三轮才回到口令上）。
+  修法：`InterconnectPeerParams` 增加 `preshared_key` 并随邀请带走，导入侧写入；
+  生成侧对口令做存在性校验；**旧版邀请（缺口令）在导入时直接明确拒绝**并提示重新生成 ——
+  否则它会「导入成功但永远连不上」，比报错糟得多。
+  用例：`TestInterconnectRoundTrip`（新增断言：邀请里的口令非空，且两端条目与邀请逐字一致）、
+  `TestInterconnectImportRejectsConflicts/缺少二次加密口令`。
+- **第三处真机才暴露的缺陷：默认路由被当成「现有网段」，把每条对端路由都判成冲突**。
+  部分内核/netlink 组合在 dump 主路由表时会把默认路由的 `Dst` 返成 **0.0.0.0/0**
+  （而不是空的目标），而 `hostRouteContext` 把每个非空 `Dst` 都收进了「主机网段」。
+  0.0.0.0/0 包含**任何**目标，于是 `PlanRoutes` 的红线 3 对每一条对端网段都成立 →
+  路由全部跳过 → 「隧道通、对端地址也 ping 得通，却访问不了对端内网」，
+  日志里还写「与 NAS 现有网段重叠」，把排查引向一个根本不存在的冲突
+  （真机上机器里压根没有那个网段）。
+  修法：`PlanRoutes` 只把前缀长度 > 0 的网段当作「主机网段」(`nonDefaultCIDRs`，
+  兜底任何调用方)，`hostRouteContext` 也不再收默认路由；同时把跳过原因**点名到具体网段**
+  （`RouteSkip.Conflict` + `HostFacts.Sources` 补上「来自网卡 end0 / 既有路由」），
+  不再只说一句「与现有网段重叠」。
+  用例：`TestPlanRoutesIgnoresDefaultRouteInHostNetworks`、`TestPlanRoutesNamesConflictingNetwork`。
+- **易用性补做（用户提的四条，全是「当初能用但不好用」）**：
+  1. **邀请可再次查看**：不落库存档，改为由当前状态**重新推导**（`buildInterconnectInvite`，
+     与生成路径共用一份逻辑，因此「生成的那份」与「后来看到的那份」不可能不一致）；
+     `Service.InterconnectInvite` + `GET /interconnect/invite/{peerID}`，权限按「查看密钥」同级
+     （邀请含对端私钥与口令）并写审计；条目没有代管私钥时明确报错而不是给一份残缺配置。
+     界面：互联窗口新增「已生成的邀请」页签，设备列表里「对端 NAS」条目也有「邀请」按钮。
+  2. **用途可区分**：`model.Interface.Kind`（`site`/空）与 `model.Peer.SiteLink` 两个**派生**字段
+     （不落库，避免污染备份与快照的比对口径），判定沿用备注前缀这一套口径；
+     「我的连接」新增「用途」列、「我的设备」在名称后打「对端 NAS」标签。
+  3. **导入端口可指定 + 不一致要提示**：导入入参增加可选 `listen_port`（0=自动），
+     与已有连接端口冲突当场拒绝；结果里回报 `listen_port` 与 `public_endpoint`，
+     并在两者端口不一致时给出可操作提示（`portNoteIfMismatch`）。同一条提示也进
+     `Interface.PortNote`，由「我的连接」行内常驻显示 —— 这类错配平时看不出，
+     只在「对端连不上本机」时才致命，必须能在平时就看见。
+  4. **说明与示例**：`interconnectFields` 全部补上 `examples`（含反例），新增「本机监听端口」
+     与「已生成的邀请」两项说明；对话框在每个关键输入框下给一行内联说明，文案仍集中在
+     `frontend/src/constants/fields.ts`（不在 `.vue` 里另写一份）。
+  用例：`TestInterconnectInviteRebuild`（重现逐字一致 + 派生标记 + 普通设备被拒）、
+  `TestInterconnectImportListenPort`（指定端口生效 + 端口占用被拒 + 端口不一致提示）。
 - 验收：`TestInterconnectRoundTrip`（两端逐字核对四处：隧道地址、双方公钥配对、准入地址、通行范围，
   外加审计留痕）、`TestInterconnectRejectsBadInput`、`TestInterconnectImportRejectsConflicts`（7 个子用例）、
   `TestInterconnectSecondLinkGetsOwnTunnel`；以及**两个独立实例**的端到端：A 生成邀请 → B 导入 →
@@ -984,3 +1048,53 @@ git tag -a v0.7.0 -m "..." && git push origin v0.7.0   # 触发 Release
 
 - 上下线判定的 3 分钟阈值此前在收敛引擎与状态缓存里各写一遍，现统一为 `model.OnlineWindow`；
 - 通知地址一律脱敏展示与记日志（令牌常带在 URL 路径里），失败原因也不回显完整地址。
+
+---
+
+## 十一、1.0.11 —— 标准模式误判与巡检噪音修复
+
+> 缘起：真机反馈「重启后提示『正在使用兼容模式』，两个异地组网都断了，到设备列表里随便保存一下就恢复；而且那条提示点了『去处理』还是同一句话，一直没有消失」。排查后是**三件独立的事凑在一起**，逐条记下：
+
+### 1. 内核模块探测写死了目录层级（根因）
+
+- 原实现只看 `/sys/module/wireguard` 与 `/lib/modules/*/kernel/net/wireguard/wireguard.ko*`。
+- 该机器内核 `6.18.18.c1145-trim` 把模块放在 **`kernel/drivers/net/wireguard/`**，且重启后模块未加载，
+  于是 `kernelModuleAvailable()` 返回 false → 整机被选成用户态实现（能连、更慢），并且在界面长期报「兼容模式」。
+  真机核对：`modprobe wireguard` 成功、`find` 能列到那个 .ko —— 内核完全支持，是我们的探测漏了。
+- 影响不止「慢一点」：**数据面实现变了会触发删除重建全部网卡**（见 `ensureOne` 的 `InterfaceBackend` 分支），
+  重启后正好发生这一次切换，正在用的异地组网因此断掉；而单条连接失败不阻断其余连接，
+  失败只写进日志，界面上看不出任何异常 —— 用户只能靠「改一下保存试试」。
+- 现在：`moduledetect.go`（不带构建标签、可在开发机上用例穷举）负责判定 ——
+  **限定运行内核版本**（避免拿旧内核残留的 .ko 误判成「有内核加速」）+ **任意目录层级**
+  （已知布局快速命中，命中不了遍历兜底）+ 只认普通文件（同名目录 `wireguard.ko.d` 不算）。
+  用例：`TestModuleTreeHasWireguardLayouts`（含飞牛那种 `kernel/drivers/net/`）、
+  `TestModuleTreeHasWireguardRejectsOthers`、`TestWireguardModuleInDirsScopedToRunningKernel`、
+  `TestIsWireguardModuleFile`。快路径的 glob 把同名**目录**也算成模块，就是被 `RejectsOthers` 抓出来的。
+
+### 2. 「兼容模式」被当成待办，永远挂在待处理清单里
+
+- 它是警告级 → 计入 `issues` → 顶栏常年黄点「1 项待确认」；文案写着「无需手动操作」，
+  却和「功能确实没在工作」的异常混在一个清单里；它的 `to=maintenance`，点「去处理」跳回本页看到同样的话
+  （`Maintenance.vue` 恰好不为 `to=maintenance` 的项显示按钮），形成死循环。
+- 现在：降为 **状态类结论（ok）**，标题「工作模式：兼容模式（用户态实现）」，不再计入异常；
+  `Fix` 改成**真能执行**的一条路径（确认 `modprobe wireguard` 可用 → 停用再启用即切回，并写明会短暂中断）。
+  用例：`TestJudgeInspectProblems` 的该条改为 `InspectOK`，并新增「状态类结论不得染色」的断言。
+
+### 3. 下发失败只躺在日志里
+
+- 「配置看起来改好了、其实没写进内核」是本次现象的核心：重启后那一轮收敛有连接没成功，
+  界面一切正常，只有日志知道。措施：巡检新增 **`apply`（最近一次配置下发）** 结论项 ——
+  成功报一句「已成功下发」，失败报出具体错误并给「运行记录」入口（`Health.Error` 已由引擎维护，
+  成功一轮即自动清空，所以它天然表示「当前仍未下发成功」）。
+  用例：`TestJudgeInspectProblems` 新增「最近一次配置下发失败」。
+
+### 4. 策略路由只信状态文件，不核对内核（同类隐患，一并修）
+
+- `applyPolicyRoutesLocked` 此前「状态里有记录就整轮跳过」。ip rule 与专用表里的路由都是**内核状态**：
+  重启、系统网络服务重启、其它工具清理都会让它们消失，而记录还在 → 永远补不回来 →
+  异地组网静默失效。nft 的转发规则早就按内核现状核对（`rulesPresent`），策略路由这一路漏了。
+- 现在：`PolicyRouteNeeded(recorded, live, checked)` 三态判定（核对不可信时退回「按记录判断」，
+  不无脑重加）+ `policyRouteLive` 用 `RuleList`/`RouteListFiltered` 核对 ip rule 与表内路由；
+  记录在而内核里没有时**补下发并写一条明确的日志**（「此前会一直缺着，组网因此不通」）。
+  核对用的网段一律归一化（配置里可能写 `192.168.2.5/24`，内核回读 `192.168.2.0/24`）。
+  用例：`TestPolicyRouteNeeded`（六种组合）、`TestPolicyRulePresent`、`TestPolicyRoutePresent`、`TestNormalizedCIDR`。

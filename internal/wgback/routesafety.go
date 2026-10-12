@@ -49,6 +49,11 @@ type RoutePlanInput struct {
 type RouteSkip struct {
 	CIDR   string
 	Reason string
+	// Conflict 是与本网段冲突的既有网段（仅在「重叠」时给出）。
+	//
+	// 单独成字段而不是塞进文案：调用方要拿着它去查这个网段来自哪张网卡/哪条路由，
+	// 再把来源补进提示里（只说「与现有网段重叠」等于让用户自己去满机找）。
+	Conflict string
 }
 
 // RoutePlan 是路由决策结果。
@@ -96,7 +101,7 @@ func PlanRoutes(in RoutePlanInput) RoutePlan {
 		return plan
 	}
 
-	hostNets := parseCIDRs(in.HostNetworks)
+	hostNets := nonDefaultCIDRs(in.HostNetworks)
 
 	// 主机上已存在的目标（含默认路由），绝不覆盖
 	existing := map[string]bool{}
@@ -135,8 +140,12 @@ func PlanRoutes(in RoutePlanInput) RoutePlan {
 			continue
 		}
 		// 红线 3：与主机其他网段重叠会抢走局域网/系统服务可达性
-		if overlapsAny(ipnet, hostNets) {
-			plan.Skip = append(plan.Skip, RouteSkip{CIDR: cidr, Reason: "与 NAS 现有网段重叠，为避免影响系统网络已跳过"})
+		if hit := firstOverlap(ipnet, hostNets); hit != "" {
+			plan.Skip = append(plan.Skip, RouteSkip{
+				CIDR:     cidr,
+				Conflict: hit,
+				Reason:   "与 NAS 现有网段 " + hit + " 重叠，为避免影响系统网络已跳过",
+			})
 			continue
 		}
 		// 红线 4：主机已有同目标路由，绝不覆盖
@@ -164,6 +173,38 @@ func parseCIDRs(list []string) []*net.IPNet {
 		out = append(out, ipnet)
 	}
 	return out
+}
+
+// nonDefaultCIDRs 解析网段列表，并丢掉默认路由写法（前缀长度为 0）。
+//
+// 为什么必须丢：主机的默认路由在部分内核/调用方那里会以 **0.0.0.0/0** 的形态出现
+// （而不是空目标）。而 0.0.0.0/0 包含**任何**目标网段，于是红线 3 会把每一条对端
+// 路由都判成「与现有网段重叠」而全部跳过 —— 现象是「隧道通了、却访问不了对端内网」，
+// 与本机是否真有冲突毫无关系，日志里那句「与 NAS 现有网段重叠」还会把人引到错误方向
+// （真机踩到过：机器上根本没有那个网段）。
+func nonDefaultCIDRs(list []string) []*net.IPNet {
+	out := []*net.IPNet{}
+	for _, n := range parseCIDRs(list) {
+		if ones, _ := n.Mask.Size(); ones == 0 {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// firstOverlap 返回 list 中第一个与 target 存在包含关系的网段（没有则返回空串）。
+// 返回网段本身而不是布尔值：提示里要点名「和谁冲突」，只说「重叠」没法处理。
+func firstOverlap(target *net.IPNet, list []*net.IPNet) string {
+	for _, n := range list {
+		if (n.IP.To4() == nil) != (target.IP.To4() == nil) {
+			continue
+		}
+		if n.Contains(target.IP) || target.Contains(n.IP) {
+			return maskedCIDR(n)
+		}
+	}
+	return ""
 }
 
 // overlapsAny 判断目标网段是否与给定网段存在包含关系（双向）。

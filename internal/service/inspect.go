@@ -284,7 +284,7 @@ func (s *Service) inspectFacts(ctx context.Context) inspectFacts {
 // 这份清单的价值全在「每一条都对」，而它最容易出的错是「该报的没报」
 // （用户以为巡检过了就等于没问题），所以每一条都有对应用例。
 //
-// 顺序即重要性：后台服务 → 运行模式 → 系统网络 → 桌面入口 → 连接 →
+// 顺序即重要性：后台服务 → 运行模式 → 下发结果 → 系统网络 → 桌面入口 → 连接 →
 // 内网访问 → 隔离 → 访问控制冲突 → 残留网卡 → 对外地址 → 通知 → 解析 → 备份。
 func judgeInspect(f inspectFacts) []InspectItem {
 	out := []InspectItem{}
@@ -330,12 +330,18 @@ func judgeInspect(f inspectFacts) []InspectItem {
 			Detail: "系统内核支持加密网络模块，连接由内核直接处理。",
 		})
 	case f.Health.TunDevice:
+		// 兼容模式能顶上，功能是正常的，因此这是一条**状态**而不是待办。
+		//
+		// 它曾经是警告级，结果在真机上长期挂在「待处理事项」里：这一条永远成立、
+		// 用户没有任何可做的操作，顶栏因此一直是黄的，点「去处理」还会跳回本页看到同样的话
+		// （同一条提示里写着「无需手动操作」，却待在待办清单里——自相矛盾）。
+		// 现在按状态报，并给一条**真的能执行**的路径（确认模块可用后停用再启用即可切回）。
 		out = append(out, InspectItem{
-			Key: "compat", Level: InspectWarning,
-			Title:  "正在使用兼容模式",
-			Detail: "系统没有可用的内核加密网络模块，已自动改用兼容模式，连接可以正常工作，速度和资源占用略逊于标准模式。",
-			Fix:    "无需手动操作；若 NAS 系统升级后支持了内核模块，会自动切回标准模式。",
-			To:     "maintenance",
+			Key: "compat", Level: InspectOK,
+			Title:  "工作模式：兼容模式（用户态实现）",
+			Detail: "系统没有可用的内核加密网络模块，已自动改用用户态实现：连接照常工作，速度与资源占用略逊于标准模式。",
+			Fix: "一般无需处理。若系统的内核模块其实可用（执行 sudo modprobe wireguard 能成功），" +
+				"到应用中心把本应用停用再启用即可切回标准模式；切换会重建连接，会有一次短暂中断。",
 		})
 	default:
 		out = append(out, InspectItem{
@@ -347,6 +353,30 @@ func judgeInspect(f inspectFacts) []InspectItem {
 			Fix: "这属于系统内核能力问题：请先把 NAS 系统更新到较新版本再试。若更新后仍不支持，请把系统版本与内核版本（uname -r）反馈给我们以便适配。",
 			To:  "logs",
 		})
+	}
+
+	// ②' 最近一次下发结果：这是「配置看起来改好了、其实没写进内核」的唯一信号。
+	//
+	// 早先它只躺在运行记录里：真机上出现过「重启后异地组网断了、界面一切正常、
+	// 到设备列表里随便保存一下就恢复」，用户完全无从判断为什么——原因就是那一轮收敛
+	// 有连接没下发成功（单条失败不阻断其余连接，见 wgback.Apply），而界面不显示。
+	// 演示模式不参与：它不碰内核，报「下发成功」没有意义。
+	if f.Health.AgentUp && !demo {
+		if f.Health.Error != "" {
+			out = append(out, InspectItem{
+				Key: "apply", Level: InspectError,
+				Title:  "配置下发失败，部分连接可能没在工作",
+				Detail: "把配置写入系统时出错：" + f.Health.Error,
+				Fix:    "本应用每 10 秒会自动重试；若持续失败，请到「运行记录」查看详情并把该条信息反馈给我们。",
+				To:     "logs",
+			})
+		} else {
+			out = append(out, InspectItem{
+				Key: "apply", Level: InspectOK,
+				Title:  "最近一次配置下发成功",
+				Detail: "当前连接与规则都已写入系统；此后的改动若失败会在这里报出。",
+			})
+		}
 	}
 
 	// ③ 网络自检读不到：说清原因，并跳过所有依赖它的小节。

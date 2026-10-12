@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
@@ -127,19 +126,25 @@ func (d *kernelDriver) List() ([]*wgtypes.Device, error) {
 //
 // 只看只读信息，不做任何探测性写操作：
 //   - /sys/module/wireguard 存在：已经加载（含编进内核的情况）；
-//   - 模块文件存在：尚未加载但可以按需加载 —— 创建网卡时内核会自行
+//   - **运行内核**对应的模块文件存在：尚未加载但可以按需加载 —— 创建网卡时内核会自行
 //     request_module("rtnl-link-wireguard")，所以这也算「可用」。
+//
+// 两条约束都是真机换来的：
+//
+//  1. **不能写死目录层级**。发行版把 wireguard.ko 放得到处都是：`kernel/net/wireguard/`、
+//     `kernel/drivers/net/wireguard/`（飞牛 6.18 内核就是这一处）、DKMS 的 `updates/dkms/`、
+//     厂商自带目录… 早先只找第一种，于是同一台机器被判定为「无内核模块」——整机降级到用户态
+//     实现（能连、更慢），界面上长期挂着一条「正在使用兼容模式」，更糟的是每次重启都会因
+//     「数据面实现变了」而删除重建全部网卡，正在用的异地组网因此断掉。
+//  2. **必须限定运行内核版本**。把旧内核残留的模块文件当成「可用」，会让内核驱动在创建网卡
+//     那一步才失败（运行期回退到用户态），而界面仍显示「标准模式可用」——更难查。
+//
+// 判定逻辑本身在 moduledetect.go（不带构建标签，可在任何平台上被用例穷举）。
 func kernelModuleAvailable() bool {
 	if _, err := os.Stat("/sys/module/wireguard"); err == nil {
 		return true
 	}
-	for _, dir := range []string{"/lib/modules", "/usr/lib/modules"} {
-		matches, _ := filepath.Glob(filepath.Join(dir, "*", "kernel/net/wireguard/wireguard.ko*"))
-		if len(matches) > 0 {
-			return true
-		}
-	}
-	return false
+	return wireguardModuleInDirs([]string{"/lib/modules", "/usr/lib/modules"}, runningKernelRelease())
 }
 
 // isUnsupportedErrno 判断错误是否表示「本内核根本不支持这类网卡」。

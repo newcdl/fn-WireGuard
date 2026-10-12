@@ -123,6 +123,131 @@ func TestPeerConfigStaleLifecycle(t *testing.T) {
 	}
 }
 
+// TestDeviceScopeIncludesSiteLAN 站点互联后，新生成的设备配置必须把**对端内网**也并入通行范围。
+//
+// 不并入的话，设备根本不会把发往对端内网的包送进隧道 —— 现象是「电脑连上了、
+// 能访问本机内网，却访问不了另一台 NAS 后面的机器」，而且不报错、无从自查。
+// 同时要确认没有把站点连接的隧道网段一并写进去（那是 NAS 之间的链路，不该进设备路由）。
+func TestDeviceScopeIncludesSiteLAN(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
+
+	// 家里网段显式指定：否则用例结果会随开发机真实的局域网变化。
+	if err := svc.SetSettings(ctx, map[string]string{"home_lan_cidrs": "192.168.1.0/24"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	// 设备所在连接
+	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.20.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
+	}, actor); err != nil {
+		t.Fatal(err)
+	}
+	// 站点互联：会自动新建一条连接（隧道网段自动分配），并把对端内网写进准入地址。
+	if _, err := svc.CreateInterconnect(ctx, service.InterconnectInput{
+		PeerName:        "nas-b",
+		PeerLANSubnets:  []string{"192.168.2.0/24"},
+		LocalLANSubnets: []string{"192.168.1.0/24"},
+	}, actor); err != nil {
+		t.Fatal(err)
+	}
+
+	ifaces, err := svc.Store.ListInterfaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devIface int64
+	for _, it := range ifaces {
+		if it.Name == "wg0" {
+			devIface = it.ID
+		}
+	}
+	if devIface == 0 {
+		t.Fatal("设备所在连接 wg0 应当存在")
+	}
+	p, err := svc.CreatePeer(ctx, service.PeerInput{
+		InterfaceID: devIface, Name: "我的电脑", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.PeerConfig(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	has := func(cidr string) bool {
+		for _, a := range cfg.AllowedIPs {
+			if a == cidr {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("192.168.1.0/24") {
+		t.Fatalf("设备通行范围应包含本机内网，实际: %v", cfg.AllowedIPs)
+	}
+	if !has("192.168.2.0/24") {
+		t.Fatalf("设备通行范围应包含站点对端内网，实际: %v", cfg.AllowedIPs)
+	}
+	for _, a := range cfg.AllowedIPs {
+		if a == "10.10.0.0/24" || a == "10.20.0.0/24" {
+			t.Fatalf("隧道网段不应进设备通行范围（那是 NAS 之间的链路），实际: %v", cfg.AllowedIPs)
+		}
+	}
+}
+
+// TestDeviceOnSiteLinkScopeIncludesBothLANs 覆盖最常见的拓扑：只有一条连接，
+// 它既是站点互联链路、又挂着你要用的设备（电脑就挂在这条连接下）。
+//
+// 此时设备的通行范围必须同时含本机内网与对端内网；数据面的源地址改写规则
+// 也必须照样下发（见 wgback.TestPlanSiteMasqCoversDeviceOnSiteLink）。
+func TestDeviceOnSiteLinkScopeIncludesBothLANs(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
+
+	if err := svc.SetSettings(ctx, map[string]string{"home_lan_cidrs": "192.168.2.0/24"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	// 直接互联：本机上没有任何连接时，向导会建出唯一的那条连接（wg0）。
+	created, err := svc.CreateInterconnect(ctx, service.InterconnectInput{
+		PeerName:        "nas2",
+		PeerLANSubnets:  []string{"192.168.3.0/24"},
+		LocalLANSubnets: []string{"192.168.2.0/24"},
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 设备就挂在这条互联连接下
+	p, err := svc.CreatePeer(ctx, service.PeerInput{
+		InterfaceID: created.InterfaceID, Name: "我的电脑", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := svc.PeerConfig(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	has := func(cidr string) bool {
+		for _, a := range cfg.AllowedIPs {
+			if a == cidr {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("192.168.2.0/24") || !has("192.168.3.0/24") {
+		t.Fatalf("设备通行范围应同时含本机内网与对端内网，实际: %v", cfg.AllowedIPs)
+	}
+	// 设备的隧道地址必须避开站点链路占用的地址，否则会与对端 NAS 撞车。
+	for _, a := range cfg.ClientAddress {
+		if strings.HasPrefix(a, "10.10.0.2/") {
+			t.Fatalf("设备地址占用了对端 NAS 的隧道地址: %v", cfg.ClientAddress)
+		}
+	}
+}
+
 func TestPeerScopeConflictRejected(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()

@@ -49,6 +49,11 @@
           <template #default="{ row }">
             <span :class="['fnwg-dot', handshakeLevel(row.last_handshake)]"></span>
             <strong>{{ row.name }}</strong>
+            <!-- 站点条目代表的是「另一台 NAS」，不是一台接入设备：标出来才不会有人
+                 拿它的配置去自己的电脑上用（那会让电脑冒充对端 NAS，两边互相抢连接） -->
+            <el-tag v-if="row.site_link" size="small" type="primary" effect="plain" style="margin-left: 6px">
+              对端 NAS
+            </el-tag>
             <el-tag v-if="!row.enabled" size="small" type="info" effect="plain" style="margin-left: 6px">已停用</el-tag>
           </template>
         </el-table-column>
@@ -123,9 +128,10 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="showConfig(row)">扫码连接</el-button>
+            <el-button v-if="row.site_link" link type="primary" @click="openInvite(row)">邀请</el-button>
             <el-button v-if="session.can('peer.write')" link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button v-if="session.can('peer.write')" link type="danger" @click="remove(row)">删除</el-button>
           </template>
@@ -153,6 +159,7 @@
         @toggle="toggleSelect(row.id)"
       >
         <template #extra>
+          <el-tag v-if="row.site_link" size="small" type="primary" effect="plain">对端 NAS</el-tag>
           <el-tag size="small" :type="stateTagType(row)" effect="plain">{{ stateLabel(row) }}</el-tag>
           <el-tag v-if="!row.enabled" size="small" type="info" effect="plain">已停用</el-tag>
           <el-tag v-if="row.config_stale" size="small" type="warning" effect="plain">需重新扫码</el-tag>
@@ -181,6 +188,7 @@
 
         <template #actions>
           <el-button size="small" type="primary" @click="showConfig(row)">扫码连接</el-button>
+          <el-button v-if="row.site_link" size="small" @click="openInvite(row)">邀请</el-button>
           <el-button v-if="session.can('peer.write')" size="small" @click="openEdit(row)">编辑</el-button>
           <el-button v-if="session.can('peer.write')" size="small" @click="remove(row)">删除</el-button>
         </template>
@@ -546,6 +554,14 @@
       </template>
     </el-dialog>
 
+    <!-- 互联邀请：这条路只给「对端 NAS」条目用 —— 查看当初那份邀请（含私钥与口令） -->
+    <InterconnectDialog
+      v-model="interconnectVisible"
+      initial-tab="existing"
+      :focus-peer-id="invitePeerId"
+      @done="load"
+    />
+
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
@@ -566,6 +582,7 @@ import type {
   WgPeer,
 } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import InterconnectDialog from '@/components/InterconnectDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
@@ -614,6 +631,9 @@ const keyword = ref('')
 const drawerVisible = ref(false)
 const cfgVisible = ref(false)
 const helpVisible = ref(false)
+// 互联邀请（只对「对端 NAS」条目开放）：打开对话框的「已生成的邀请」页签并定位到该条目
+const interconnectVisible = ref(false)
+const invitePeerId = ref<number | undefined>(undefined)
 const cfg = ref<PeerConfigResult | null>(null)
 const qrDataUrl = ref('')
 const scenario = ref('split')
@@ -800,6 +820,12 @@ function openCreate() {
 /** 关闭抽屉时复位向导步骤，下次打开从第一步开始 */
 function onDrawerClosed() {
   createStep.value = 0
+}
+
+/** 查看「对端 NAS」条目对应的互联邀请（按当前设置重新生成，含私钥与口令）。 */
+function openInvite(row: WgPeer) {
+  invitePeerId.value = row.id
+  interconnectVisible.value = true
 }
 
 function openEdit(row: WgPeer) {

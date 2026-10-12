@@ -36,8 +36,10 @@ func (s *Service) ListInterfaces(ctx context.Context) ([]model.Interface, error)
 		return nil, err
 	}
 	s.Cache.EnrichInterfaces(list)
+	s.markSiteInterfaces(ctx, list)
 	for i := range list {
 		list[i].PrivateKey = ""
+		list[i].PortNote = s.portNoteFor(ctx, list[i])
 	}
 	return list, nil
 }
@@ -50,8 +52,53 @@ func (s *Service) GetInterface(ctx context.Context, id int64) (*model.Interface,
 	}
 	list := []model.Interface{*it}
 	s.Cache.EnrichInterfaces(list)
+	s.markSiteInterfaces(ctx, list)
 	it.PrivateKey = ""
+	it.PortNote = s.portNoteFor(ctx, *it)
 	return it, nil
+}
+
+// portNoteFor 推导「对外访问地址的端口 ≠ 本连接监听端口」的提示（派生，不落库）。
+//
+// 放在列表与详情两条读路径上：这条提示必须在**平时**就能看见，
+// 否则用户只有在「对端连不上本机」时才会去猜端口。
+func (s *Service) portNoteFor(ctx context.Context, it model.Interface) string {
+	endpoint, _ := s.serverEndpoint(ctx, &it)
+	return portNoteIfMismatch(&it, endpoint)
+}
+
+// markSiteInterfaces 填「这条连接是异地组网还是普通连接」的派生标记（不落库）。
+//
+// 判定沿用备注前缀（isSitePeer），与拓扑图、互联向导共用一套口径 ——
+// 换个判据就会出现「拓扑说是站点、列表说是普通」这种自相矛盾。
+func (s *Service) markSiteInterfaces(ctx context.Context, list []model.Interface) {
+	if len(list) == 0 {
+		return
+	}
+	peers, err := s.Store.ListPeers(ctx, 0)
+	if err != nil {
+		return // 读不到就不标：宁可少个标签，也不要靠猜打标
+	}
+	site := map[int64]bool{}
+	for i := range peers {
+		if isSitePeer(&peers[i]) {
+			site[peers[i].InterfaceID] = true
+		}
+	}
+	for i := range list {
+		if site[list[i].ID] {
+			list[i].Kind = model.IfaceKindSite
+		}
+	}
+}
+
+// markSitePeers 填「这条条目是另一台 NAS」的派生标记（不落库）。
+func markSitePeers(peers []model.Peer) {
+	for i := range peers {
+		if isSitePeer(&peers[i]) {
+			peers[i].SiteLink = true
+		}
+	}
 }
 
 // CreateInterfaceInput 是创建接口的入参。

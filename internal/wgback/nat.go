@@ -57,6 +57,13 @@ var natMarker = []byte("fnwg-nat")
 // 只用「是不是丢弃」区分不出来 —— 按标记数才能确认它们各自都还在。
 var natMarkerACL = []byte("fnwg-acl")
 
+// natMarkerSite 是「站点间源地址改写」规则的标记。
+//
+// 与 natMarker 分开：这类规则同样写在源地址改写链上，但语义不同（改写目标是站点连接、
+// 而不是出口网卡）。混用同一个标记时，「出口网卡改写规则是否存在」的判定会把它们算进去，
+// 于是规则其实丢了却报「正常」。
+var natMarkerSite = []byte("fnwg-snat")
+
 func nftConn() (*nftables.Conn, error) {
 	c, err := nftables.New()
 	if err != nil {
@@ -150,6 +157,9 @@ func (b *linuxBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpti
 		if plan.Isolate {
 			diff.Append("（预演）将启用设备间隔离：%s", DescribeIsolation(plan))
 		}
+		if msg := DescribeSiteMasq(plan); msg != "" {
+			diff.Append("（预演）%s", msg)
+		}
 		return
 	}
 
@@ -173,7 +183,8 @@ func (b *linuxBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpti
 	//
 	// 只在真的要做内网转发时才开：设备间隔离不需要转发开关，
 	// 不应该因为一个隔离开关就去改内核的全局设置。
-	if plan.Enable {
+	// 站点间源地址改写同样走转发路径，因此也要求转发开关。
+	if plan.Enable || len(plan.SiteMasq) > 0 {
 		turned, err := b.ensureIPForward()
 		if err != nil {
 			diff.Append("启用内网访问失败：%v", err)
@@ -196,6 +207,7 @@ func (b *linuxBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpti
 
 	if plan.Empty() {
 		b.state.SetNAT("", nil, nil)
+		b.state.SetNATSite(nil, nil)
 		_ = b.state.Save()
 		if removed {
 			diff.Append("已关闭内网访问与设备间隔离，相关规则已移除")
@@ -214,12 +226,16 @@ func (b *linuxBackend) syncNATLocked(specs []model.InterfaceSpec, opts ApplyOpti
 		return
 	}
 	b.state.SetNAT(fingerprint, plan.Sources, plan.WANs)
+	b.state.SetNATSite(SiteMasqDevs(plan), SiteMasqSubnets(plan))
 	_ = b.state.Save()
 	if plan.Enable {
 		diff.Append("已启用内网访问：%s", DescribeNAT(plan))
 	}
 	if plan.Isolate {
 		diff.Append("%s", DescribeIsolation(plan))
+	}
+	if msg := DescribeSiteMasq(plan); msg != "" {
+		diff.Append("%s", msg)
 	}
 }
 
@@ -233,6 +249,7 @@ func (b *linuxBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool
 	siteSources := []string{}
 	isoSources := []string{}
 	tunnels := []string{}
+	siteNAT := []SiteNATInput{}
 	anyLAN := false
 	anyIsolate := false
 	for _, s := range specs {
@@ -246,14 +263,20 @@ func (b *linuxBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool
 			anyIsolate = true
 			isoSources = append(isoSources, subnets...)
 		}
+		// 对端站点网段（站点到站点互联）：对端局域网里的主机把包送进来时，
+		// 源地址是**对端局域网网段**，落在本连接隧道网段之外。
+		// 少了这一项，现象就是「隧道通、对端 NAS 自己能访问本机内网，
+		// 但对端局域网里的机器访问不了」—— 最容易漏的一环。
+		remote := peerSiteSubnets(s, subnets)
 		if s.AllowLAN {
 			anyLAN = true
 			sources = append(sources, subnets...)
-			// 对端站点网段（站点到站点互联）：对端局域网里的主机把包送进来时，
-			// 源地址是**对端局域网网段**，落在本连接隧道网段之外。
-			// 少了这一项，现象就是「隧道通、对端 NAS 自己能访问本机内网，
-			// 但对端局域网里的机器访问不了」—— 最容易漏的一环。
-			siteSources = append(siteSources, peerSiteSubnets(s, subnets)...)
+			siteSources = append(siteSources, remote...)
+		}
+		// 需要主动把流量送进对端内网的连接（站点互联/异地组网，路由方式为 client）：
+		// 为本机设备发往对端内网的流量做源地址改写，否则对端会因源地址不在准入地址里而丢弃。
+		if s.RouteTable == model.RouteTableClient && len(remote) > 0 {
+			siteNAT = append(siteNAT, SiteNATInput{Dev: s.Name, Remote: remote})
 		}
 	}
 
@@ -266,6 +289,7 @@ func (b *linuxBackend) planNATLocked(specs []model.InterfaceSpec) (NATPlan, bool
 		IsolateRequested: anyIsolate,
 		IsolateSubnets:   isoSources,
 		TunnelSubnets:    tunnels,
+		SiteNAT:          siteNAT,
 	}
 	// 出口网卡与主机网段只在真的要做内网访问时才去探测：
 	// 它们都要读内核路由表，没必要每 10 秒为一个没打开的开关付这份代价。
@@ -530,6 +554,10 @@ func (b *linuxBackend) ensureNATTableLocked(plan NATPlan) error {
 	// 拒绝规则永远轮不到生效 —— 用户看到的就是「限制了却还能访问」。
 	aclApplied := addPeerTargetRules(c, tbl, fwd, plan)
 
+	// 站点间源地址改写：设备 → 对端内网的流量在本机是「隧道进、隧道出」，
+	// 改写成站点连接自己的地址后，对端只需要认识「对面 NAS」即可。
+	siteApplied := addSiteMasqRules(c, tbl, post, plan)
+
 	applied := 0
 	for _, src := range plan.Sources {
 		n, err := parseIPNet(src)
@@ -571,7 +599,7 @@ func (b *linuxBackend) ensureNATTableLocked(plan NATPlan) error {
 			})
 		}
 	}
-	if applied == 0 && isoApplied == 0 && aclApplied == 0 {
+	if applied == 0 && isoApplied == 0 && aclApplied == 0 && siteApplied == 0 {
 		c.DelTable(tbl)
 		_ = c.Flush()
 		return fmt.Errorf("没有可用的 IPv4 隧道网段")
@@ -580,11 +608,49 @@ func (b *linuxBackend) ensureNATTableLocked(plan NATPlan) error {
 		return fmt.Errorf("下发转发规则失败: %w", err)
 	}
 	if !plan.Enable {
-		// 只下发了隔离规则：系统转发链的兜底放行是为「设备访问内网」准备的，
+		// 只下发了隔离规则（或站点间改写）：系统转发链的兜底放行是为「设备访问内网」准备的，
 		// 这里既不需要，往里插放行规则还会削弱隔离的语义。
 		return nil
 	}
 	return b.ensureSystemForwardLocked(c, plan)
+}
+
+// addSiteMasqRules 写入「站点间源地址改写」规则，返回实际写入的条数。
+//
+// 每条规则形如：
+//
+//	ip saddr <本机隧道网段> ip daddr <对端内网网段> oifname "<站点连接>" masquerade
+//
+// 三处匹配都写死在规则里（源、目标、出口），因此它只会命中「本机设备 → 对端内网」
+// 这一种流量：局域网主机的源地址不在本机隧道网段里，NAS 自身流量的目标通常不是对端内网，
+// 都不会被改写。出口限定为站点连接本身，也不会把流量塞回其它隧道。
+func addSiteMasqRules(c *nftables.Conn, tbl *nftables.Table, chain *nftables.Chain, plan NATPlan) int {
+	n := 0
+	for _, r := range plan.SiteMasq {
+		src, err := parseIPNet(r.Src)
+		if err != nil {
+			continue
+		}
+		dst, err := parseIPNet(r.Dst)
+		if err != nil {
+			continue
+		}
+		sp, dp := matchSrcIPv4(src), matchDstIPv4(dst)
+		if len(sp) == 0 || len(dp) == 0 {
+			continue // IPv6 等无法表达的写法：整条跳过，不写半条规则
+		}
+		ex := append(append([]expr.Any{}, sp...), dp...)
+		ex = append(ex, matchOifName(r.Dev)...)
+		ex = append(ex, &expr.Masq{})
+		c.AddRule(&nftables.Rule{
+			Table:    tbl,
+			Chain:    chain,
+			Exprs:    ex,
+			UserData: natMarkerSite,
+		})
+		n++
+	}
+	return n
 }
 
 // addIsolationRules 写入设备间隔离规则，返回实际写入的条数。
@@ -936,6 +1002,8 @@ func (b *linuxBackend) natStatusLocked() model.NATStatus {
 		IPForward:            ipForwardEnabled(),
 		IPForwardEnabledByUs: b.state.IPForwardByUs(),
 		IsolateNets:          b.state.IsolateNets(),
+		SiteNATDevs:          b.state.NATSiteDevs(),
+		SiteNATSubnets:       b.state.NATSiteSubnets(),
 	}
 	if st.Sources == nil {
 		st.Sources = []string{}
@@ -945,6 +1013,12 @@ func (b *linuxBackend) natStatusLocked() model.NATStatus {
 	}
 	if st.IsolateNets == nil {
 		st.IsolateNets = []string{}
+	}
+	if st.SiteNATDevs == nil {
+		st.SiteNATDevs = []string{}
+	}
+	if st.SiteNATSubnets == nil {
+		st.SiteNATSubnets = []string{}
 	}
 
 	notes := []string{}
@@ -972,6 +1046,16 @@ func (b *linuxBackend) natStatusLocked() model.NATStatus {
 		default:
 			st.IsolateActive = true
 			st.IsolateRules = rules
+		}
+	}
+	// 站点间源地址改写：与上面两类同样核对内核里是否真的还在。
+	if len(st.SiteNATDevs) > 0 {
+		rules, err := b.siteMasqRuleCount()
+		switch {
+		case err != nil:
+			notes = append(notes, "无法读取站点间改写规则状态："+err.Error())
+		case rules == 0:
+			notes = append(notes, "站点间流量改写规则不存在（可能被其它工具清理过），修改任意连接或重新打开开关即可恢复")
 		}
 	}
 	st.Note = strings.Join(notes, "；")
@@ -1002,7 +1086,41 @@ func (b *linuxBackend) rulesPresent(plan NATPlan) bool {
 			return false
 		}
 	}
+	// 站点间源地址改写同样写在 postrouting 链上，但带自己的标记：
+	// 与出口网卡改写规则共用标记的话，两者会互相冒充，判定就不准了。
+	if len(plan.SiteMasq) > 0 {
+		if n, err := b.siteMasqRuleCount(); err != nil || n == 0 {
+			return false
+		}
+	}
 	return true
+}
+
+// siteMasqRuleCount 返回源地址改写链上带「站点间改写」标记的规则条数。
+func (b *linuxBackend) siteMasqRuleCount() (int, error) {
+	c, err := nftConn()
+	if err != nil {
+		return 0, err
+	}
+	t, err := findNATTable(c)
+	if err != nil || t == nil {
+		return 0, err
+	}
+	ch, err := c.ListChain(t, natPostChain)
+	if err != nil || ch == nil {
+		return 0, err
+	}
+	rules, err := c.GetRules(t, ch)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range rules {
+		if bytes.Equal(r.UserData, natMarkerSite) {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // aclRuleCount 返回转发链里带 acl 标记的规则条数（按设备的内网访问规则）。
@@ -1063,7 +1181,10 @@ func (b *linuxBackend) isoRuleCount() (int, error) {
 	return n, nil
 }
 
-// natRuleCount 返回专用表里源地址改写链上的规则条数，用于确认规则确实落到内核里了。
+// natRuleCount 返回专用表里「出口网卡源地址改写」规则的条数，用于确认规则确实落到内核里了。
+//
+// 按标记数而不是按链上总条数：站点间改写同样写在 postrouting 链上，
+// 用总条数判断的话，出口改写规则其实丢了也会因为站点规则还在而报「正常」。
 func (b *linuxBackend) natRuleCount() (int, error) {
 	c, err := nftConn()
 	if err != nil {
@@ -1081,7 +1202,13 @@ func (b *linuxBackend) natRuleCount() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return len(rules), nil
+	n := 0
+	for _, r := range rules {
+		if bytes.Equal(r.UserData, natMarker) {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // natChecksLocked 生成内网访问链路与设备间隔离的自检清单。
@@ -1210,6 +1337,32 @@ func (b *linuxBackend) natChecksLocked(st model.NATStatus) []model.NATCheck {
 				Key: "isolate", Label: "设备间隔离", OK: true,
 				Detail: fmt.Sprintf("已隔离 %s：这些连接里的设备之间不能互访，但仍可访问 NAS 与内网（共 %d 条阻断规则）",
 					strings.Join(st.IsolateNets, "、"), st.IsolateRules),
+			})
+		}
+	}
+
+	// ⑥ 站点间改写：只在真的做了改写时展示。设备连上来之后能访问另一台 NAS 的内网，
+	//    靠的就是这一步；它生效了却不说明的话，用户不知道「为什么能通」，出问题时也无从下手。
+	if len(st.SiteNATDevs) > 0 {
+		rules, err := b.siteMasqRuleCount()
+		switch {
+		case err != nil:
+			checks = append(checks, model.NATCheck{
+				Key: "site_nat", Label: "站点间改写", OK: false,
+				Detail: "无法读取站点间改写规则状态：" + err.Error(),
+				Fix:    "本应用每 10 秒会自动重试，也可点「立即应用」重建规则",
+			})
+		case rules == 0:
+			checks = append(checks, model.NATCheck{
+				Key: "site_nat", Label: "站点间改写", OK: false,
+				Detail: "规则内容与期望一致但内核里查不到（可能被其它工具清理过）",
+				Fix:    "点「立即应用」重建规则；若反复出现请反馈此问题",
+			})
+		default:
+			checks = append(checks, model.NATCheck{
+				Key: "site_nat", Label: "站点间改写", OK: true,
+				Detail: fmt.Sprintf("已为经 %s 访问对端内网 %s 的流量改写源地址：连上隧道的设备可直接访问对端内网",
+					strings.Join(st.SiteNATDevs, "、"), strings.Join(st.SiteNATSubnets, "、")),
 			})
 		}
 	}

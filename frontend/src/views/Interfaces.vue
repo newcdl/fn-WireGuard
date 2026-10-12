@@ -28,6 +28,13 @@
             <strong>{{ row.name }}</strong>
           </template>
         </el-table-column>
+        <el-table-column label="用途" width="96">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.kind === 'site' ? 'primary' : 'info'" effect="plain">
+              {{ row.kind === 'site' ? '异地组网' : '设备接入' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="工作状态" width="110">
           <template #default="{ row }">
             <el-tag size="small" :type="row.up ? 'success' : 'danger'" effect="plain">
@@ -119,6 +126,9 @@
         :title="row.name"
       >
         <template #extra>
+          <el-tag size="small" :type="row.kind === 'site' ? 'primary' : 'info'" effect="plain">
+            {{ row.kind === 'site' ? '异地组网' : '设备接入' }}
+          </el-tag>
           <el-tag size="small" :type="row.up ? 'success' : 'danger'" effect="plain">
             {{ row.up ? '正常' : '未工作' }}
           </el-tag>
@@ -449,6 +459,9 @@ function rowIssue(row: WgInterface): string {
     return '设备间隔离已开启但未生效，设备之间仍可互访；到「系统维护」查看卡在哪一层。'
   if (accessIssueIds.value.has(row.id))
     return '这条连接上的设备范围与开关互相矛盾（例如范围含家里网段但内网访问没开），到「系统维护」查看具体结论。'
+  // 端口映射类问题放在最后：它平时不影响使用，只在「外面连不回来」时才致命。
+  // 但恰恰因为平时看不出，才必须在列表里常驻提示（真机踩过：外部端口与本机监听端口对不上）。
+  if (row.port_note) return row.port_note
   return ''
 }
 

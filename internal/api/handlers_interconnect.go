@@ -15,6 +15,10 @@ import (
 // 由后端去解析与校验，报错信息也就能直接照原样显示（哪一项不对、为什么不对）。
 type interconnectImportRequest struct {
 	Text string `json:"text"`
+	// ListenPort 是本机这条连接要监听的 UDP 端口，0 = 自动分配。
+	// 允许指定是因为「外部端口 ≠ 本机端口」很常见（路由器映射、内网穿透），
+	// 与外部端口对不上时对端永远连不上，而现象只有「一直离线」。
+	ListenPort int `json:"listen_port"`
 }
 
 // handleCreateInterconnect 生成一份互联邀请：本端建好连接与对端条目，并返回要交给对方的文件。
@@ -47,7 +51,24 @@ func (s *Server) handleImportInterconnect(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	out, err := s.svc.ImportInterconnect(r.Context(), inv, actorOf(r))
+	out, err := s.svc.ImportInterconnect(r.Context(), inv, req.ListenPort, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleInterconnectInvite 重现一份已生成的互联邀请。
+//
+// 权限按「查看密钥」同级校验：邀请里含对端连接的私钥与二次加密口令，
+// 等同于把对方那条连接交出去；没有该权限的账号应当只能看到条目、看不到邀请。
+func (s *Server) handleInterconnectInvite(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.svc.InterconnectInvite(r.Context(), id, actorOf(r))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

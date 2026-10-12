@@ -26,6 +26,7 @@ func (s *Service) ListPeers(ctx context.Context, interfaceID int64) ([]model.Pee
 	}
 	s.Cache.EnrichPeers(peers)
 	s.markConfigStale(ctx, peers)
+	markSitePeers(peers)
 	for i := range peers {
 		peers[i].PresharedKey = ""
 		peers[i].ClientPrivateKey = ""
@@ -42,6 +43,7 @@ func (s *Service) GetPeer(ctx context.Context, id int64) (*model.Peer, error) {
 	list := []model.Peer{*p}
 	s.Cache.EnrichPeers(list)
 	s.markConfigStale(ctx, list)
+	markSitePeers(list)
 	*p = list[0]
 	p.PresharedKey = ""
 	p.ClientPrivateKey = ""
@@ -456,6 +458,20 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		return nil, err
 	}
 	endpoint, warn := s.serverEndpoint(ctx, it)
+	// 站点互联的对端条目不是「一台设备」：它代表的就是**对面那台 NAS**，
+	// 生成的配置里带着对端连接的私钥与隧道地址。
+	//
+	// 把它当普通设备配置拿到另一台机器上用，那台机器会以对端身份连上来、把对端
+	// NAS 顶掉（同一个公钥在同一时刻只对应一个有效端点），现象是「两台 NAS
+	// 时通时不通、设备访问不了对端内网」，且两端界面都看不出异常。
+	if isSitePeer(p) {
+		msg := "这条配置是给**对端 NAS**用的（含对端连接的私钥与隧道地址）：请用它配置对面那台 NAS，" +
+			"不要用在你自己的手机或电脑上 —— 否则那台设备会冒充对端 NAS，双方互相抢占连接。"
+		if warn != "" {
+			warn += "；"
+		}
+		warn += msg
+	}
 	clientAddrs, extraRoutes := wgconf.SplitClientAndServerIPs(it, p)
 	clientAllowed := s.clientAllowedIPs(ctx, it, p, extraRoutes)
 	conf := wgconf.RenderClient(serverPub, it, p, wgconf.RenderClientOptions{
@@ -524,12 +540,48 @@ func (s *Service) clientAllowedIPs(ctx context.Context, it *model.Interface, p *
 			return wgconf.MergeCIDRs(p.ClientAllowedIPs)
 		}
 	}
-	// lan（默认）：仅让设备能访问本端内网与额外放行的网段
+	// lan（默认）：仅让设备能访问本端内网、对端站点内网与额外放行的网段
 	out := append([]string{}, s.homeLANSubnets(ctx)...)
 	out = append(out, extra...)
+	// 站点互联（异地组网）：把对端内网也并入设备通行范围。
+	//
+	// 少了这一项，现象是「隧道通了、能访问本机内网，却访问不了另一台 NAS 后面的机器」——
+	// 而且不报错：设备根本没把发往对端内网的包送进隧道。
+	// 与「设备上网方式=全量」的区别是：这里只多放行对端内网，上网流量仍走设备本地网络。
+	out = append(out, s.siteLANSubnets(ctx)...)
 	if len(out) == 0 {
 		// 探测失败时退化为"只能访问隧道内地址"，仍然可用且安全
 		out = append(out, it.Addresses...)
+	}
+	return wgconf.MergeCIDRs(out)
+}
+
+// siteLANSubnets 收集本机全部「站点互联」对端的内网网段（隧道之外的那些）。
+//
+// 判定复用 topology.siteSubnetsOf：某条链路里「准入地址落在本连接隧道之外」的部分
+// 就是对端内网。三处（拓扑展示、数据面转发来源、这里）共用同一套推导，
+// 避免出现「拓扑画了、配置却不认」这种自相矛盾。
+func (s *Service) siteLANSubnets(ctx context.Context) []string {
+	ifaces, err := s.Store.ListInterfaces(ctx)
+	if err != nil {
+		return nil
+	}
+	out := []string{}
+	for i := range ifaces {
+		it := &ifaces[i]
+		if !it.Enabled {
+			continue
+		}
+		peers, err := s.Store.ListPeers(ctx, it.ID)
+		if err != nil {
+			continue
+		}
+		for j := range peers {
+			if !peers[j].Enabled {
+				continue
+			}
+			out = append(out, siteSubnetsOf(it, &peers[j])...)
+		}
 	}
 	return wgconf.MergeCIDRs(out)
 }

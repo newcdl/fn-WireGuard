@@ -50,6 +50,13 @@ const (
 	// RouteTableClient 仅当本机作为客户端时才为对端网段添加路由。
 	RouteTableClient = "client"
 
+	// IfaceKindSite 表示这条连接是「异地组网」（站点到站点互联）。
+	//
+	// 派生字段，**不落库**：由「该连接下存在站点条目（备注以「站点互联」开头）」判定，
+	// 与拓扑图、互联向导用同一口径。落库会污染备份与快照的比对（同一份配置会因为
+	// 派生值不同而被判成「变了」）。
+	IfaceKindSite = "site"
+
 	// PeerDisabledQuota / PeerDisabledExpired 是设备被**自动**停用的原因（Peer.DisabledReason 的取值）。
 	//
 	// 只记「为什么停用」，不记具体数值或期限：那些会随管理员调整而变，
@@ -132,7 +139,11 @@ type Interface struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 
-	// 以下为运行时字段，不落库
+	// 以下为运行时/派生字段，不落库
+	// Kind 是「这条连接的用途」：IfaceKindSite=异地组网，空=普通（设备接入）。
+	Kind string `json:"kind,omitempty"`
+	// PortNote 是「对外访问地址的端口 ≠ 本连接监听端口」时的提示（派生，不落库）。
+	PortNote   string  `json:"port_note,omitempty"`
 	PublicKey  string  `json:"public_key,omitempty"`
 	Up         bool    `json:"up,omitempty"`
 	PeerCount  int     `json:"peer_count,omitempty"`
@@ -197,7 +208,10 @@ type Peer struct {
 	// 然后对着「明明改了范围却还是访问不了」困惑很久。
 	ConfigFingerprint string `json:"config_fingerprint,omitempty"`
 
-	// 运行时字段
+	// 运行时/派生字段
+	// SiteLink 表示这条条目代表的是「另一台 NAS」（站点互联的对端），不是一台接入设备。
+	// 派生自备注前缀（与拓扑、互联向导同一口径），不落库。
+	SiteLink      bool      `json:"site_link,omitempty"`
 	Online        bool      `json:"online,omitempty"`
 	LastHandshake time.Time `json:"last_handshake,omitempty"`
 	Endpoint      string    `json:"endpoint,omitempty"`
@@ -530,6 +544,11 @@ type NATStatus struct {
 	IsolateNets []string `json:"isolate_nets"`
 	// IsolateRules 内核里实际的阻断规则条数，便于对照 `nft list table` 核对。
 	IsolateRules int `json:"isolate_rules"`
+	// SiteNATDevs 是当前做了「站点间源地址改写」的连接（出口网卡）列表。
+	// 它对应「设备连上隧道后能访问另一台 NAS 的内网」这一步。
+	SiteNATDevs []string `json:"site_nat_devs"`
+	// SiteNATSubnets 是被改写后可达的对端内网网段。
+	SiteNATSubnets []string `json:"site_nat_subnets"`
 	// Checks 是内网访问链路的逐项自检结果。
 	// 「设备连上了但访问不了家里其它设备」在界面上只是一个现象，
 	// 成因可能有好几层，这里把每层都查一遍并给出修复建议。

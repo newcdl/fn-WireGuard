@@ -70,6 +70,7 @@ func (s *Service) GetOverview(ctx context.Context) (*Overview, error) {
 		return nil, err
 	}
 	s.Cache.EnrichPeers(peers)
+	markSitePeers(peers)
 	for i := range peers {
 		p := peers[i]
 		p.PresharedKey = ""
@@ -81,6 +82,18 @@ func (s *Service) GetOverview(ctx context.Context) (*Overview, error) {
 			ov.Recent = append(ov.Recent, p)
 		}
 		ov.TopPeers = append(ov.TopPeers, p)
+	}
+	// 连接用途（派生）：与「我的连接」列表同一口径，避免总览与列表说法不一致。
+	siteIfaces := map[int64]bool{}
+	for i := range peers {
+		if peers[i].SiteLink {
+			siteIfaces[peers[i].InterfaceID] = true
+		}
+	}
+	for i := range ov.Interfaces {
+		if siteIfaces[ov.Interfaces[i].ID] {
+			ov.Interfaces[i].Kind = model.IfaceKindSite
+		}
 	}
 	// 流量排行
 	sort.Slice(ov.TopPeers, func(i, j int) bool {

@@ -82,6 +82,13 @@ type InterconnectPeerParams struct {
 	TunnelAddress string `json:"tunnel_address"`
 	// TunnelSubnet 是两端共用的隧道网段。
 	TunnelSubnet string `json:"tunnel_subnet"`
+	// PresharedKey 是这条互联的「二次加密口令」（两端必须完全一致）。
+	//
+	// 必须随邀请一起交给对方：邀请方给自己那条对端条目生成了口令，对端若不知道，
+	// 握手会因口令不一致被**直接拒绝** —— 现象只是「设备一直离线、最近通信从未」，
+	// 此时端口映射、公网地址、FRP 全都是对的也无济于事（真机踩到过：
+	// 两端流量在涨、却一次都没握上手，很难往口令上想）。
+	PresharedKey string `json:"preshared_key"`
 	MTU          int    `json:"mtu"`
 }
 
@@ -107,6 +114,8 @@ type InterconnectCreated struct {
 	InviteJSON string `json:"invite_json"`
 	// PeerConf 是给「对端不装本应用」的场景用的 wg-quick 配置文本。
 	PeerConf string `json:"peer_conf"`
+	// PortNote 是「对外地址的端口 ≠ 本连接监听端口」时的提示（为空表示一致，无需提示）。
+	PortNote string `json:"port_note,omitempty"`
 	// Warnings 是必须让用户知道但不至于失败的事（私钥随文件走、缺少对外地址等）。
 	Warnings []string `json:"warnings"`
 }
@@ -121,7 +130,14 @@ type InterconnectImported struct {
 	TunnelSubnet  string   `json:"tunnel_subnet"`
 	AllowedIPs    []string `json:"allowed_ips"`
 	ClientAllowed []string `json:"client_allowed_ips"`
-	Warnings      []string `json:"warnings"`
+	// ListenPort 是本机这条连接实际监听的 UDP 端口；PublicEndpoint 是对外访问地址。
+	// 两者一起给出来，用户才能核对「外部端口 → 本机端口」这段映射（端口可以不同，
+	// 但必须真的转得通，否则表现只是「对端连不上本机」，谁也看不出是端口的事）。
+	ListenPort     int    `json:"listen_port"`
+	PublicEndpoint string `json:"public_endpoint"`
+	// PortNote 是两者不一致时的提示（为空表示一致）。
+	PortNote string   `json:"port_note,omitempty"`
+	Warnings []string `json:"warnings"`
 }
 
 // CreateInterconnect 生成一份互联邀请：在本机建好连接与对端条目，并给出交给对方的文件。
@@ -165,19 +181,9 @@ func (s *Service) CreateInterconnect(ctx context.Context, in InterconnectInput, 
 		return nil, fmt.Errorf("连接已创建，但没能确定隧道网段：请到「我的连接」检查该连接的本机专用地址")
 	}
 	peerAllowed := nextFreeIP(it, nil) // 形如 10.10.0.2/32，用于准入地址
-	peerIP, _, err := net.ParseCIDR(peerAllowed)
-	if err != nil {
-		return nil, fmt.Errorf("分配对端隧道地址失败：%w", err)
+	if _, _, perr := net.ParseCIDR(peerAllowed); perr != nil {
+		return nil, fmt.Errorf("分配对端隧道地址失败：%w", perr)
 	}
-	// 邀请里给对方的地址必须带上隧道网段的掩码（对端直接拿它当连接地址），
-	// 而准入地址要的是单主机形式 —— 两者不是一回事，混用会得到「隧道能起、内网不通」。
-	tunnelMask := 24
-	if _, tn, err := net.ParseCIDR(it.Addresses[0]); err == nil {
-		if ones, bits := tn.Mask.Size(); bits == 32 {
-			tunnelMask = ones
-		}
-	}
-	peerTunnelAddr := fmt.Sprintf("%s/%d", peerIP.String(), tunnelMask)
 
 	// 对端在本端的条目：准入地址=对端隧道地址+对端内网网段；通行范围=本机暴露的网段。
 	// 公钥由本端生成（GenerateKeys），这样邀请文件里能直接带上对端要用的私钥。
@@ -206,37 +212,26 @@ func (s *Service) CreateInterconnect(ctx context.Context, in InterconnectInput, 
 	if !wgkey.Validate(p.ClientPrivateKey) {
 		return nil, fmt.Errorf("对端连接的私钥没能生成，请重试；若反复出现请反馈此问题")
 	}
+	// 口令同样必须存在：它要随邀请交给对方，缺了就会变成「两端永远握不上手」。
+	if !wgkey.Validate(p.PresharedKey) {
+		return nil, fmt.Errorf("对端连接的二次加密口令没能生成，请重试；若反复出现请反馈此问题")
+	}
 
+	endpoint, epWarn := s.serverEndpoint(ctx, it)
+	// 邀请的组装与「再次查看邀请」共用同一份推导（buildInterconnectInvite）：
+	// 两处各写一遍，迟早会出现「当初生成的那份」与「后来看到的那份」不一致。
+	inv, err := buildInterconnectInvite(it, p, endpoint)
+	if err != nil {
+		return nil, err
+	}
 	out := &InterconnectCreated{
 		InterfaceID:       it.ID,
 		InterfaceName:     it.Name,
 		PeerID:            p.ID,
-		TunnelSubnet:      tunnelSubnet,
-		PeerTunnelAddress: peerIP.String(),
-	}
-	endpoint, epWarn := s.serverEndpoint(ctx, it)
-	sitePub, err := wgkey.PublicKey(it.PrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("导出本机公钥失败：%w", err)
-	}
-	out.Invite = InterconnectInvite{
-		Kind:    InterconnectKind,
-		Version: InterconnectVersion,
-		Site: InterconnectSite{
-			Name:          it.Name,
-			PublicKey:     sitePub,
-			Endpoint:      endpoint,
-			TunnelAddress: it.Addresses[0],
-			LANSubnets:    localLAN,
-		},
-		Peer: InterconnectPeerParams{
-			Name:       peerName,
-			PrivateKey: p.ClientPrivateKey,
-			// 对端在隧道里的地址：本机地址之外的下一个空闲地址（见 nextFreeIP）。
-			TunnelAddress: peerTunnelAddr,
-			TunnelSubnet:  tunnelSubnet,
-			MTU:           mtu,
-		},
+		TunnelSubnet:      inv.Peer.TunnelSubnet,
+		PeerTunnelAddress: hostIP(inv.Peer.TunnelAddress),
+		Invite:            inv,
+		PortNote:          portNoteIfMismatch(it, endpoint),
 	}
 	raw, err := json.MarshalIndent(out.Invite, "", "  ")
 	if err != nil {
@@ -264,20 +259,191 @@ func (s *Service) CreateInterconnect(ctx context.Context, in InterconnectInput, 
 			"没填对端的对外地址，本机不会主动去连对端：隧道要由对端发起（对端有公网地址，或对端在导入后填上你的地址）")
 	}
 	out.Warnings = append(out.Warnings,
-		"邀请文件里含对端连接的私钥，等同于密码：请通过安全渠道交给对方，不要发到群里或上传网盘")
+		"邀请文件里含对端连接的私钥与二次加密口令，等同于密码：请通过安全渠道交给对方，不要发到群里或上传网盘")
+	out.Warnings = append(out.Warnings,
+		"对端导入后两处内网即互通；连上本机的设备会自动带上对端内网，可访问两处的机器"+
+			"（已连上的设备需重新扫码一次，让新范围写进它的配置）")
 
 	s.audit(ctx, a, "interconnect.create", "interface", fmt.Sprint(it.ID), "", it.Name, "ok",
-		fmt.Sprintf("生成互联邀请：隧道 %s，对端 %s，暴露本机网段 %s", tunnelSubnet, peerTunnelAddr, strings.Join(localLAN, "、")))
+		fmt.Sprintf("生成互联邀请：隧道 %s，对端 %s，暴露本机网段 %s",
+			out.TunnelSubnet, out.PeerTunnelAddress, strings.Join(localLAN, "、")))
 	return out, nil
+}
+
+// buildInterconnectInvite 由「本机连接 + 对端条目」推导出邀请内容。
+//
+// 「生成邀请」与「再次查看邀请」都走这一份推导：邀请里的每一项都能从库里推出来
+// （连接私钥 → 公钥、连接地址 → 隧道网段、条目准入地址 → 对端隧道地址、
+// 条目的代管私钥与口令 → 要交给对方的东西），因此不需要另外存档一份 ——
+// 存档反而要再存一遍私钥与口令，收益低、风险高。
+func buildInterconnectInvite(it *model.Interface, p *model.Peer, endpoint string) (InterconnectInvite, error) {
+	if it == nil || p == nil {
+		return InterconnectInvite{}, fmt.Errorf("这条互联条目已经不存在，请刷新页面后重试")
+	}
+	if len(it.Addresses) == 0 {
+		return InterconnectInvite{}, fmt.Errorf("这条连接没有本机专用地址，推导不出邀请内容：请到「我的连接」检查该连接")
+	}
+	sitePub, err := wgkey.PublicKey(it.PrivateKey)
+	if err != nil {
+		return InterconnectInvite{}, fmt.Errorf("导出本机公钥失败：%w", err)
+	}
+	if !wgkey.Validate(p.ClientPrivateKey) {
+		return InterconnectInvite{}, fmt.Errorf("这条条目没有代管私钥（当初是以外部识别码添加的），重现不出邀请：" +
+			"请到「我的连接 → 与另一台 NAS 互联」重新生成一份，并在对端重新导入")
+	}
+	tunnelSubnet := subnetOf(it.Addresses[0])
+	// 对端隧道地址：准入地址里落在本连接隧道网段内的那一个（形如 10.10.0.2/32）。
+	peerTunnel := ""
+	for _, a := range p.AllowedIPs {
+		if subnetContains(tunnelSubnet, a) {
+			peerTunnel = a
+			break
+		}
+	}
+	if peerTunnel == "" {
+		return InterconnectInvite{}, fmt.Errorf("这条条目的准入地址里没有对端隧道地址，重现不出邀请：" +
+			"请到「我的设备」检查该条目的「分配给这台设备的内部地址」")
+	}
+	// 掩码必须换成隧道网段的掩码：对端直接拿这个地址当自己的连接地址，
+	// 写成 /32 会让它连不上本连接以外的地址（准入地址要的是 /32，两者不是一回事）。
+	mask := 24
+	if _, tn, err := net.ParseCIDR(it.Addresses[0]); err == nil {
+		if ones, bits := tn.Mask.Size(); bits == 32 {
+			mask = ones
+		}
+	}
+	lan, err := normalizeSubnets(p.ClientAllowedIPs, false)
+	if err != nil {
+		return InterconnectInvite{}, fmt.Errorf("这条条目暴露给对端的网段有问题：%w", err)
+	}
+	return InterconnectInvite{
+		Kind:    InterconnectKind,
+		Version: InterconnectVersion,
+		Site: InterconnectSite{
+			Name:          it.Name,
+			PublicKey:     sitePub,
+			Endpoint:      endpoint,
+			TunnelAddress: it.Addresses[0],
+			LANSubnets:    lan,
+		},
+		Peer: InterconnectPeerParams{
+			Name:       p.Name,
+			PrivateKey: p.ClientPrivateKey,
+			// 口令必须随邀请交出去：本端那条对端条目已经带着它，对端不知道就会握手失败。
+			PresharedKey:  p.PresharedKey,
+			TunnelAddress: fmt.Sprintf("%s/%d", hostIP(peerTunnel), mask),
+			TunnelSubnet:  tunnelSubnet,
+			MTU:           it.MTU,
+		},
+	}, nil
+}
+
+// InterconnectInvite 重现一份已生成的互联邀请。
+//
+// 内容全部由当前状态推导，不落库；邀请含对端私钥与口令，因此调用方必须按
+// 「查看密钥」同级权限（model.PermKeyReveal）校验，并留下审计。
+//
+// 它反映的是**当前**设置：若对外地址等在这之后改过，重现出来的会与当初那份不同，
+// 界面要提示「把新的这份重新交给对端导入」。
+func (s *Service) InterconnectInvite(ctx context.Context, peerID int64, a Actor) (*InterconnectCreated, error) {
+	p, err := s.Store.GetPeer(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("这条条目不存在，请刷新页面后重试")
+	}
+	if !isSitePeer(p) {
+		return nil, fmt.Errorf("这不是互联条目：只有备注以「%s」开头的对端条目才有对应的邀请", InterconnectRemark)
+	}
+	it, err := s.Store.GetInterface(ctx, p.InterfaceID)
+	if err != nil {
+		return nil, fmt.Errorf("这条条目所属的连接已经不存在，请刷新页面")
+	}
+	endpoint, epWarn := s.serverEndpoint(ctx, it)
+	inv, err := buildInterconnectInvite(it, p, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.MarshalIndent(inv, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	out := &InterconnectCreated{
+		InterfaceID:       it.ID,
+		InterfaceName:     it.Name,
+		PeerID:            p.ID,
+		TunnelSubnet:      inv.Peer.TunnelSubnet,
+		PeerTunnelAddress: hostIP(inv.Peer.TunnelAddress),
+		Invite:            inv,
+		InviteJSON:        string(raw),
+		PortNote:          portNoteIfMismatch(it, endpoint),
+	}
+	if res, err := s.PeerConfig(ctx, p.ID); err == nil {
+		out.PeerConf = res.Conf
+		if res.Warning != "" {
+			out.Warnings = appendWarning(out.Warnings, res.Warning)
+		}
+	}
+	if epWarn != "" {
+		out.Warnings = appendWarning(out.Warnings, epWarn)
+	}
+	if endpoint == "" {
+		out.Warnings = append(out.Warnings,
+			"本机没有对外地址，对端无法主动连过来：请先在「系统设置 → 接入设置」填写家里的公网域名或 IP")
+	}
+	out.Warnings = append(out.Warnings,
+		"这是按**当前**设置重新生成的一份：如果你改过对外地址，请把新的这份重新交给对端导入")
+	out.Warnings = append(out.Warnings,
+		"邀请文件里含对端连接的私钥与二次加密口令，等同于密码：请通过安全渠道交给对方")
+
+	s.audit(ctx, a, "interconnect.invite_view", "peer", fmt.Sprint(p.ID), "", p.Name, "ok", "查看已生成的互联邀请")
+	return out, nil
+}
+
+// portNoteIfMismatch 在「对外访问地址的端口」与本连接监听端口不一致时，给出可操作的提示。
+//
+// 两者**可以不同**（靠路由器端口映射或内网穿透换算），但必须真的转得通。
+// 这类错配的现象只有「对端一直连不上本机」，从状态与日志里都看不出与端口有关 ——
+// 真机踩到过：路由器把外部 51821 转到本机 51821，而本机实际监听 51820。
+func portNoteIfMismatch(it *model.Interface, endpoint string) string {
+	if it == nil || it.ListenPort <= 0 {
+		return ""
+	}
+	_, portStr, err := net.SplitHostPort(strings.TrimSpace(endpoint))
+	if err != nil {
+		return ""
+	}
+	ext, err := strconv.Atoi(portStr)
+	if err != nil || ext <= 0 || ext == it.ListenPort {
+		return ""
+	}
+	return fmt.Sprintf("对外访问地址用的是 %d 端口，本连接的监听端口是 %d："+
+		"两者可以不同（靠路由器端口映射或内网穿透换算），但必须真的转得通 —— "+
+		"请确认「外部 %d」确实转到了「本机 %d」；对端一直连不上本机时，先查这一条",
+		ext, it.ListenPort, ext, it.ListenPort)
+}
+
+// hostIP 取 CIDR 里的地址部分（10.10.0.2/32 → 10.10.0.2）。
+func hostIP(cidr string) string {
+	ip, _, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil {
+		return strings.TrimSpace(cidr)
+	}
+	return ip.String()
 }
 
 // ImportInterconnect 导入一份互联邀请：在本机建立对称的连接与对端条目。
 //
+// listenPort 是本机这条连接要监听的 UDP 端口，0 表示交给自动分配（推荐）。
+// 之所以允许指定：外部端口与本机端口常常不一致（路由器映射、内网穿透），
+// 而邀请里不带端口、界面原先也不提示，用户只能靠猜 —— 猜错的唯一现象就是「对端连不上本机」。
+//
 // 导入前把所有能提前查出来的冲突都挡住（隧道网段与已有连接重叠、两端内网网段撞车、
-// 公钥重复、私钥格式不对）—— 建完再发现就只能删连接重来，而那些冲突的表现都是「不通」。
-func (s *Service) ImportInterconnect(ctx context.Context, inv InterconnectInvite, a Actor) (*InterconnectImported, error) {
+// 公钥重复、私钥格式不对、端口被占用）—— 建完再发现就只能删连接重来，而那些冲突的表现都是「不通」。
+func (s *Service) ImportInterconnect(ctx context.Context, inv InterconnectInvite, listenPort int, a Actor) (*InterconnectImported, error) {
 	if err := ValidateInterconnectInvite(inv); err != nil {
 		return nil, err
+	}
+	if listenPort < 0 || listenPort > 65535 {
+		return nil, fmt.Errorf("「本机监听端口」要填 1 到 65535 之间的数字（留空表示自动分配）")
 	}
 	tunnelSubnet := subnetOf(inv.Peer.TunnelAddress)
 
@@ -286,6 +452,12 @@ func (s *Service) ImportInterconnect(ctx context.Context, inv InterconnectInvite
 	ifaces, err := s.Store.ListInterfaces(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// 指定了端口就要当场确认它没被别的连接占用：内核里一个 UDP 端口只能有一个监听者，
+	// 冲突的表现是「连接建好了却起不来」，等那时候再查又是一轮。
+	if listenPort > 0 && portUsedBy(ifaces, listenPort) {
+		return nil, fmt.Errorf("监听端口 %d 已经被另一条连接占用：请换一个端口，"+
+			"或把路由器/内网穿透改成映射到本机正在使用的那个端口", listenPort)
 	}
 	probe := &model.Interface{Name: "待导入", Addresses: []string{inv.Peer.TunnelAddress}}
 	if err := checkInterfaceConflicts(probe, ifaces); err != nil {
@@ -323,6 +495,7 @@ func (s *Service) ImportInterconnect(ctx context.Context, inv InterconnectInvite
 		mtu = InterconnectMTU
 	}
 	it, err := s.CreateInterface(ctx, CreateInterfaceInput{
+		ListenPort: listenPort, // 0 = 自动分配（默认 51820 起，避开已有连接）
 		MTU:        mtu,
 		Addresses:  []string{inv.Peer.TunnelAddress},
 		PrivateKey: inv.Peer.PrivateKey,
@@ -345,6 +518,7 @@ func (s *Service) ImportInterconnect(ctx context.Context, inv InterconnectInvite
 		InterfaceID:      it.ID,
 		Name:             peerName,
 		PublicKey:        inv.Site.PublicKey,
+		PresharedKey:     strings.TrimSpace(inv.Peer.PresharedKey),
 		AllowedIPs:       allowed,
 		RouteMode:        model.RouteModeCustom,
 		ClientAllowedIPs: localLAN,
@@ -358,22 +532,32 @@ func (s *Service) ImportInterconnect(ctx context.Context, inv InterconnectInvite
 		return nil, err
 	}
 
+	// 把「本机监听端口 / 对外访问地址」一并回报：这两个数是核对
+	// 「外部端口 → 本机端口」那条映射的唯一依据，缺了它用户只能靠猜。
+	endpoint, _ := s.serverEndpoint(ctx, it)
 	out := &InterconnectImported{
-		InterfaceID:   it.ID,
-		InterfaceName: it.Name,
-		PeerID:        p.ID,
-		PeerName:      peerName,
-		TunnelAddress: inv.Peer.TunnelAddress,
-		TunnelSubnet:  tunnelSubnet,
-		AllowedIPs:    allowed,
-		ClientAllowed: localLAN,
+		InterfaceID:    it.ID,
+		InterfaceName:  it.Name,
+		PeerID:         p.ID,
+		PeerName:       peerName,
+		TunnelAddress:  inv.Peer.TunnelAddress,
+		TunnelSubnet:   tunnelSubnet,
+		AllowedIPs:     allowed,
+		ClientAllowed:  localLAN,
+		ListenPort:     it.ListenPort,
+		PublicEndpoint: endpoint,
+		PortNote:       portNoteIfMismatch(it, endpoint),
 	}
 	if strings.TrimSpace(inv.Site.Endpoint) == "" {
 		out.Warnings = append(out.Warnings,
 			"邀请里没有对端的对外地址，本机无法主动去连对端：请让对端先发起连接（或稍后在设备里补填对端地址）")
 	}
 	out.Warnings = append(out.Warnings,
-		"两端内网里的普通主机要互相访问，还需要在局域网侧把对端网段的路由指到本机（NAS 自身与连上隧道的设备不受影响）")
+		"两台 NAS 之间已可互访对方内网；连上隧道的设备也会自动带上对端内网"+
+			"（已连上的设备需重新扫码一次，让新范围写进它的配置）")
+	out.Warnings = append(out.Warnings,
+		"两端内网里的**普通主机**（没连隧道的电脑、手机）要互相访问，仍需在各自局域网的网关上加一条静态路由，"+
+			"把对端网段指向本机 NAS —— 本应用不会修改你家里的路由器设置")
 
 	s.audit(ctx, a, "interconnect.import", "interface", fmt.Sprint(it.ID), "", it.Name, "ok",
 		fmt.Sprintf("导入互联邀请：隧道 %s，对端 %s，准入 %s", tunnelSubnet, inv.Site.Name, strings.Join(allowed, "、")))
@@ -395,6 +579,12 @@ func ValidateInterconnectInvite(inv InterconnectInvite) error {
 	}
 	if !wgkey.Validate(inv.Peer.PrivateKey) {
 		return fmt.Errorf("邀请里对端连接的私钥格式不正确，文件可能已损坏")
+	}
+	// 口令缺了不能放行：旧版邀请不带这个字段，导入后两端会一直「从未连接」，
+	// 而那时现象与端口、公网、防火墙全都无关，排查成本极高 —— 在这里直接说清。
+	if !wgkey.Validate(inv.Peer.PresharedKey) {
+		return fmt.Errorf("这份邀请里缺少（或格式不对）两端通信必需的「二次加密口令」：" +
+			"多半是旧版本生成的邀请，导入后两端会一直「从未连接」。请让对方升级后用新版重新生成一份邀请")
 	}
 	if _, _, err := net.ParseCIDR(strings.TrimSpace(inv.Site.TunnelAddress)); err != nil {
 		return fmt.Errorf("邀请里对端的隧道地址不合法")

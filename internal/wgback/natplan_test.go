@@ -703,3 +703,100 @@ func TestPeerRestrictionsFromSpecs(t *testing.T) {
 		t.Fatalf("禁止访问的设备策略应保留：%+v", got[1])
 	}
 }
+
+// TestPlanSiteMasqRules 站点间源地址改写：设备 → 对端内网的流量必须在本机被改写成
+// 站点连接自己的地址。
+//
+// 不改写的话，对端看到的源地址是「设备的隧道地址」，而它的准入地址里只有
+// 「对面 NAS 的地址」—— 包会被对端 WireGuard 直接丢弃，现象是「能连上本机、
+// 却访问不了另一台 NAS 后面的机器」，且不报错。
+func TestPlanSiteMasqRules(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.20.0.0/24", "10.10.0.0/24"},
+		WANInterfaces: []string{"end0"},
+		TunnelSubnets: []string{"10.20.0.0/24", "10.10.0.0/24"},
+		SiteNAT: []SiteNATInput{
+			{Dev: "wg1", Remote: []string{"192.168.2.0/24", "192.168.2.0/24"}},
+		},
+	})
+	if len(plan.SiteMasq) != 2 {
+		t.Fatalf("两个隧道网段各应生成 1 条站点改写规则，实际: %+v", plan.SiteMasq)
+	}
+	found := false
+	for _, r := range plan.SiteMasq {
+		if r.Src == "10.20.0.0/24" && r.Dst == "192.168.2.0/24" && r.Dev == "wg1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("缺少「设备网段 → 对端内网」的改写规则: %+v", plan.SiteMasq)
+	}
+	desc := DescribeSiteMasq(plan)
+	if !strings.Contains(desc, "wg1") || !strings.Contains(desc, "192.168.2.0/24") {
+		t.Fatalf("描述应包含出口连接与对端网段: %s", desc)
+	}
+}
+
+// TestPlanSiteMasqCoversDeviceOnSiteLink 回归：设备与站点链路在**同一条连接**上时
+// （只有一条连接、设备就挂在它下面 —— 最常见的用法），仍然必须下发改写规则。
+//
+// 曾经的写法把「站点连接自身的隧道网段」整段排除，于是源被排除光、一条规则都不下发，
+// 现象是「设备能访问本机内网、却访问不了对端内网」。这里钉住它不会再回来。
+func TestPlanSiteMasqCoversDeviceOnSiteLink(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.10.0.0/24"}, // 设备与站点链路共用这一条连接
+		WANInterfaces: []string{"end0"},
+		TunnelSubnets: []string{"10.10.0.0/24"},
+		SiteNAT:       []SiteNATInput{{Dev: "wg0", Remote: []string{"192.168.3.0/24"}}},
+	})
+	if len(plan.SiteMasq) != 1 {
+		t.Fatalf("设备与站点同连接时必须下发改写规则，实际: %+v", plan.SiteMasq)
+	}
+	r := plan.SiteMasq[0]
+	if r.Src != "10.10.0.0/24" || r.Dst != "192.168.3.0/24" || r.Dev != "wg0" {
+		t.Fatalf("规则内容错误: %+v", r)
+	}
+}
+
+// TestPlanSiteMasqEmptyWithoutSite 没有站点连接时不得产生任何改写规则：
+// 这条规则会改写源地址，凭空出现等于悄悄改变了用户网络的行为。
+func TestPlanSiteMasqEmptyWithoutSite(t *testing.T) {
+	plan := PlanNAT(NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.20.0.0/24"},
+		WANInterfaces: []string{"end0"},
+		TunnelSubnets: []string{"10.20.0.0/24"},
+	})
+	if len(plan.SiteMasq) != 0 {
+		t.Fatalf("没有站点连接时不应产生站点改写规则: %+v", plan.SiteMasq)
+	}
+}
+
+// TestPlanSiteMasqFingerprint 站点改写的内容变化必须引起指纹变化（否则规则不会重建），
+// 且指纹里要能看出这是站点改写。
+func TestPlanSiteMasqFingerprint(t *testing.T) {
+	base := NATPlanInput{
+		Enabled:       true,
+		SourceSubnets: []string{"10.20.0.0/24"},
+		WANInterfaces: []string{"end0"},
+		TunnelSubnets: []string{"10.20.0.0/24"},
+		SiteNAT:       []SiteNATInput{{Dev: "wg1", Remote: []string{"192.168.2.0/24"}}},
+	}
+	a := PlanNAT(base).Fingerprint()
+	if !strings.Contains(a, "snat:") {
+		t.Fatalf("指纹应包含站点改写条目，实际: %s", a)
+	}
+	changed := base
+	changed.SiteNAT = []SiteNATInput{{Dev: "wg1", Remote: []string{"192.168.9.0/24"}}}
+	if PlanNAT(changed).Fingerprint() == a {
+		t.Fatal("对端网段变化必须引起指纹变化，否则规则不会重建")
+	}
+	// 换顺序（同一组规则）不该引起重建：输入顺序变化不是内容变化。
+	swapped := base
+	swapped.SiteNAT = []SiteNATInput{{Dev: "wg1", Remote: []string{"192.168.2.0/24"}}}
+	if PlanNAT(swapped).Fingerprint() != a {
+		t.Fatal("内容相同的站点改写不应引起指纹变化")
+	}
+}
