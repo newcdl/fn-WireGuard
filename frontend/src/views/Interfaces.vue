@@ -280,9 +280,8 @@
         <el-form-item>
           <template #label><FieldLabel :meta="F.dns_mode" /></template>
           <el-radio-group v-model="form.dns_mode">
-            <el-radio value="client">仅下发给设备</el-radio>
-            <el-radio value="host">NAS 也一起使用</el-radio>
-            <el-radio value="off">不参与</el-radio>
+            <el-radio value="client">下发给设备</el-radio>
+            <el-radio value="off">不下发</el-radio>
           </el-radio-group>
           <FieldTips :meta="F.dns_mode" />
         </el-form-item>
@@ -515,7 +514,9 @@ function openEdit(row: WgInterface) {
     mtu: row.mtu,
     addresses: [...(row.addresses || [])],
     dns: [...(row.dns || [])],
-    dns_mode: row.dns_mode || 'client',
+    // 历史值 host（「NAS 也一起使用」）从未生效过，一律按「下发给设备」显示：
+    // 照原值填回去会让单选一个都选不中，而保存时后端也只会把它归一成 client。
+    dns_mode: row.dns_mode === 'off' ? 'off' : 'client',
     route_table: row.route_table === 'client' ? 'client' : 'off',
     post_up: row.post_up || '',
     post_down: row.post_down || '',

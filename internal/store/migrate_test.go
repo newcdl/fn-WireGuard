@@ -86,6 +86,146 @@ func TestAllowLANColumnAddedByMigration(t *testing.T) {
 	}
 }
 
+// TestSiteOccupiedColumnAddedByMigration 回归「升级不会读不出设备」：
+// wg_peer 的 site_occupied（对端已占用网段台账）是新加的列，旧库升级后必须被自动补上。
+//
+// 这一步失败的后果比「少一个字段」严重得多：查询里带着这一列，
+// 整个 ListPeers 会直接报 no such column —— 设备列表整页读不出来。
+func TestSiteOccupiedColumnAddedByMigration(t *testing.T) {
+	dir := t.TempDir()
+	box, err := secretbox.New(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, "old-peer.db")
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE wg_interface (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		uuid TEXT NOT NULL,
+		private_key BLOB,
+		listen_port INTEGER NOT NULL DEFAULT 51820,
+		fwmark INTEGER NOT NULL DEFAULT 0,
+		mtu INTEGER NOT NULL DEFAULT 1420,
+		addresses TEXT NOT NULL DEFAULT '[]',
+		dns TEXT NOT NULL DEFAULT '[]',
+		dns_mode TEXT NOT NULL DEFAULT 'client',
+		route_table TEXT NOT NULL DEFAULT 'auto',
+		pre_up TEXT NOT NULL DEFAULT '',
+		post_up TEXT NOT NULL DEFAULT '',
+		pre_down TEXT NOT NULL DEFAULT '',
+		post_down TEXT NOT NULL DEFAULT '',
+		enabled INTEGER NOT NULL DEFAULT 1,
+		autostart INTEGER NOT NULL DEFAULT 1,
+		allow_lan INTEGER NOT NULL DEFAULT 0,
+		isolate_peers INTEGER NOT NULL DEFAULT 0,
+		revision INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	// 旧版 wg_peer：除了 site_occupied，其余列都在
+	if _, err := raw.Exec(`CREATE TABLE wg_peer (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		interface_id INTEGER NOT NULL,
+		name TEXT NOT NULL DEFAULT '',
+		public_key TEXT NOT NULL,
+		preshared_key BLOB,
+		client_priv BLOB,
+		route_mode TEXT NOT NULL DEFAULT 'lan',
+		client_ips TEXT NOT NULL DEFAULT '[]',
+		endpoint_host TEXT NOT NULL DEFAULT '',
+		endpoint_port INTEGER NOT NULL DEFAULT 0,
+		allowed_ips TEXT NOT NULL DEFAULT '[]',
+		keepalive INTEGER NOT NULL DEFAULT 0,
+		group_tag TEXT NOT NULL DEFAULT '',
+		remark TEXT NOT NULL DEFAULT '',
+		quota_rx INTEGER NOT NULL DEFAULT 0,
+		quota_tx INTEGER NOT NULL DEFAULT 0,
+		expire_at TEXT,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		config_fp TEXT NOT NULL DEFAULT '',
+		lan_policy TEXT NOT NULL DEFAULT 'inherit',
+		lan_targets TEXT NOT NULL DEFAULT '[]',
+		disabled_reason TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO wg_interface(name,uuid,private_key,addresses,dns,route_table,enabled,autostart,revision,created_at,updated_at)
+		 VALUES('wg0','old-uuid',x'',?,?,'client',1,1,1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`,
+		`["10.20.0.1/24"]`, `[]`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO wg_peer(interface_id,name,public_key,route_mode,client_ips,allowed_ips,remark,created_at,updated_at)
+		 VALUES(1,'对端 NAS','PUBKEY','custom','[]',?,'站点互联','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`,
+		`["10.20.0.2/32"]`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	st, err := store.Open(dbPath, box)
+	if err != nil {
+		t.Fatalf("打开旧库失败（说明 site_occupied 列没被补上）: %v", err)
+	}
+	p, err := st.GetPeer(ctx, 1)
+	if err != nil {
+		t.Fatalf("读取旧设备失败（整张设备表会因此读不出来）: %v", err)
+	}
+	if len(p.SiteOccupied) != 0 {
+		t.Fatalf("历史数据没有台账，应为空，实际：%v", p.SiteOccupied)
+	}
+	// 列必须真的可写：写完能读回来才算补上了
+	if err := st.SetPeerSiteOccupied(ctx, 1, []string{"10.30.0.0/24"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetPeer(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.SiteOccupied) != 1 || got.SiteOccupied[0] != "10.30.0.0/24" {
+		t.Fatalf("台账写入后应能读回，实际：%v", got.SiteOccupied)
+	}
+	// 编辑设备（UpdatePeer）**不该**把台账清掉：它属于对端当时告诉我们什么
+	got.Name = "对端 NAS（改名）"
+	if err := st.UpdatePeer(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	again, err := st.GetPeer(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.SiteOccupied) != 1 {
+		t.Fatalf("编辑设备不该清掉对端占用台账，实际：%v", again.SiteOccupied)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 迁移每次启动都会跑一遍：重复执行必须无害
+	st2, err := store.Open(dbPath, box)
+	if err != nil {
+		t.Fatalf("重复打开（再次执行迁移）不该失败: %v", err)
+	}
+	defer st2.Close()
+	last, err := st2.GetPeer(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(last.SiteOccupied) != 1 {
+		t.Fatalf("重复迁移不该丢掉台账，实际：%v", last.SiteOccupied)
+	}
+}
+
 // TestNetworkSafetyMigration 是安全回归测试：
 // 升级到 0.3.0 后，历史库里"会把 NAS 默认路由抢走"的数据必须被自动转换成安全形式，
 // 这样用户即使直接用旧数据重装，也不会再次把系统网络弄坏。

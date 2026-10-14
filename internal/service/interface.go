@@ -22,8 +22,17 @@ import (
 const (
 	defaultMTU        = 1420
 	defaultListenPort = 51820
-	defaultAddrOctet  = 10 // 默认内部网段 10.10.0.0/24 的第三个八位组
 	autoAllocTries    = 64 // 自动分配时最多顺延尝试的位数
+
+	// addrBaseMin / addrBaseMax 是自动分配时「第三个八位组」的可取范围：10.10.0.0/24 ~ 10.250.0.0/24。
+	//
+	// 起点**不固定为 10**：真实环境里两台 NAS 的第 N 条连接会拿到同一个网段（见
+	// defaultInterfaceAddr），于是两端的设备地址成对重复。这里留出 241 个网段，
+	// 由每台机器自己的基准偏移（见 defaultAddrOffset）挑起点。
+	addrBaseMin = 10
+	addrBaseMax = 250
+	// addrSpan 是可选网段个数。
+	addrSpan = addrBaseMax - addrBaseMin + 1
 )
 
 // ifaceIndexRe 匹配 wgN 形式的连接名，用于推导默认地址与端口的偏移量。
@@ -409,18 +418,16 @@ func (s *Service) InterfaceConf(ctx context.Context, id int64) (string, string, 
 
 // applyInterfaceDefaults 归一化字段并补齐缺省值。
 //
-// 内部地址与监听端口留空时，按连接序号自动分配一个不与其它连接冲突的取值：
-// wg0 → 10.10.0.1/24 + 51820，wg1 → 10.11.0.1/24 + 51821，以此类推；
-// 若序号位已被占用则顺延寻找空位，避免「新建第二条连接就必须手工改端口和网段」。
+// 内部地址与监听端口留空时自动分配一个不与其它连接冲突的取值：网段按「本机偏移 + 连接
+// 序号」顺延（见 defaultInterfaceAddr / pickFreeAddr），端口从 51820 起按序号顺延；
+// 序号位已被占用则继续顺延，避免「新建第二条连接就必须手工改端口和网段」。
 func (s *Service) applyInterfaceDefaults(ctx context.Context, it *model.Interface, selfID int64) error {
 	it.Addresses = wgconf.MergeCIDRs(it.Addresses)
 	it.DNS = wgconf.MergeCIDRs(it.DNS)
 	if it.MTU <= 0 {
 		it.MTU = defaultMTU
 	}
-	if it.DNSMode == "" {
-		it.DNSMode = "client"
-	}
+	it.DNSMode = normalizeDNSMode(it.DNSMode)
 	// 安全底线：默认不管理本机路由。历史值 auto 一并降级为 off。
 	if it.RouteTable == "" || it.RouteTable == "auto" {
 		it.RouteTable = model.RouteTableOff
@@ -437,7 +444,7 @@ func (s *Service) applyInterfaceDefaults(ctx context.Context, it *model.Interfac
 		it.ListenPort = pickFreePort(others, start)
 	}
 	if len(it.Addresses) == 0 {
-		it.Addresses = []string{pickFreeAddr(others, start)}
+		it.Addresses = []string{pickFreeAddr(others, start, s.defaultAddrOffset(ctx), s.reservedSubnets(ctx))}
 	}
 	return nil
 }
@@ -456,15 +463,29 @@ func defaultIndexFor(name string) int {
 	return n
 }
 
-// defaultInterfaceAddr 按序号给出默认内部地址：wg0 → 10.10.0.1/24、wg1 → 10.11.0.1/24。
-func defaultInterfaceAddr(idx int) string {
+// defaultInterfaceAddr 按「本机偏移 + 连接序号」给出默认内部地址：
+// 偏移 0 时 wg0 → 10.10.0.1/24、wg1 → 10.11.0.1/24。
+//
+// 为什么要加一个按机器随机的基准偏移（真机踩到过）：两台 NAS 的第 1 条连接都是各自
+// 「序号 0」，纯按序号分配必然都得到 10.10.0.0/24，第 2 条都是 10.11.0.0/24……于是
+// 两端设备地址成对重复（都是 .2、.3…）。两端各自独立时看不出问题，但：
+//   - 同一个客户端同时导入两台 NAS 的配置时，两份配置的 Address 直接冲突（其中一条不通）；
+//   - 两台 NAS 互联后，从一端访问对端同网段里的设备会被本机直连路由截住，永远不通，
+//     而隧道本身是通的（能访问对端 NAS 与对端其它网段），用户完全推不出是地址撞车。
+//
+// 加上这台机器自己的基准后，两端默认网段撞车的概率从「必然」降到约 1/241；
+// 本机内部仍按序号顺延、仍会避开已占用的网段（见 pickFreeAddr）。
+func defaultInterfaceAddr(offset, idx int) string {
+	return fmt.Sprintf("10.%d.0.1/24", addrBase(offset, idx))
+}
+
+// addrBase 把「基准偏移 + 连接序号」折算到 addrBaseMin..addrBaseMax 区间内。
+func addrBase(offset, idx int) int {
 	if idx < 0 {
 		idx = 0
 	}
-	if idx > 240 { // 10.10.0.0/24 ~ 10.250.0.0/24
-		idx = 240
-	}
-	return fmt.Sprintf("10.%d.0.1/24", defaultAddrOctet+idx)
+	v := (offset%addrSpan + addrSpan) % addrSpan
+	return addrBaseMin + (v+idx)%addrSpan
 }
 
 // defaultInterfacePort 按序号给出默认监听端口：wg0 → 51820、wg1 → 51821。
@@ -488,14 +509,22 @@ func pickFreePort(others []model.Interface, start int) int {
 	return defaultInterfacePort(start)
 }
 
-// pickFreeAddr 从序号对应的默认网段开始顺延，返回第一个不与已有连接重叠的网段。
-func pickFreeAddr(others []model.Interface, start int) string {
+// pickFreeAddr 从「本机偏移 + 序号」对应的默认网段开始顺延，返回第一个可用的网段。
+//
+// avoid 是「本机已知、由另一台 NAS 占用」的网段（见 reservedSubnets）：本机内部唯一并不能
+// 保证两端不撞车 —— 两端各自算出的第 N 条连接会落在同一个网段，于是两端的设备地址成对重复
+// （都是 .2、.3…）。自动分配时一并避开，是唯一能在用户还没察觉之前就避免这个坑的时机。
+//
+// 只作用于自动分配：用户手工填的地址仍由用户决定。那份清单是「导入那一刻」的快照，
+// 可能已经过期，硬拦会让人连想改都改不掉（重叠时由体检持续报出来，见 inspect.go）。
+func pickFreeAddr(others []model.Interface, start, offset int, avoid []string) string {
 	for i := 0; i < autoAllocTries; i++ {
-		if a := defaultInterfaceAddr(start + i); !addrOverlapsAny(others, a) {
+		a := defaultInterfaceAddr(offset, start+i)
+		if !addrOverlapsAny(others, a) && !addrOverlapsAnyCIDR(avoid, a) {
 			return a
 		}
 	}
-	return defaultInterfaceAddr(start)
+	return defaultInterfaceAddr(offset, start)
 }
 
 // otherInterfaces 返回除 selfID 之外的全部连接，用于跨连接冲突检查与空位查找。
@@ -545,9 +574,39 @@ func addrOverlapsAny(others []model.Interface, cidr string) bool {
 	return false
 }
 
+// addrOverlapsAnyCIDR 判断网段是否与一份网段清单中的任意一项重叠。
+func addrOverlapsAnyCIDR(avoid []string, cidr string) bool {
+	_, n, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil {
+		return false
+	}
+	for _, c := range avoid {
+		if _, cn, err := net.ParseCIDR(strings.TrimSpace(c)); err == nil && cidrOverlap(n, cn) {
+			return true
+		}
+	}
+	return false
+}
+
 // cidrOverlap 判断两个网段是否有交集（不同协议族之间永远不重叠）。
 func cidrOverlap(a, b *net.IPNet) bool {
 	return a.Contains(b.IP) || b.Contains(a.IP)
+}
+
+// normalizeDNSMode 归一化「下发 DNS」的取值。
+//
+// 空值取默认（下发给设备）；历史值 host 一律按 client 处理 —— 它对应界面上的
+// 「NAS 也一起使用」，而这个行为**从未实现过**：本应用绝不修改 NAS 自身的系统解析
+// （见 internal/dnsserver 的安全边界）。对这类存量值报错只会让用户连「改个别的地方」
+// 都保存不了，所以静默归一；其它取值原样返回，交给校验去拒绝，不静默接受拼错的写法。
+func normalizeDNSMode(v string) string {
+	v = strings.TrimSpace(v)
+	switch v {
+	case "", model.DNSModeLegacyHost:
+		return model.DNSModeClient
+	default:
+		return v
+	}
 }
 
 func (s *Service) validateInterface(ctx context.Context, it *model.Interface, selfID int64) error {
@@ -566,10 +625,8 @@ func (s *Service) validateInterface(ctx context.Context, it *model.Interface, se
 	if err := validateIPList("域名解析服务器", it.DNS); err != nil {
 		return err
 	}
-	switch it.DNSMode {
-	case "client", "host", "off":
-	default:
-		return fmt.Errorf("「域名解析方式」取值不正确，请选择：仅下发给设备 / NAS 也一起使用 / 不参与")
+	if it.DNSMode != model.DNSModeClient && it.DNSMode != model.DNSModeOff {
+		return fmt.Errorf("「下发 DNS」取值不正确，请选择：下发给设备 / 不下发")
 	}
 	switch it.RouteTable {
 	case model.RouteTableOff, model.RouteTableClient:
@@ -582,7 +639,7 @@ func (s *Service) validateInterface(ctx context.Context, it *model.Interface, se
 	if err != nil {
 		return err
 	}
-	if err := checkInterfaceConflicts(it, others); err != nil {
+	if err := checkInterfaceConflicts(it, others, s.defaultAddrOffset(ctx)); err != nil {
 		return err
 	}
 
@@ -608,7 +665,10 @@ func (s *Service) validateInterface(ctx context.Context, it *model.Interface, se
 }
 
 // checkInterfaceConflicts 校验名称、监听端口与内部地址网段是否与其它连接冲突。
-func checkInterfaceConflicts(it *model.Interface, others []model.Interface) error {
+//
+// offset 是本机的网段基准偏移，只用于给出「建议换成哪个网段」——它必须与自动分配
+// 用的是同一个偏移，否则建议出来的地址可能又把别的连接撞上。
+func checkInterfaceConflicts(it *model.Interface, others []model.Interface, offset int) error {
 	for i := range others {
 		if others[i].Name == it.Name {
 			return fmt.Errorf("连接名称「%s」已经被使用了，请换一个名称", it.Name)
@@ -632,7 +692,7 @@ func checkInterfaceConflicts(it *model.Interface, others []model.Interface) erro
 				}
 				if cidrOverlap(an, on) {
 					return fmt.Errorf("内部地址网段 %s 与连接 %s 的 %s 重叠，请更换（例如 %s）",
-						a, others[i].Name, o, pickFreeAddr(others, defaultIndexFor(it.Name)))
+						a, others[i].Name, o, pickFreeAddr(others, defaultIndexFor(it.Name), offset, nil))
 				}
 			}
 		}
@@ -660,16 +720,4 @@ func (s *Service) nextInterfaceName(ctx context.Context) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("连接数量已达上限（最多 100 条），请先删除不再使用的连接")
-}
-
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
 }

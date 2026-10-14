@@ -66,12 +66,19 @@ func TestInterconnectRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.TunnelSubnet != "10.10.0.0/24" || created.PeerTunnelAddress != "10.10.0.2" {
-		t.Fatalf("隧道网段与对端地址不对：%s / %s", created.TunnelSubnet, created.PeerTunnelAddress)
+	// 隧道网段是 10.x.0.0/24：x 由**本机基准偏移**决定（同一台机器稳定、不同机器几乎不同），
+	// 因此这里只能断言形状与相对关系，不能写死具体网段 —— 写死就等于把"两台机器必然撞车"
+	// 当成契约，而那正是我们要去掉的行为。
+	if !strings.HasPrefix(created.TunnelSubnet, "10.") || !strings.HasSuffix(created.TunnelSubnet, ".0.0/24") {
+		t.Fatalf("隧道网段应形如 10.x.0.0/24，实际 %s", created.TunnelSubnet)
+	}
+	// 对端隧道地址必须是同一网段里的 .2
+	if want := subnetHost(t, created.TunnelSubnet, 2); created.PeerTunnelAddress != want {
+		t.Fatalf("对端隧道地址应为同网段里的 .2（%s），实际 %s", want, created.PeerTunnelAddress)
 	}
 	// 邀请里给对方的地址要带隧道网段掩码（对方直接拿它当连接地址）
-	if created.Invite.Peer.TunnelAddress != "10.10.0.2/24" {
-		t.Fatalf("邀请里的对端隧道地址应为 10.10.0.2/24，实际 %s", created.Invite.Peer.TunnelAddress)
+	if want := created.PeerTunnelAddress + "/24"; created.Invite.Peer.TunnelAddress != want {
+		t.Fatalf("邀请里的对端隧道地址应为 %s，实际 %s", want, created.Invite.Peer.TunnelAddress)
 	}
 	if created.Invite.Peer.TunnelSubnet != created.TunnelSubnet {
 		t.Fatalf("邀请里的隧道网段要与本机一致：%+v", created.Invite.Peer)
@@ -105,10 +112,11 @@ func TestInterconnectRoundTrip(t *testing.T) {
 		t.Fatalf("必须提醒「邀请文件含私钥」：%v", created.Warnings)
 	}
 
-	// A 本端：连接与对端条目
+	// A 本端：连接与对端条目（地址都由自动分配给出，因此只断言形状与相对关系）
+	myAddr := subnetHost(t, created.TunnelSubnet, 1) // 本机在隧道里占 .1
 	ifaceA := mustInterface(t, svcA)
-	if len(ifaceA.Addresses) != 1 || ifaceA.Addresses[0] != "10.10.0.1/24" {
-		t.Fatalf("A 的隧道地址应为 10.10.0.1/24：%v", ifaceA.Addresses)
+	if len(ifaceA.Addresses) != 1 || ifaceA.Addresses[0] != myAddr+"/24" {
+		t.Fatalf("A 的隧道地址应为 %s/24：%v", myAddr, ifaceA.Addresses)
 	}
 	if !ifaceA.AllowLAN {
 		t.Fatal("站点互联必须打开「允许设备访问家里内网」：对端局域网里的主机要靠它转发")
@@ -117,7 +125,7 @@ func TestInterconnectRoundTrip(t *testing.T) {
 		t.Fatalf("站点互联要用 client 路由方式（走本应用自己的策略路由表）：%s", ifaceA.RouteTable)
 	}
 	peersA := mustPeers(t, svcA, ifaceA.ID)
-	if got := peersA[0].AllowedIPs; len(got) != 2 || got[0] != "10.10.0.2/32" || got[1] != "192.168.2.0/24" {
+	if got := peersA[0].AllowedIPs; len(got) != 2 || got[0] != created.PeerTunnelAddress+"/32" || got[1] != "192.168.2.0/24" {
 		t.Fatalf("A 的对端准入地址应为对端隧道地址+对端内网：%v", got)
 	}
 	if got := peersA[0].ClientAllowedIPs; len(got) != 1 || got[0] != "192.168.1.0/24" {
@@ -140,8 +148,8 @@ func TestInterconnectRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	ifaceB := mustInterface(t, svcB)
-	if len(ifaceB.Addresses) != 1 || ifaceB.Addresses[0] != "10.10.0.2/24" {
-		t.Fatalf("B 的隧道地址应当由邀请给定：%v", ifaceB.Addresses)
+	if len(ifaceB.Addresses) != 1 || ifaceB.Addresses[0] != created.PeerTunnelAddress+"/24" {
+		t.Fatalf("B 的隧道地址应当由邀请给定（%s/24）：%v", created.PeerTunnelAddress, ifaceB.Addresses)
 	}
 	if !ifaceB.AllowLAN || ifaceB.RouteTable != model.RouteTableClient {
 		t.Fatalf("B 侧同样要打开内网访问并用 client 路由：%+v", ifaceB)
@@ -158,7 +166,7 @@ func TestInterconnectRoundTrip(t *testing.T) {
 	if peersB[0].PublicKey != created.Invite.Site.PublicKey {
 		t.Fatal("B 的对端条目应当记 A 的公钥")
 	}
-	if got := peersB[0].AllowedIPs; len(got) != 2 || got[0] != "10.10.0.1/32" || got[1] != "192.168.1.0/24" {
+	if got := peersB[0].AllowedIPs; len(got) != 2 || got[0] != myAddr+"/32" || got[1] != "192.168.1.0/24" {
 		t.Fatalf("B 的对端准入地址应为 A 的隧道地址+A 内网：%v", got)
 	}
 	// 这条断言是本次事故的回归：导入侧必须拿到与邀请一致的口令，
@@ -374,8 +382,8 @@ func TestInterconnectSecondLinkGetsOwnTunnel(t *testing.T) {
 	if second.TunnelSubnet == first.TunnelSubnet {
 		t.Fatalf("第二条互联应当自动换一个隧道网段：都是 %s", first.TunnelSubnet)
 	}
-	if second.PeerTunnelAddress != "10.11.0.2" {
-		t.Fatalf("第二条互联的对端地址应为新网段里的 .2：%s", second.PeerTunnelAddress)
+	if want := subnetHost(t, second.TunnelSubnet, 2); second.PeerTunnelAddress != want {
+		t.Fatalf("第二条互联的对端地址应为它自己网段里的 .2（%s）：%s", want, second.PeerTunnelAddress)
 	}
 }
 

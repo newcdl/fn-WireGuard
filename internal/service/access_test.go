@@ -142,6 +142,100 @@ func TestDiagnoseAccessConflicts(t *testing.T) {
 
 // TestDiagnoseAccessNoFalsePositives 一套自洽的配置不该产生任何矛盾结论 ——
 // 假警报会让用户学会忽略这些提示，那就等于没有提示。
+// TestDiagnoseAccessAddrOutsideTunnel 设备的登记地址全落在隧道之外必须被报出来。
+//
+// 这条此前完全静默：配置照常生成、二维码看起来完全正常，设备却怎么都连不上
+// （回包无路可走）。最容易踩到的路径是「为了避开两台 NAS 撞车改了连接网段，
+// 而旧设备地址没跟着改」—— 那时用户只会以为设备坏了。
+func TestDiagnoseAccessAddrOutsideTunnel(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+	fixedHomeLAN(t, svc, "172.31.0.0/24")
+
+	wg0, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 设备地址留在旧网段（例如连接网段后来从 10.99 改成了 10.10）
+	p, err := svc.CreatePeer(ctx, service.PeerInput{
+		InterfaceID: wg0.ID, Name: "旧手机", GenerateKeys: true,
+		AllowedIPs: []string{"10.99.0.2/32"}, Keepalive: 25, Enabled: boolPtr(true),
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issue := findAccessIssue(svc.DiagnoseAccess(ctx), "peer_addr_outside_tunnel")
+	if issue == nil {
+		t.Fatalf("必须报出「设备地址不在隧道网段内」，实际: %+v", svc.DiagnoseAccess(ctx))
+	}
+	if !strings.Contains(issue.Detail, "10.99.0.2/32") || !strings.Contains(issue.Detail, "10.10.0.0/24") {
+		t.Fatalf("要说清是哪个地址、落在哪个网段之外，实际: %s", issue.Detail)
+	}
+	if !strings.Contains(issue.Detail, "旧手机") || issue.Fix == "" {
+		t.Fatalf("要点名设备并给出处置办法，实际: %+v", issue)
+	}
+	// 处理入口在设备页：改的是那台设备的地址，不是这条连接的设置
+	if issue.To != "peers" {
+		t.Fatalf("处理入口应指向「我的设备」，实际: %q", issue.To)
+	}
+
+	// 生成二维码那一步也必须说 —— 用户就是在那里拿到配置的
+	res, err := svc.PeerConfig(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Warning, "不在本连接的隧道网段") {
+		t.Fatalf("生成配置时要给出这条提示，实际: %q", res.Warning)
+	}
+}
+
+// TestDiagnoseAccessSiteAdmitCross 站点条目放行的网段撞上本机另一条连接时必须报出来。
+//
+// 从本机（或它的设备）访问那个网段会被本地那条连接截住、根本到不了对端，
+// 而界面上原先一句话都没有 —— 用户只会以为「对端那台机器有问题」。
+func TestDiagnoseAccessSiteAdmitCross(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+	fixedHomeLAN(t, svc, "172.31.0.0/24")
+
+	site, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg0", Addresses: []string{"10.10.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
+		RouteTable: model.RouteTableClient,
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+		Name: "wg1", Addresses: []string{"10.11.0.1/24"}, Enabled: boolPtr(true), Autostart: boolPtr(true),
+	}, actor); err != nil {
+		t.Fatal(err)
+	}
+	// 站点条目：准入 = 对端 NAS 地址 + 一条放行网段；那条网段恰好是 wg1 的专用地址
+	if _, err := svc.CreatePeer(ctx, service.PeerInput{
+		InterfaceID: site.ID, Name: "对端 NAS", GenerateKeys: true, GeneratePSK: true,
+		AllowedIPs: []string{"10.10.0.2/32", "10.11.0.0/24"}, Keepalive: 25,
+		Enabled: boolPtr(true), Remark: service.InterconnectRemark,
+	}, actor); err != nil {
+		t.Fatal(err)
+	}
+
+	issue := findAccessIssue(svc.DiagnoseAccess(ctx), "site_admit_cross_interface")
+	if issue == nil {
+		t.Fatalf("必须报出「对端条目放行的网段撞本机另一条连接」，实际: %+v", svc.DiagnoseAccess(ctx))
+	}
+	if !strings.Contains(issue.Detail, "对端 NAS") || !strings.Contains(issue.Detail, "10.11") {
+		t.Fatalf("要说清是谁的哪一段放行撞了谁，实际: %s", issue.Detail)
+	}
+	if issue.Fix == "" {
+		t.Fatal("必须给出处置办法")
+	}
+}
+
 func TestDiagnoseAccessNoFalsePositives(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()

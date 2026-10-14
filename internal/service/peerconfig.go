@@ -32,13 +32,19 @@ type clientBaseline struct {
 }
 
 // baselineFor 计算一条连接的公共配置输入。
+//
+// DNS 必须取 clientDNS（下发给设备的实际取值），不能直接用 it.DNS：
+// 打开「内网域名解析」后，下发给设备的 DNS 会被替换成本连接的隧道地址。
+// 若这里用 it.DNS，就会出现「记录设备拿到什么」与「事后比对应当是什么」两套算法 ——
+// 结果只要那个开关开着，每台设备的「需重新扫码」标记就永远清不掉，
+// 连重新扫码也没用（因为重新生成的记录用的是另一套值）。真机反馈过。
 func (s *Service) baselineFor(ctx context.Context, it *model.Interface) (clientBaseline, error) {
 	pub, err := wgkey.PublicKey(it.PrivateKey)
 	if err != nil {
 		return clientBaseline{}, err
 	}
 	endpoint, _ := s.serverEndpoint(ctx, it)
-	return clientBaseline{endpoint: endpoint, serverPub: pub, dns: it.DNS, mtu: it.MTU}, nil
+	return clientBaseline{endpoint: endpoint, serverPub: pub, dns: s.clientDNS(ctx, it), mtu: it.MTU}, nil
 }
 
 // peerConfigFingerprint 计算某台设备**当前应当**拿到的配置指纹。

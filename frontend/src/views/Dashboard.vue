@@ -309,7 +309,6 @@ import { allHelpGroups } from '@/constants/fields'
 import { useBreakpoint } from '@/composables/useBreakpoint'
 import { useSystemHealth } from '@/composables/useSystemHealth'
 import { useTheme } from '@/composables/useTheme'
-import { useSession } from '@/stores/session'
 import { useRealtime } from '@/stores/realtime'
 import { formatBytes, formatRate, timeAgo } from '@/utils/format'
 import ViewSwitch from '@/components/ViewSwitch.vue'
@@ -321,7 +320,6 @@ const { mode: peersViewMode, isTable: peersIsTable } = useViewMode('dashboard-pe
 
 const router = useRouter()
 const realtime = useRealtime()
-const session = useSession()
 const { isMobile } = useBreakpoint()
 const { isDark } = useTheme()
 

@@ -960,30 +960,6 @@ function flowLayer(root: Element): SVGGElement {
 }
 
 /**
- * 保证 SVG 里有一个绿色箭头标记（只建一次）。
- * 用 marker 而不是自己画三角形：挂在边的 marker-end 上，方向自然就是「从 A 到 B」，
- * 也随线的粗细自动缩放。
- */
-function ensureArrow(root: Element): void {
-  if (root.querySelector('#fnwg-topo-arrow')) return
-  const ns = 'http://www.w3.org/2000/svg'
-  const defs = root.querySelector('defs') || root.insertBefore(document.createElementNS(ns, 'defs'), root.firstChild)
-  const marker = document.createElementNS(ns, 'marker')
-  marker.setAttribute('id', 'fnwg-topo-arrow')
-  marker.setAttribute('viewBox', '0 0 10 10')
-  marker.setAttribute('refX', '9')
-  marker.setAttribute('refY', '5')
-  marker.setAttribute('markerWidth', '6')
-  marker.setAttribute('markerHeight', '6')
-  marker.setAttribute('orient', 'auto')
-  const head = document.createElementNS(ns, 'path')
-  head.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z')
-  head.setAttribute('fill', FLOW_COLOR)
-  marker.appendChild(head)
-  defs.appendChild(marker)
-}
-
-/**
  * 把每个设备卡片提到同级最后（SVG 的叠放顺序由 DOM 顺序决定，没有 z-index）。
  *
  * 要求是「线永远在设备下面」：库把连线与节点分层渲染，重绘后顺序还可能变，

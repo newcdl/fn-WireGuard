@@ -363,49 +363,64 @@ func TestInterfaceCrossConnectionConflicts(t *testing.T) {
 
 // TestInterfaceAutoAllocation 回归：地址与端口留空时应按连接序号自动错开，
 // 新建第二条连接不必手工改端口和网段。
+//
+// 网段**不写死具体值**：默认网段的起点带一个按本机随机的基准偏移（见 defaultAddrOffset），
+// 两台 NAS 的第 N 条连接因此不再必然选到同一个网段。这里断言的是「按序号错开」这条**相对关系**
+// 与形状 —— 写死等于把"两台机器必然撞车"当成契约，而那正是要修掉的行为。
 func TestInterfaceAutoAllocation(t *testing.T) {
 	svc, _ := newTestEnv(t)
 	ctx := context.Background()
 	actor := service.Actor{Username: "tester"}
 
-	// 名称、地址、端口全部留空 → 自动分配 wg0 / 10.10.0.1/24 / 51820
+	// 名称、地址、端口全部留空 → 自动分配 wg0 / 10.x.0.1/24 / 51820
 	first, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: boolPtr(true), Autostart: boolPtr(true)}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Name != "wg0" || first.ListenPort != 51820 || first.Addresses[0] != "10.10.0.1/24" {
+	if first.Name != "wg0" || first.ListenPort != 51820 {
 		t.Fatalf("首条连接的默认值不正确: %s %d %v", first.Name, first.ListenPort, first.Addresses)
 	}
+	base := thirdOctet(t, first.Addresses[0])
 
-	// 第二条同样留空 → 名称顺延为 wg1，地址与端口同步递增，从源头避开冲突
+	// 第二条同样留空 → 名称顺延为 wg1，网段与端口同步递增，从源头避开冲突
 	second, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{Enabled: boolPtr(true), Autostart: boolPtr(true)}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Name != "wg1" || second.ListenPort != 51821 || second.Addresses[0] != "10.11.0.1/24" {
+	if second.Name != "wg1" || second.ListenPort != 51821 {
 		t.Fatalf("第二条连接的默认值未随名称递增: %s %d %v", second.Name, second.ListenPort, second.Addresses)
 	}
+	if got := octetDelta(t, base, second.Addresses[0]); got != 1 {
+		t.Fatalf("第二条连接的网段应比首条正好后移一位，实际后移 %d：%v", got, second.Addresses)
+	}
 
-	// 指定名称 wg5、地址与端口留空 → 按名称序号给出 10.15.0.1/24 + 51825
+	// 指定名称 wg5、地址与端口留空 → 端口按名称序号给出 51825，网段后移 5 位
 	third, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
 		Name: "wg5", Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if third.ListenPort != 51825 || third.Addresses[0] != "10.15.0.1/24" {
+	if third.ListenPort != 51825 {
 		t.Fatalf("按名称序号分配不正确: %d %v", third.ListenPort, third.Addresses)
 	}
+	if got := octetDelta(t, base, third.Addresses[0]); got != 5 {
+		t.Fatalf("wg5 的网段应比首条后移 5 位，实际后移 %d：%v", got, third.Addresses)
+	}
 
-	// 非 wgN 命名从 0 号位起顺延，跳过已被占用的端口与网段，而不是直接报冲突
+	// 非 wgN 命名从 0 号位起顺延，跳过已被占用的端口与网段，而不是直接报冲突：
+	// 端口落到第一个空闲的 51822，网段落到首条之后的第一个空闲位（后移 2 位）
 	fourth, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
 		Name: "office", Enabled: boolPtr(true), Autostart: boolPtr(true),
 	}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fourth.ListenPort != 51822 || fourth.Addresses[0] != "10.12.0.1/24" {
-		t.Fatalf("未跳过已占用的端口/网段: %d %v", fourth.ListenPort, fourth.Addresses)
+	if fourth.ListenPort != 51822 {
+		t.Fatalf("未跳过已占用的端口: %d %v", fourth.ListenPort, fourth.Addresses)
+	}
+	if got := octetDelta(t, base, fourth.Addresses[0]); got != 2 {
+		t.Fatalf("office 的网段应落到首条之后的第一个空闲位（后移 2 位），实际后移 %d：%v", got, fourth.Addresses)
 	}
 
 	// 用户显式指定的取值必须原样保留，不被自动分配覆盖

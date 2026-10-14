@@ -163,8 +163,22 @@ func (s *Service) createPeer(ctx context.Context, in PeerInput, a Actor) (*model
 		if err != nil {
 			return nil, err
 		}
-		if ip := nextFreeIP(it, existing); ip != "" {
-			p.AllowedIPs = append(p.AllowedIPs, ip)
+		// 手填了 IPv4 就不再自动追加一个。
+		//
+		// 界面恒传 auto_address=true（它的含义是「允许自动分配」），而这里原先只要这个标志
+		// 为真就追加 —— 于是用户手填 `10.20.0.10/32` 之后，设备身上还挂着自动挑的
+		// `10.20.0.3/32`。"我把它改成不重复的地址了"就是这么失效的：多出来的那个地址照样
+		// 与对端的设备撞车，而界面上完全看不出来（真机踩到过：日志里一台设备的准入地址里
+		// 同时有 10.206.0.10/32 与 10.206.0.3/32）。
+		if !hasIPv4Addr(p.AllowedIPs) {
+			// 手填的那一项也要算作「已占用」，否则自动分配可能挑到同一个地址。
+			used := existing
+			if len(p.AllowedIPs) > 0 {
+				used = append([]model.Peer{{AllowedIPs: p.AllowedIPs}}, existing...)
+			}
+			if ip := nextFreeIP(it, used); ip != "" {
+				p.AllowedIPs = append(p.AllowedIPs, ip)
+			}
 		}
 	}
 	if p.Keepalive == 0 && p.EndpointHost == "" {
@@ -281,7 +295,6 @@ func (s *Service) UpdatePeer(ctx context.Context, id int64, in PeerInput, a Acto
 		}
 		p.PublicKey = in.PublicKey
 	}
-	p.PresharedKey = strings.TrimSpace(in.PresharedKey)
 	p.RouteMode = in.RouteMode
 	p.ClientAllowedIPs = in.ClientAllowedIPs
 	p.EndpointHost = strings.TrimSpace(in.EndpointHost)
@@ -316,12 +329,28 @@ func (s *Service) UpdatePeer(ctx context.Context, id int64, in PeerInput, a Acto
 	} else if in.ClientPrivateKey != "" {
 		p.ClientPrivateKey = in.ClientPrivateKey
 	}
+	// 二次加密口令的三个来源，别混：
+	//   - GeneratePSK=true：用户明确点了「生成新口令」；
+	//   - PresharedKey 非空：调用方明确给出（轮换或外部录入）；
+	//   - 两者都为空：**保持原值**，这不是「清空」。
+	//
+	// 第三条修的是一处会静默损坏数据的缺陷：设备编辑抽屉（frontend 的 Peers.vue）根本不提交
+	// preshared_key 字段，而这里**原先无条件用空值覆盖** —— 于是「编辑设备改个名字或换个地址」
+	// 就会把它的二次加密口令清空；设备手上那份配置还带着旧口令，握手被对端直接拒绝，现象只是
+	// 「一直离线」，成因（口令被清掉）在界面上完全看不出来。真机日志里能读出来：
+	//
+	//	更新节点 MAC（…）（通行范围、清除二次加密口令）
+	//
+	// 将来若确实需要「清除口令」这个能力，请另加一个显式开关，不要再用「空值 = 清空」——
+	// 那正是这次故障的根源。
 	if in.GeneratePSK {
 		psk, err := wgkey.GeneratePSK()
 		if err != nil {
 			return nil, err
 		}
 		p.PresharedKey = psk
+	} else if v := strings.TrimSpace(in.PresharedKey); v != "" {
+		p.PresharedKey = v
 	}
 	if err := s.validatePeer(ctx, p, id); err != nil {
 		return nil, err
@@ -472,9 +501,37 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		}
 		warn += msg
 	}
+	// 设备的登记地址全落在隧道之外：配置照常生成、二维码看起来完全正常，设备却怎么都连不上
+	//（回包无路可走）。最常见的是「为了避开两台 NAS 撞车改了连接网段，而旧设备地址没跟着改」——
+	// 那句话只在二维码这一步说得出，用户也就只有在这一步才可能看到（见 access.go 的同一判据）。
+	if peerAddrsOutsideTunnel(it, p) {
+		msg := fmt.Sprintf("这台设备的地址（%s）不在本连接的隧道网段 %s 内：它的配置里会带一个隧道外的地址，"+
+			"握手能成、回包却没有路可走，现象只是「怎么都连不上」。请到「我的设备」把它改成隧道网段内的地址",
+			strings.Join(p.AllowedIPs, "、"), strings.Join(cidrStrings(it.Addresses), "、"))
+		if warn != "" {
+			warn += "；"
+		}
+		warn += msg
+	}
+	// 设备拿到的 DNS 会是本机隧道地址时，必须说清「它只在连接期间可用」。
+	//
+	// 那个地址只有在隧道建立后才存在：断开后如果客户端没把 DNS 还原（直接退出客户端、
+	// 睡眠、崩溃、切 Wi-Fi 都会留下这种状态），设备上的域名解析会全部失败 ——
+	// 现象是「所有按域名访问的都不通」，而 FN Connect 这类正是按域名访问的功能。
+	// 用户完全想不到与这条连接有关（真机反馈过）。这一步服务端无法代劳，只能提前提醒。
+	if s.dnsResolveOn(ctx) {
+		if host := firstIPv4Host(it.Addresses); host != "" && containsString(s.clientDNS(ctx, it), host) {
+			if warn != "" {
+				warn += "；"
+			}
+			warn += fmt.Sprintf("这台设备的 DNS 会被指向本机隧道地址 %s，它**只在连接建立期间可用**："+
+				"断开连接后如果这台设备上不了网（尤其是访问按域名访问的服务），"+
+				"请把它网卡上的 DNS 改回「自动获取」—— 客户端异常退出时可能没把 DNS 还原，服务端无法代劳", host)
+		}
+	}
 	clientAddrs, extraRoutes := wgconf.SplitClientAndServerIPs(it, p)
 	clientAllowed := s.clientAllowedIPs(ctx, it, p, extraRoutes)
-	conf := wgconf.RenderClient(serverPub, it, p, wgconf.RenderClientOptions{
+	conf := wgconf.RenderClient(serverPub, p, wgconf.RenderClientOptions{
 		Endpoint:         endpoint,
 		ClientPrivateKey: p.ClientPrivateKey,
 		ClientAddress:    clientAddrs,
@@ -510,22 +567,44 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 	}, nil
 }
 
-// clientDNS 返回下发给设备的 DNS 服务器地址。
+// clientDNS 返回下发给设备的 DNS 服务器地址。三种情况，按优先级：
 //
-// 打开了「内网域名解析」时，设备必须把 NAS 当作解析器，否则它解析不了家里设备名：
-// 此时下发的是**本连接的隧道地址**，而连接里配置的 DNS 变成本应用解析器的上游。
-// 关闭时保持原样（下发连接里配置的 DNS），行为与升级前完全一致。
+//  1. 打开「内网域名解析」时下发**本连接的隧道地址**：设备必须把 NAS 当作解析器，
+//     否则它解析不了家里设备名。这是用户显式打开的另一个开关，优先级高于连接的
+//     「下发 DNS」—— 否则「不下发」会让这个功能静默失效，而界面上看不出原因。
+//  2. 「下发 DNS = 不下发」时不下发任何 DNS。连接里那一栏仍作为本应用解析器的上游
+//     （见 reconcile.syncDNS 的上游取法），只是不推给设备。
+//  3. 其余情况下发连接里配置的 DNS（与升级前行为一致）。
 func (s *Service) clientDNS(ctx context.Context, it *model.Interface) []string {
-	if s.Store.GetSetting(ctx, model.SettingDNSResolve, "") != "1" {
+	if s.dnsResolveOn(ctx) {
+		if host := firstIPv4Host(it.Addresses); host != "" {
+			return []string{host}
+		}
+		// 没有可用的 IPv4 隧道地址时退回原值：宁可不生效，也不要下发一个设备连不上的地址
 		return it.DNS
 	}
-	for _, a := range it.Addresses {
+	if it.DNSMode == model.DNSModeOff {
+		return nil
+	}
+	return it.DNS
+}
+
+// dnsResolveOn 判断「内网域名解析」总开关是否打开。
+//
+// 它同时决定「下发给设备的 DNS」与「本机是否起解析服务」，两处必须同源：
+// 各写一遍字面量迟早会出现「设备被指向本机、本机却没起解析服务」。
+func (s *Service) dnsResolveOn(ctx context.Context) bool {
+	return s.Store.GetSetting(ctx, model.SettingDNSResolve, "") == "1"
+}
+
+// firstIPv4Host 返回地址清单里第一个 IPv4 地址（去掉掩码）；没有则返回空串。
+func firstIPv4Host(addrs []string) string {
+	for _, a := range addrs {
 		if ip, _, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil && ip.To4() != nil {
-			return []string{ip.String()}
+			return ip.String()
 		}
 	}
-	// 没有可用的 IPv4 隧道地址时退回原值：宁可不生效，也不要下发一个设备连不上的地址
-	return it.DNS
+	return ""
 }
 
 // clientAllowedIPs 生成客户端侧的通行范围（决定设备上哪些流量走隧道）。
@@ -698,6 +777,164 @@ func (s *Service) validatePeer(ctx context.Context, p *model.Peer, selfID int64)
 		}
 		if sameStringSet(other.AllowedIPs, p.AllowedIPs) && len(p.AllowedIPs) > 0 {
 			return fmt.Errorf("「允许通行的地址」与设备「%s」完全相同，两台设备会冲突，请修改后重试", other.Name)
+		}
+	}
+	return s.checkPeerAddrOverlap(ctx, p, selfID)
+}
+
+// hasIPv4Addr 判断地址列表里是否已经有 IPv4 项。
+func hasIPv4Addr(list []string) bool {
+	for _, a := range list {
+		if ip, _, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil && ip.To4() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOverlaps 判断「一个主机地址」（/32）是否与另一项声明冲突。
+//
+// 只从一侧判断（主机地址是否落在对方声明的范围里）：另一侧若是更宽的网段（例如有人把设备
+// 写成 `10.20.0.9/24`），那它确实声明了整段，落在其中的主机地址就真的会与它抢流量。
+func hostOverlaps(host, other string) bool {
+	hip, _, err := net.ParseCIDR(strings.TrimSpace(host))
+	if err != nil {
+		return false
+	}
+	_, on, err := net.ParseCIDR(strings.TrimSpace(other))
+	if err != nil {
+		return false
+	}
+	return on.Contains(hip)
+}
+
+// tunnelPrefixLens 取本连接隧道网段的掩码长度（v4 → 前缀长度）。
+//
+// 有多个网段时取**最长**的那个：判据是「声明是否细到能与设备地址直接比较」，
+// 取最长的等于用最严的那条网段做门槛。
+func tunnelPrefixLens(it *model.Interface) map[int]int {
+	out := map[int]int{}
+	for _, a := range it.Addresses {
+		_, n, err := net.ParseCIDR(strings.TrimSpace(a))
+		if err != nil {
+			continue
+		}
+		fam := 6
+		if n.IP.To4() != nil {
+			fam = 4
+		}
+		ones, _ := n.Mask.Size()
+		if cur, ok := out[fam]; !ok || ones > cur {
+			out[fam] = ones
+		}
+	}
+	return out
+}
+
+// comparableWithTunnel 判断「对端条目声明的一项」是否细到能与本机设备地址直接比较。
+//
+// 比本连接隧道网段**更宽**的声明一律跳过：那是「对端整个地址空间都能进来」这类准入声明
+// （例如把对端内网写成 10.0.0.0/8），本机自己的隧道地址本来就落在它里面 ——
+// 拿它来比会把这条连接上的每一台设备都判成冲突，用户什么也做不了。
+func comparableWithTunnel(entry string, tunnelOnes map[int]int) bool {
+	_, n, err := net.ParseCIDR(strings.TrimSpace(entry))
+	if err != nil {
+		return false
+	}
+	fam := 6
+	if n.IP.To4() != nil {
+		fam = 4
+	}
+	ones, _ := n.Mask.Size()
+	limit, ok := tunnelOnes[fam]
+	if !ok {
+		return true // 本连接没有这一族的网段：不做判断，交给其它校验
+	}
+	return ones >= limit
+}
+
+// checkPeerAddrOverlap 检查这台设备的隧道地址是否与「本机这条连接的专用地址」或
+// 「同一连接里其它条目已占用的隧道地址」**重叠**。
+//
+// 为什么必须拦「重叠」而不只是「完全相同」（真机踩到过）：WireGuard 的准入地址是一张
+// 按前缀索引的表，本机发往 X 的包会交给「声明了 X 的那个节点」。只要两个节点都声明了同一个
+// 地址，其中一个就必然收不到 —— 而只比对「集合完全相同」时，
+// {10.20.0.3/32} 与 {10.20.0.3/32, 192.168.2.0/24} 会被判成「不冲突」而放行，
+// 于是「设备」与「对端 NAS 条目」抢同一个地址也能存下来：对端 NAS 在界面上看着在线
+// （握手走的是公钥与对外地址，与内网地址无关），实际永远不通，且没有任何提示。
+//
+// 两类**不算冲突**的项要先排除，否则会制造大量假冲突：
+//
+//  1. 对端内网网段（192.168.2.0/24 这类）不是「某个节点的隧道地址」，它们落在隧道之外，
+//     在取「本连接隧道内的地址」时就已经被排除；
+//  2. 比本连接隧道网段更宽的声明，见 comparableWithTunnel。
+func (s *Service) checkPeerAddrOverlap(ctx context.Context, p *model.Peer, selfID int64) error {
+	it, err := s.Store.GetInterface(ctx, p.InterfaceID)
+	if err != nil {
+		return nil // 连接读不到时另有校验报错，不在这里重复报
+	}
+	tunnel := subnetListOf(it)
+	// deviceAddrs 是**这台设备自己**的隧道地址 = 准入地址里落在本连接隧道网段内的那些。
+	//
+	// 为什么不用 p.AllowedIPs 直接比：站点条目的准入地址里还带着「对端内网网段」
+	//（那些是"允许从哪些源地址进来"，不是某台设备的地址），混在一起比会把
+	// 正常的对端网段也判成冲突。
+	deviceAddrs := []string{}
+	for _, a := range p.AllowedIPs {
+		for _, sn := range tunnel {
+			if subnetContains(sn, a) {
+				deviceAddrs = append(deviceAddrs, a)
+				break
+			}
+		}
+	}
+	if len(deviceAddrs) == 0 {
+		return nil
+	}
+	// 与「本机这条连接的专用地址」冲突：那是把设备配成了 NAS 自己。
+	//
+	// 这里必须把连接地址收敛成**它自己那一个地址**再比（10.10.0.1/24 → 10.10.0.1/32）：
+	// 拿 /24 整段去比的话，同网段里的每一台设备都会被判成「与 NAS 冲突」（它们本来就该
+	// 落在这个网段里）—— 那会把所有正常配置全部拦下。
+	for _, a := range it.Addresses {
+		host := hostCIDR(a)
+		if host == "" {
+			continue
+		}
+		for _, d := range deviceAddrs {
+			if hostOverlaps(host, d) {
+				return fmt.Errorf("「分配给这台设备的内部地址」%s 与本机这条连接的专用地址 %s 是同一个地址："+
+					"设备会和 NAS 抢同一个地址，请给设备换一个（例如该网段里靠后的位置）", d, a)
+			}
+		}
+	}
+	peers, err := s.Store.ListPeers(ctx, p.InterfaceID)
+	if err != nil {
+		return nil
+	}
+	tunnelOnes := tunnelPrefixLens(it)
+	for i := range peers {
+		other := &peers[i]
+		if other.ID == selfID {
+			continue
+		}
+		for _, o := range tunnelAddrsOf(it, other) {
+			if !comparableWithTunnel(o, tunnelOnes) {
+				continue
+			}
+			for _, d := range deviceAddrs {
+				if cidrOverlaps(d, o) {
+					who := "设备「" + other.Name + "」"
+					if isSitePeer(other) {
+						// 这一条最要紧：它意味着「能访问对端 NAS、却访问不了对端设备」，
+						// 而现象与这个地址的关系用户完全推不出来。
+						who = "对端 NAS 条目「" + other.Name + "」"
+					}
+					return fmt.Errorf("「分配给这台设备的内部地址」%s 与 %s 已占用的 %s 重叠："+
+						"同一连接里两个条目声明同一个地址时，本机只会把发往它的流量交给其中一个，"+
+						"另一个（往往就是对端的设备）会永远访问不到。请换一个地址", d, who, o)
+				}
+			}
 		}
 	}
 	return nil

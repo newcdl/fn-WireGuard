@@ -247,6 +247,28 @@ func TestJudgeInspectProblems(t *testing.T) {
 			level:  InspectWarning,
 			gone:   []string{"iface-down", "endpoint"},
 		},
+		{
+			// 两端设备地址成对重复的成因之一，而现象只是「访问不了对端的某几台设备」——
+			// 与成因之间的关系用户完全推不出来，必须由体检持续说出来。
+			name: "本机连接网段与对端已占用网段重叠",
+			break_: func(f *inspectFacts) {
+				f.SiteOccupied = []string{"10.12.0.0/24"}
+				f.SiteOverlap = []string{"连接「wg2」的 10.12.0.0/24"}
+			},
+			key:   "site-subnet-overlap",
+			level: InspectWarning,
+		},
+		{
+			// 有台账但不重叠时必须报「没重复」而不是警告：误报会让人去改本来没问题的网段。
+			// 没有台账（老邀请导入的）时则整条不出现 —— 宁可不说话，也不说一句无用的结论。
+			name: "有对端台账但没有重叠",
+			break_: func(f *inspectFacts) {
+				f.SiteOccupied = []string{"10.12.0.0/24"}
+				f.SiteOverlap = nil
+			},
+			key:   "site-subnet-overlap",
+			level: InspectOK,
+		},
 	}
 
 	for _, c := range cases {

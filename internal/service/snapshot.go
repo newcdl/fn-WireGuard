@@ -539,7 +539,9 @@ func compareInterface(old, cur model.Interface) []string {
 	d = eqInt(d, "防火墙标记", old.FWMark, cur.FWMark)
 	d = eqList(d, "隧道地址", old.Addresses, cur.Addresses)
 	d = eqList(d, "下发的 DNS", old.DNS, cur.DNS)
-	d = eqStr(d, "DNS 模式", old.DNSMode, cur.DNSMode)
+	// 两边都归一后再比：历史值 host 与 client 是同一件事（见 normalizeDNSMode），
+	// 直接用原值比会让「升级后第一次对比」凭空多出一条差异。
+	d = eqStr(d, "下发 DNS 的开关", normalizeDNSMode(old.DNSMode), normalizeDNSMode(cur.DNSMode))
 	d = eqStr(d, "路由表", old.RouteTable, cur.RouteTable)
 	d = eqStr(d, "启动前脚本", old.PreUp, cur.PreUp)
 	d = eqStr(d, "启动后脚本", old.PostUp, cur.PostUp)

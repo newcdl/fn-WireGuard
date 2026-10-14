@@ -33,7 +33,7 @@
 import { Select } from '@element-plus/icons-vue'
 import type { ScenarioPreset } from '@/constants/fields'
 
-const props = withDefaults(
+withDefaults(
   defineProps<{
     modelValue?: string
     presets: ScenarioPreset[]

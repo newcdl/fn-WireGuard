@@ -239,6 +239,17 @@ type inspectFacts struct {
 	// BackupEnabled / BackupLast 计划备份的开关与最近一次结果。
 	BackupEnabled bool
 	BackupLast    *BackupRunState
+	// SiteOccupied 是本机已知的「另一台 NAS 已占用网段」（各站点条目上记着的台账）；
+	// SiteOverlap 是它与本机连接网段重叠的那些。
+	//
+	// 这是「两端设备地址成对重复」里**事后也无从自查**的那一类：现象只是
+	// 「访问不了对端的某几台设备」，因此必须由体检持续说出来，而不是只在导入那一刻提示一次。
+	//
+	// 「往站点互联连接上直接加设备」那类**不在这里报**：它发生在用户自己的操作当时，
+	// 添加设备时有一次确认提醒就够了（见 frontend 的 Peers.vue）—— 报成常驻待处理，
+	// 只会让顶栏长期挂着一条用户已经知情并接受的事，而待办清单一旦开始说无用的话就没人看了。
+	SiteOccupied []string
+	SiteOverlap  []string
 }
 
 // InspectChecks 做一次即时判定，不落库。
@@ -275,6 +286,9 @@ func (s *Service) inspectFacts(ctx context.Context) inspectFacts {
 	f.Gateway, f.HasGateway = LoadGatewayFact(ctx, s.Store)
 	f.BackupEnabled = LoadBackupPlan(ctx, s.Store).Enabled
 	f.BackupLast = loadBackupRunState(ctx, s.Store)
+	// 站点互联引发的地址撞车（见判定 ⑬）：读不到就当没有，不因此让整份报告缺项。
+	f.SiteOccupied = s.reservedSubnets(ctx)
+	f.SiteOverlap = s.siteReservedOverlaps(ctx, f.SiteOccupied)
 	return f
 }
 
@@ -285,7 +299,8 @@ func (s *Service) inspectFacts(ctx context.Context) inspectFacts {
 // （用户以为巡检过了就等于没问题），所以每一条都有对应用例。
 //
 // 顺序即重要性：后台服务 → 运行模式 → 下发结果 → 系统网络 → 桌面入口 → 连接 →
-// 内网访问 → 隔离 → 访问控制冲突 → 残留网卡 → 对外地址 → 通知 → 解析 → 备份。
+// 内网访问 → 隔离 → 访问控制冲突 → 残留网卡 → 对外地址 → 通知 → 解析 → 备份 →
+// 站点互联的地址撞车（本机网段与对端已占用网段重叠）。
 func judgeInspect(f inspectFacts) []InspectItem {
 	out := []InspectItem{}
 
@@ -693,6 +708,34 @@ func judgeInspect(f inspectFacts) []InspectItem {
 				Key: "backup", Level: InspectOK,
 				Title:  "计划备份正常",
 				Detail: detail + "。",
+			})
+		}
+	}
+
+	// ⑬ 本机连接网段与「另一台 NAS 已占用网段」重叠。
+	//
+	// 不报成 error：隧道本身仍然是通的，只是那几台设备互相访问不到 ——
+	// 报成 error 会让人以为整条组网断了，去查一通端口与公钥，方向全错。
+	// 没有对端台账（老邀请导入的、或还没导入过）时不产生任何条目：宁可不说话，也不说一句无用的结论。
+	if len(f.SiteOccupied) > 0 {
+		if len(f.SiteOverlap) > 0 {
+			out = append(out, InspectItem{
+				Key: "site-subnet-overlap", Level: InspectWarning,
+				Title: "本机连接网段与另一台 NAS 已占用的网段重复",
+				Detail: strings.Join(f.SiteOverlap, "；") + " 与另一台 NAS 已占用的网段重叠。" +
+					"两端同网段里的设备会拿到相同的地址，互相访问会被本机直连路由截住（永远不通），" +
+					"表现为「能访问对端 NAS，却访问不了对端的某几台设备」。",
+				Fix: "到「我的连接」把上面那条连接的「本机专用地址」换成别的网段（新建时留空会自动挑一个不冲突的）；" +
+					"改完该连接下的设备需要重新扫码一次。",
+				To: "interfaces",
+			})
+		} else {
+			out = append(out, InspectItem{
+				Key: "site-subnet-overlap", Level: InspectOK,
+				Title:  "本机网段与另一台 NAS 已占用的网段没有重复",
+				Detail: fmt.Sprintf("对端已占用 %s，本机连接都避开了。", strings.Join(f.SiteOccupied, "、")),
+				Fix: "无需处理。这份清单是导入那一刻对方的占用情况，对方之后新增的连接不会同步过来；" +
+					"本机新建连接时请留意不要与对端撞车。",
 			})
 		}
 	}

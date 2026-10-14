@@ -42,7 +42,7 @@ func (s *Service) ImportConf(ctx context.Context, text, nameOverride string, a A
 		MTU:        f.Interface.MTU,
 		Addresses:  f.Interface.Addresses,
 		DNS:        f.Interface.DNS,
-		DNSMode:    "client",
+		DNSMode:    model.DNSModeClient,
 		RouteTable: "auto",
 		PostUp:     strings.Join(f.Interface.PostUp, "\n"),
 		PostDown:   strings.Join(f.Interface.PostDown, "\n"),
@@ -466,6 +466,18 @@ func (s *Service) applyBackupPayload(ctx context.Context, payload *BackupPayload
 	// 恢复设置：全量备份包含全部设置项，逐项覆盖写入。
 	for k, v := range payload.Settings {
 		if k == "" {
+			continue
+		}
+		// 安装标识**不随备份走**：它是「这台机器是谁」，而「默认网段的按机器偏移」正是
+		// 从它派生的。换机恢复时若沿用备份里的那一份，新机器会与源机器算出同一个基准，
+		// 两台 NAS 的默认网段照旧成对重复 —— 那正是这个标识要解决的问题。
+		// 检测到「备份来自另一台机器」时留痕，让用户知道本机没有沿用那份标识。
+		if k == SettingInstallID {
+			if cur := strings.TrimSpace(s.Store.GetSetting(ctx, SettingInstallID, "")); cur != "" && cur != strings.TrimSpace(v) {
+				_ = s.Store.AddLog(ctx, "warn", "backup",
+					"备份来自另一台机器（安装标识不同）：本机继续使用自己的标识",
+					"这是刻意的：两台机器共用标识会让新建连接的默认网段撞在一起")
+			}
 			continue
 		}
 		if err := s.Store.SetSetting(ctx, k, v); err != nil {

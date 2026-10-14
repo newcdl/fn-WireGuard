@@ -133,11 +133,69 @@
         <div class="fnwg-hint">{{ S.interconnect_listen_port.hint }}</div>
 
         <div style="margin-top: 10px">
-          <el-button type="primary" :loading="importing" @click="doImport">导入</el-button>
+          <el-button :loading="previewing" @click="doPreview">检查一下（先看会做什么）</el-button>
           <span class="fnwg-hint" style="margin-left: 10px">
-            导入会把本机已有的配置也检查一遍：隧道网段冲突、两端内网网段相同、公钥或端口重复都会当场拒绝并说明原因
+            检查会把本机已有配置一并核对：隧道网段冲突、两端内网网段相同、公钥或端口重复都会当场说明
           </span>
         </div>
+
+        <template v-if="preview">
+          <el-alert
+            v-for="(w, i) in preview.warnings"
+            :key="i"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="w"
+            style="margin: 10px 0 0"
+          />
+          <el-descriptions :column="isMobile ? 1 : 2" border size="small" style="margin-top: 12px">
+            <el-descriptions-item label="将要新建的连接">{{ preview.interface_name }}</el-descriptions-item>
+            <el-descriptions-item label="隧道地址">{{ preview.tunnel_address }}</el-descriptions-item>
+            <el-descriptions-item label="隧道网段">{{ preview.tunnel_subnet }}</el-descriptions-item>
+            <el-descriptions-item label="对端名称">{{ preview.peer_name }}</el-descriptions-item>
+            <el-descriptions-item label="本机监听端口">
+              <span class="fnwg-mono">{{ preview.listen_port }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="对端地址">
+              <span class="fnwg-mono">{{ preview.peer_endpoint || '未提供（由对端发起连接）' }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="放行对端来源" :span="2">
+              <span class="fnwg-mono">{{ preview.allowed_ips.join('、') }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="本机暴露给对端" :span="2">
+              <span class="fnwg-mono">{{ preview.client_allowed_ips.join('、') }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="会写进策略路由表的网段" :span="2">
+              <span v-if="preview.route_subnets.length" class="fnwg-mono">
+                {{ preview.route_subnets.join('、') }}
+              </span>
+              <span v-else class="fnwg-hint">无（放行范围都落在本连接的隧道网段内）</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="对端已占用的网段" :span="2">
+              <span v-if="preview.occupied_by_peer.length" class="fnwg-mono">
+                {{ preview.occupied_by_peer.join('、') }}
+              </span>
+              <span v-else class="fnwg-hint">邀请里没有这项信息（对方版本较旧，或对方也没有其它连接）</span>
+            </el-descriptions-item>
+          </el-descriptions>
+          <div class="fnwg-hint" style="margin-top: 8px">
+            点「确认导入」后，上面这些内容就会建到本机（随时可在「我的连接 / 我的设备」里删除）。
+          </div>
+          <div style="margin-top: 10px">
+            <el-button
+              type="primary"
+              :loading="importing"
+              :disabled="!previewFresh"
+              @click="doImport"
+            >
+              确认导入
+            </el-button>
+            <span v-if="!previewFresh" class="fnwg-hint" style="margin-left: 10px">
+              上面的内容已经变了，请重新点一次「检查一下」
+            </span>
+          </div>
+        </template>
 
         <template v-if="imported">
           <el-alert
@@ -277,7 +335,10 @@ import { ElMessage } from 'element-plus'
 import { api } from '@/api/client'
 import type {
   InterconnectCreated,
+  InterconnectImportInput,
   InterconnectImported,
+  InterconnectInput,
+  InterconnectPreview,
   NetworkCheckResult,
   WgInterface,
   WgPeer,
@@ -314,6 +375,16 @@ const saving = ref(false)
 const importing = ref(false)
 const created = ref<InterconnectCreated | null>(null)
 const imported = ref<InterconnectImported | null>(null)
+const previewing = ref(false)
+const preview = ref<InterconnectPreview | null>(null)
+/**
+ * 这份预检是「基于什么输入」算出来的。
+ *
+ * 必须记下来并在确认前比对：用户先点了检查、又改了粘贴的文本或端口，
+ * 若还能确认，他就是在「A 的清单」上按了确认、实际执行下去的却是 B ——
+ * 这类不一致只能靠事后比对发现，所以在这里直接拦住（见 previewFresh）。
+ */
+const previewForKey = ref('')
 const importText = ref('')
 // 端口用文本承载：留空表示自动分配（数字输入框在「留空」这个语义上不好用）
 const importPortText = ref('')
@@ -424,13 +495,22 @@ async function showExisting(): Promise<void> {
 async function create(): Promise<void> {
   saving.value = true
   try {
-    created.value = await api.post<InterconnectCreated>('/interconnect', {
+    // 请求体的形状用 types.ts 里的类型钉住：后端字段名一改，这里编译期就会报错，
+    // 而不是等到运行时报「缺少参数」。
+    const body: InterconnectInput = {
       peer_name: form.peer_name.trim(),
       peer_lan_subnets: splitSubnets(form.peerLAN),
       peer_endpoint: form.peer_endpoint.trim(),
       local_lan_subnets: splitSubnets(form.localLAN),
-    })
+    }
+    created.value = await api.post<InterconnectCreated>('/interconnect', body)
     ElMessage.success('本机这一半已建好，把邀请交给另一台 NAS 导入即可')
+    // 立刻通知外层刷新列表：本机这一半（连接 + 对端条目）这一下就已经建好了。
+    //
+    // 原先只在「导入成功」后通知，于是「生成邀请 → 复制配置 → 关掉对话框」这条
+    // 最常见的路径会让列表一直是旧的 —— 用户关掉对话框后看到的是一份
+    // 没有刚建那条连接的列表，只能自己按刷新（真机反馈过）。
+    emit('done')
   } catch (e) {
     ElMessage.error((e as Error)?.message || '生成邀请失败')
   } finally {
@@ -438,18 +518,67 @@ async function create(): Promise<void> {
   }
 }
 
-async function doImport(): Promise<void> {
+/** 端口输入 → 请求值；非法时提示并返回 null（0 表示交给后端自动分配）。 */
+function parseImportPort(): number | null {
   const raw = importPortText.value.trim()
-  if (raw && !/^\d+$/.test(raw)) {
+  if (!raw) return 0
+  if (!/^\d+$/.test(raw)) {
     ElMessage.error('「本机监听端口」请填 1–65535 的数字，或留空交给自动分配')
+    return null
+  }
+  return Number(raw)
+}
+
+/** 当前输入对应的「预检身份」：文本 + 端口，任一变化都让已算好的预检作废。 */
+function previewKey(): string {
+  return `${importText.value.trim()}|${importPortText.value.trim()}`
+}
+
+/** 已算好的预检是否仍对应当前输入（不对应时不允许确认，必须重新检查一遍）。 */
+const previewFresh = computed(() => preview.value !== null && previewForKey.value === previewKey())
+
+/**
+ * 预检：只读地问后端「这次导入会做什么」，把清单摆给用户看。
+ *
+ * 为什么不让「导入」一步到位：导入会一次建出连接 + 对端条目，并往策略路由表里写网段。
+ * 在此之前用户看到的只有一段看不懂的文本，直接建完再报告「做了什么」，
+ * 他就只能靠事后去两个页面里逐个核对。
+ */
+async function doPreview(): Promise<void> {
+  const port = parseImportPort()
+  if (port === null) return
+  previewing.value = true
+  try {
+    // 与执行导入共用同一个请求体类型：这两步一旦形状不一致，
+    // 确认框里的清单就与实际执行的内容无关了（见 previewFresh）。
+    const body: InterconnectImportInput = { text: importText.value, listen_port: port }
+    const p = await api.post<InterconnectPreview>('/interconnect/import/preview', body)
+    // 把预检选定的端口回填进输入框：用户看到的就是最终会用的那个，确认后也按它建。
+    importPortText.value = String(p.listen_port)
+    preview.value = p
+    previewForKey.value = previewKey()
+  } catch (e) {
+    preview.value = null
+    previewForKey.value = ''
+    ElMessage.error((e as Error)?.message || '检查失败')
+  } finally {
+    previewing.value = false
+  }
+}
+
+async function doImport(): Promise<void> {
+  if (!previewFresh.value) {
+    ElMessage.warning('请先点「检查一下」看一遍将要做什么，确认后再导入')
     return
   }
+  const port = parseImportPort()
+  if (port === null) return
   importing.value = true
   try {
-    imported.value = await api.post<InterconnectImported>('/interconnect/import', {
-      text: importText.value,
-      listen_port: raw ? Number(raw) : 0,
-    })
+    const body: InterconnectImportInput = { text: importText.value, listen_port: port }
+    imported.value = await api.post<InterconnectImported>('/interconnect/import', body)
+    preview.value = null
+    previewForKey.value = ''
     ElMessage.success('已导入：本机侧连接与对端条目都建好了')
     emit('done')
   } catch (e) {
@@ -488,6 +617,10 @@ function reset(): void {
   // 关闭即复位：邀请含私钥，留着既没有意义也不该在屏幕上多停一秒
   created.value = null
   imported.value = null
+  // 预检结果同样要清掉：它只是「刚才那份输入会做什么」的快照，
+  // 留着会让下次打开时看到一份与当前输入无关的清单。
+  preview.value = null
+  previewForKey.value = ''
   viewed.value = null
   viewedPeerName.value = ''
   importText.value = ''

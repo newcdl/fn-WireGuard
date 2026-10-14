@@ -11,7 +11,8 @@ export interface WgInterface {
   mtu: number
   addresses: string[]
   dns: string[]
-  dns_mode: 'client' | 'host' | 'off'
+  /** 连接里填的 DNS 是否下发给设备；host 是历史值（从未生效过），后端按 client 处理 */
+  dns_mode: 'client' | 'off'
   route_table: string
   pre_up: string
   post_up: string
@@ -682,6 +683,32 @@ export interface InterconnectImported {
   public_endpoint: string
   /** 两者不一致时的提示（为空表示一致） */
   port_note?: string
+  warnings: string[]
+}
+
+/** 多 NAS 互联：导入前的预检结果（只读，不落库） */
+export interface InterconnectPreview {
+  /** 将要新建的连接名 */
+  interface_name: string
+  /** 该连接在隧道里的地址（形如 10.20.0.2/24） */
+  tunnel_address: string
+  tunnel_subnet: string
+  /** 预检选定的监听端口：确认导入后实际就用它 */
+  listen_port: number
+  /** 将要新建的对端条目名 */
+  peer_name: string
+  /** 放行对端使用的来源地址（对端 NAS 地址 + 对端内网网段） */
+  allowed_ips: string[]
+  /** 连上本机的设备会被配置成可访问的范围（本机暴露给对端的网段） */
+  client_allowed_ips: string[]
+  /** 会写进本应用专用策略路由表的网段 */
+  route_subnets: string[]
+  /** 本机主动去连对端用的地址（邀请里没带就是空，由对端发起） */
+  peer_endpoint?: string
+  /** 对外地址端口与本机监听端口不一致时的提示 */
+  port_note?: string
+  /** 对端随邀请带来的「已占用网段」：本机今后新建连接会自动避开 */
+  occupied_by_peer: string[]
   warnings: string[]
 }
 

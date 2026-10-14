@@ -98,18 +98,6 @@ func contains(list []string, v string) bool {
 	return false
 }
 
-func sameStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func normAddrs(in []string) []string {
 	out := make([]string, 0, len(in))
 	seen := map[string]bool{}

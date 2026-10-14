@@ -365,7 +365,6 @@ import type { BackupPlan, BackupPlanStatus, BackupRecord } from '@/api/types'
 import FieldLabel from '@/components/FieldLabel.vue'
 import ItemCard from '@/components/ItemCard.vue'
 import { backupFields as B } from '@/constants/fields'
-import { useBreakpoint } from '@/composables/useBreakpoint'
 import { useSession } from '@/stores/session'
 import { formatBytes, formatTime } from '@/utils/format'
 import ViewSwitch from '@/components/ViewSwitch.vue'
@@ -375,7 +374,6 @@ import { useViewMode } from '@/composables/useViewMode'
 const { mode: viewMode, isTable } = useViewMode('backup-plans')
 
 const session = useSession()
-const { isMobile } = useBreakpoint()
 const can = computed(() => session.can('backup.restore'))
 
 /** 合并后的一行：本机记录，或计划备份写在共享文件夹里的副本。 */

@@ -1041,22 +1041,6 @@ func cidrStrings(list []*net.IPNet) []string {
 	return out
 }
 
-func covered(protected []*net.IPNet, ip net.IP) bool {
-	for _, n := range protected {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-func familyOf(ip net.IP) int {
-	if ip.To4() != nil {
-		return netlink.FAMILY_V4
-	}
-	return netlink.FAMILY_V6
-}
-
 // captureBaselineLocked 记录系统默认路由基线（仅首次，避免被污染后的状态覆盖）。
 func (b *linuxBackend) captureBaselineLocked() {
 	if b.state.BaselineTaken {
