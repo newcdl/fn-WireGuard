@@ -494,7 +494,7 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 	// NAS 顶掉（同一个公钥在同一时刻只对应一个有效端点），现象是「两台 NAS
 	// 时通时不通、设备访问不了对端内网」，且两端界面都看不出异常。
 	if isSitePeer(p) {
-		msg := "这条配置是给**对端 NAS**用的（含对端连接的私钥与隧道地址）：请用它配置对面那台 NAS，" +
+		msg := "这条配置是给「对端 NAS」用的（含对端连接的私钥与隧道地址）：请用它配置对面那台 NAS，" +
 			"不要用在你自己的手机或电脑上 —— 否则那台设备会冒充对端 NAS，双方互相抢占连接。"
 		if warn != "" {
 			warn += "；"
@@ -524,7 +524,7 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 			if warn != "" {
 				warn += "；"
 			}
-			warn += fmt.Sprintf("这台设备的 DNS 会被指向本机隧道地址 %s，它**只在连接建立期间可用**："+
+			warn += fmt.Sprintf("这台设备的 DNS 会被指向本机隧道地址 %s，它「只在连接建立期间可用」："+
 				"断开连接后如果这台设备上不了网（尤其是访问按域名访问的服务），"+
 				"请把它网卡上的 DNS 改回「自动获取」—— 客户端异常退出时可能没把 DNS 还原，服务端无法代劳", host)
 		}

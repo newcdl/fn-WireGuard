@@ -408,7 +408,7 @@ func (s *Service) InterconnectInvite(ctx context.Context, peerID int64, a Actor)
 			"本机没有对外地址，对端无法主动连过来：请先在「系统设置 → 接入设置」填写家里的公网域名或 IP")
 	}
 	out.Warnings = append(out.Warnings,
-		"这是按**当前**设置重新生成的一份：如果你改过对外地址，请把新的这份重新交给对端导入")
+		"这是按「当前」设置重新生成的一份：如果你改过对外地址，请把新的这份重新交给对端导入")
 	out.Warnings = append(out.Warnings,
 		"邀请文件里含对端连接的私钥与二次加密口令，等同于密码：请通过安全渠道交给对方")
 
@@ -658,7 +658,7 @@ func importWarnings(plan *interconnectImportPlan, inv InterconnectInvite) []stri
 		// 不阻断导入：站点隧道本身能通，且用户当场能做的处置只是"以后新建连接时换个网段"。
 		out = append(out,
 			"两台机器的「安装标识」相同：说明两边是同一份数据装出来的（多半是把一台的整机数据拷到了另一台）。"+
-				"这样两边**以后新建连接的默认网段还会挑到同一个**，请在需要时把新连接的「本机专用地址」换成别的网段"+
+				"这样两边「以后新建连接的默认网段还会挑到同一个」，请在需要时把新连接的「本机专用地址」换成别的网段"+
 				"（例如 10.60.0.1/24）；已经建好的连接不受影响")
 	}
 	if strings.TrimSpace(inv.Site.Endpoint) == "" {
@@ -669,7 +669,7 @@ func importWarnings(plan *interconnectImportPlan, inv InterconnectInvite) []stri
 		"两台 NAS 之间已可互访对方内网；连上隧道的设备也会自动带上对端内网"+
 			"（已连上的设备需重新扫码一次，让新范围写进它的配置）")
 	out = append(out,
-		"两端内网里的**普通主机**（没连隧道的电脑、手机）要互相访问，仍需在各自局域网的网关上加一条静态路由，"+
+		"两端内网里的「普通主机」（没连隧道的电脑、手机）要互相访问，仍需在各自局域网的网关上加一条静态路由，"+
 			"把对端网段指向本机 NAS —— 本应用不会修改你家里的路由器设置")
 	return out
 }
@@ -1056,7 +1056,7 @@ func occupiedOverlapNote(occupied []string, mine []model.Interface) string {
 		more = fmt.Sprintf("（共 %d 处）", len(pairs))
 	}
 	return "两端的连接网段撞车了：" + strings.Join(shown, "；") + more +
-		" —— 隧道本身能通，但两端同网段里的**设备**互相访问会被本机直连路由截住（永远不通），" +
+		" —— 隧道本身能通，但两端同网段里的「设备」互相访问会被本机直连路由截住（永远不通），" +
 		"同一台客户端同时连两台 NAS 时地址也会冲突。" +
 		"建议把其中一侧那条连接的「本机专用地址」换成别的网段（改完该连接下的设备需要重新扫码），" +
 		"再重新生成一份邀请交给对端导入。"
@@ -1152,7 +1152,7 @@ func peerOccupiedNote(shared, others []string) string {
 			strings.Join(shared, "、")))
 	}
 	return strings.Join(parts, "；") +
-		"。本机今后新建连接的自动分配会避开它们，但这只是**导入那一刻**对方的占用情况：" +
+		"。本机今后新建连接的自动分配会避开它们，但这只是「导入那一刻」对方的占用情况：" +
 		"对方之后新增的连接不会自动同步过来（邀请是单向的）—— 若两端设备地址出现重复，" +
 		"请到「系统维护 → 体检」里核对，那里会持续比对"
 }
