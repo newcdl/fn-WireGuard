@@ -28,6 +28,13 @@
             <strong>{{ row.name }}</strong>
           </template>
         </el-table-column>
+        <el-table-column label="用途" width="96">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.kind === 'site' ? 'primary' : 'info'" effect="plain">
+              {{ row.kind === 'site' ? '异地组网' : '设备接入' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="工作状态" width="110">
           <template #default="{ row }">
             <el-tag size="small" :type="row.up ? 'success' : 'danger'" effect="plain">
@@ -36,7 +43,22 @@
             <el-tag v-if="!row.enabled" size="small" type="info" effect="plain" style="margin-left: 4px">
               已停用
             </el-tag>
-            <div v-if="rowIssue(row)" class="fnwg-row-warn">{{ rowIssue(row) }}</div>
+            <!-- 这一列只有 110px，整句话塞进来会被折成七八行、把整行撑成一道墙（真机上就是这样）。
+                 所以窄列只放 5 个字以内的短标签，完整说明放悬停，能去的页面点一下就过去
+                 （与设备页「需重新扫码」同一做法）。完整句子留给卡片视图。 -->
+            <div v-if="rowWarn(row).label" style="margin-top: 4px">
+              <el-tooltip :content="rowWarn(row).text" placement="top">
+                <el-tag
+                  size="small"
+                  type="warning"
+                  effect="plain"
+                  :style="{ cursor: warnClickable(row) ? 'pointer' : 'default' }"
+                  @click="onWarnClick(row)"
+                >
+                  {{ rowWarn(row).label }}
+                </el-tag>
+              </el-tooltip>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="内部地址" min-width="170">
@@ -119,6 +141,9 @@
         :title="row.name"
       >
         <template #extra>
+          <el-tag size="small" :type="row.kind === 'site' ? 'primary' : 'info'" effect="plain">
+            {{ row.kind === 'site' ? '异地组网' : '设备接入' }}
+          </el-tag>
           <el-tag size="small" :type="row.up ? 'success' : 'danger'" effect="plain">
             {{ row.up ? '正常' : '未工作' }}
           </el-tag>
@@ -170,7 +195,15 @@
           </span>
         </div>
 
-        <div v-if="rowIssue(row)" class="fnwg-row-warn">{{ rowIssue(row) }}</div>
+        <!-- 卡片宽度充裕，这里仍然写整句话；能跳到「系统维护」的那几类做成可点 -->
+        <div
+          v-if="rowWarn(row).label"
+          class="fnwg-row-warn"
+          :style="{ cursor: warnClickable(row) ? 'pointer' : 'default' }"
+          @click="onWarnClick(row)"
+        >
+          {{ rowWarn(row).text }}
+        </div>
 
         <template #actions>
           <el-button size="small" @click="gotoPeers(row)">设备</el-button>
@@ -270,9 +303,8 @@
         <el-form-item>
           <template #label><FieldLabel :meta="F.dns_mode" /></template>
           <el-radio-group v-model="form.dns_mode">
-            <el-radio value="client">仅下发给设备</el-radio>
-            <el-radio value="host">NAS 也一起使用</el-radio>
-            <el-radio value="off">不参与</el-radio>
+            <el-radio value="client">下发给设备</el-radio>
+            <el-radio value="off">不下发</el-radio>
           </el-radio-group>
           <FieldTips :meta="F.dns_mode" />
         </el-form-item>
@@ -442,14 +474,80 @@ const accessIssueIds = computed(
   () => new Set((net.value?.access_issues || []).map((a) => a.interface_id ?? 0)),
 )
 
-function rowIssue(row: WgInterface): string {
-  if (row.enabled && !row.up) return '已启用但当前未工作：设备无法连接。点「立即应用」重新下发配置。'
-  if (row.allow_lan && natBlocked.value) return '内网访问已开启但链路未就绪，到「系统维护」查看卡在哪一层。'
+/**
+ * 行内异常提示。
+ *
+ * 表格里「工作状态」列只有 110px：一句完整的话折成七八行，整行被撑成一道墙，
+ * 相邻的正常行也被挤到看不清（真机上就是这样）。所以这里拆成两份：
+ * Label 进窄列，Text 进悬停与卡片视图，够得着的处置入口点一下直达。
+ */
+interface RowWarn {
+  /** 窄列里的短标签，5 个字以内（见上：列宽只有 110px） */
+  label: string
+  /** 完整说明，两处呈现共用同一份，避免悬停与卡片说两套话 */
+  text: string
+  /** 'maintenance' 表示点一下去「系统维护」看结论；'none' 表示就地按提示操作，点了不跳转 */
+  action: 'maintenance' | 'none'
+}
+
+const EMPTY_WARN: RowWarn = { label: '', text: '', action: 'none' }
+
+function computeWarn(row: WgInterface): RowWarn | null {
+  // 这一条的处理入口是工具栏的「立即应用」，不要跳走 —— 用户看到的是自己刚点过启用的那条连接
+  if (row.enabled && !row.up)
+    return {
+      label: '需重新应用',
+      text: '已启用但当前未工作：设备无法连接。点工具栏的「立即应用」重新下发配置。',
+      action: 'none',
+    }
+  if (row.allow_lan && natBlocked.value)
+    return {
+      label: '链路未就绪',
+      text: '内网访问已开启但链路未就绪。点这里到「系统维护」查看卡在哪一层。',
+      action: 'maintenance',
+    }
   if (row.isolate_peers && isolateBlocked.value)
-    return '设备间隔离已开启但未生效，设备之间仍可互访；到「系统维护」查看卡在哪一层。'
+    return {
+      label: '隔离未生效',
+      text: '设备间隔离已开启但未生效，设备之间仍可互访。点这里到「系统维护」查看卡在哪一层。',
+      action: 'maintenance',
+    }
   if (accessIssueIds.value.has(row.id))
-    return '这条连接上的设备范围与开关互相矛盾（例如范围含家里网段但内网访问没开），到「系统维护」查看具体结论。'
-  return ''
+    // 这里不举具体例子：矛盾有六种（范围指向另一条连接、被隔离挡住、内网访问没开……），
+    // 写死其中一种，另外五种情况下用户会拿着对不上的话去「系统维护」找。
+    return {
+      label: '设置有冲突',
+      text: '这条连接上的设备范围与「内网访问」「设备隔离」这几项开关对不上，按现象查不出来。点这里到「系统维护」查看具体结论。',
+      action: 'maintenance',
+    }
+  // 端口映射类问题放在最后：它平时不影响使用，只在「外面连不回来」时才致命。
+  // 但恰恰因为平时看不出，才必须在列表里常驻提示（真机踩过：外部端口与本机监听端口对不上）。
+  // 它不跳转：要改的是路由器上的端口映射，本应用里没有能改的地方，跳过去只会让人白找一圈。
+  if (row.port_note) return { label: '核对端口', text: `${row.port_note}。`, action: 'none' }
+  return null
+}
+
+// 整表算一次：提示与列表、全局体检结论同源，逐行在模板里现算会把 issues 扫描重复几十遍
+const warnByIface = computed(() => {
+  const m = new Map<number, RowWarn>()
+  for (const row of list.value) {
+    const w = computeWarn(row)
+    if (w) m.set(row.id, w)
+  }
+  return m
+})
+
+function rowWarn(row: WgInterface): RowWarn {
+  return warnByIface.value.get(row.id) ?? EMPTY_WARN
+}
+
+function warnClickable(row: WgInterface): boolean {
+  return rowWarn(row).action === 'maintenance'
+}
+
+/** 列表与卡片共用：只有「去系统维护看结论」那几类才跳转，其余点了不动（避免误导性的跳转） */
+function onWarnClick(row: WgInterface) {
+  if (warnClickable(row)) router.push({ name: 'maintenance' })
 }
 
 // 名称、专用地址与服务端口刻意留空：由后端按连接序号自动分配，
@@ -502,7 +600,9 @@ function openEdit(row: WgInterface) {
     mtu: row.mtu,
     addresses: [...(row.addresses || [])],
     dns: [...(row.dns || [])],
-    dns_mode: row.dns_mode || 'client',
+    // 历史值 host（「NAS 也一起使用」）从未生效过，一律按「下发给设备」显示：
+    // 照原值填回去会让单选一个都选不中，而保存时后端也只会把它归一成 client。
+    dns_mode: row.dns_mode === 'off' ? 'off' : 'client',
     route_table: row.route_table === 'client' ? 'client' : 'off',
     post_up: row.post_up || '',
     post_down: row.post_down || '',

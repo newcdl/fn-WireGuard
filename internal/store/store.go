@@ -101,6 +101,10 @@ CREATE TABLE IF NOT EXISTS wg_peer (
   -- 它落在服务端规则上，设备侧改不了。
   lan_policy    TEXT    NOT NULL DEFAULT 'inherit',
   lan_targets   TEXT    NOT NULL DEFAULT '[]',
+  -- site_occupied 是「对端 NAS 已占用的隧道网段」台账，只会在站点条目上有值（导入邀请时写入）。
+  -- 本机之后新建连接的自动分配据此避开对方已用的网段；不落库的话这份信息只在导入那一刻存在，
+  -- 之后就再也对不上「我们两端的默认网段撞了没有」。
+  site_occupied TEXT    NOT NULL DEFAULT '[]',
   -- disabled_reason 记录「被自动停用的原因」（quota / expire，空表示不是自动停用）。
   -- 月度额度要到月初自动恢复，而恢复的前提是知道当初为什么停用：只看 enabled=0
   -- 分不清「管理员手工停的」与「流量用尽自动停的」，分不清就会把前者也一并放开。
@@ -296,6 +300,9 @@ func (s *Store) migrate() error {
 		// 设备的内网访问范围：默认 inherit=随连接，升级后行为与升级前完全一致。
 		{"wg_peer", "lan_policy", `ALTER TABLE wg_peer ADD COLUMN lan_policy TEXT NOT NULL DEFAULT 'inherit'`},
 		{"wg_peer", "lan_targets", `ALTER TABLE wg_peer ADD COLUMN lan_targets TEXT NOT NULL DEFAULT '[]'`},
+		// 对端 NAS 已占用的网段台账（只有站点条目会有值）：默认空表示「没有这份信息」，
+		// 于是老库升级上来不会被误判成「对端占用了什么」。
+		{"wg_peer", "site_occupied", `ALTER TABLE wg_peer ADD COLUMN site_occupied TEXT NOT NULL DEFAULT '[]'`},
 		// 飞牛统一网关免密登录：账号对应的飞牛用户 UID（NULL/0 表示自建账号）。
 		{"sys_user", "trim_uid", `ALTER TABLE sys_user ADD COLUMN trim_uid INTEGER`},
 		// 飞牛用户名的快照，仅用于展示。

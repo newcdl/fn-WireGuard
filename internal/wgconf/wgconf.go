@@ -249,9 +249,9 @@ type RenderClientOptions struct {
 	ClientPrivateKey string
 	// ClientAddress 是分配给客户端的隧道地址（CIDR）。
 	ClientAddress []string
-	// AllowedIPs 是客户端侧的路由（决定全局代理或分流）。
+	// AllowedIPs 是客户端侧的路由（决定全局代理或分流）。为空则这一行不写出。
 	AllowedIPs []string
-	// DNS 下发给客户端的 DNS。
+	// DNS 下发给客户端的 DNS。为空表示不下发 DNS（不会回落到连接里配置的 DNS）。
 	DNS []string
 	// MTU 可选。
 	MTU int
@@ -260,15 +260,15 @@ type RenderClientOptions struct {
 }
 
 // RenderClient 渲染客户端配置。
-func RenderClient(serverPublicKey string, it *model.Interface, p *model.Peer, opt RenderClientOptions) string {
+//
+// 只呈现调用方算好的值，**不做任何兜底**：这里的每一处兜底都会把调用方的语义悄悄换掉
+// （例如「不下发 DNS」会变成下发连接里的 DNS，「没探测到内网」会变成把设备的全部流量
+// 塞进隧道），而设备配置指纹是按调用方算出的值算的 —— 两边于是对不上，界面还会显示
+// 「一切正常」。真机踩到过（DNS 那一处）。
+// 传进来的值不合法时，应在调用方报错并说明怎么办，而不是在这里替用户猜一个。
+func RenderClient(serverPublicKey string, p *model.Peer, opt RenderClientOptions) string {
 	if opt.Keepalive == 0 {
 		opt.Keepalive = DefaultKeepalive
-	}
-	if len(opt.AllowedIPs) == 0 {
-		opt.AllowedIPs = []string{"0.0.0.0/0", "::/0"}
-	}
-	if len(opt.DNS) == 0 {
-		opt.DNS = it.DNS
 	}
 	var b strings.Builder
 	b.WriteString("# 由 WireGuard 管理工具生成\n")
@@ -294,7 +294,11 @@ func RenderClient(serverPublicKey string, it *model.Interface, p *model.Peer, op
 	if opt.Endpoint != "" {
 		fmt.Fprintf(&b, "Endpoint = %s\n", opt.Endpoint)
 	}
-	fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(opt.AllowedIPs, ", "))
+	// 为空时不写这一行：配置会因缺字段而被客户端当场拒绝（可见的失败），
+	// 而不是变成「0.0.0.0/0」把设备的全部上网流量塞进隧道（看不见的语义变化）。
+	if len(opt.AllowedIPs) > 0 {
+		fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(opt.AllowedIPs, ", "))
+	}
 	if opt.Keepalive > 0 {
 		fmt.Fprintf(&b, "PersistentKeepalive = %d\n", opt.Keepalive)
 	}
@@ -380,11 +384,6 @@ func SplitClientAndServerIPs(it *model.Interface, p *model.Peer) (clientAddrs []
 		clientAddrs = []string{p.AllowedIPs[0]}
 	}
 	return clientAddrs, routes
-}
-
-func prefixLen(n *net.IPNet) int {
-	ones, _ := n.Mask.Size()
-	return ones
 }
 
 // MergeCIDRs 去重并排序网段列表。

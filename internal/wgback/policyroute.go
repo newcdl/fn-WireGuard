@@ -79,6 +79,67 @@ func ipFamily(ip net.IP) int {
 	return 6
 }
 
+// PolicyRuleView / PolicyRouteView 是内核里的 ip rule 与路由的关键字段。
+//
+// 刻意不用 netlink 的类型：核对逻辑要能在任何平台上被用例穷举（本项目的一贯做法：
+// 判定留在纯函数里，netlink 只在 Linux 侧做取数与落地）。
+type PolicyRuleView struct {
+	// Dst 是规则的目标网段（空串表示非目标规则）。
+	Dst string
+	// Table 是规则指向的表号。
+	Table int
+}
+
+// PolicyRouteNeeded 判断一条策略路由是否需要（重新）下发。
+//
+// 三个输入：状态文件里有没有记录、内核里是否确实还在、这次核对是否可信。
+//
+//   - 核对不可信（读内核失败）时退回「按记录判断」——宁可少动一次，也不无脑重加；
+//   - 核对可信时**只看内核**：记录还在、内核里没了就补下发。
+//
+// 为什么不能只信记录：ip rule 与专用表里的路由都是内核状态，重启、系统网络服务重启、
+// 其它网络工具清理都会让它们消失，而状态文件里的记录还在。只信记录就永远不会补回来，
+// 于是现象是「异地组网直接不通、或时通时不通」，而界面与日志看上去一切正常
+// （nft 的转发规则早就按内核现状核对过，策略路由这一路当时漏了）。
+func PolicyRouteNeeded(recorded, live, checked bool) bool {
+	if !checked {
+		return !recorded
+	}
+	return !live
+}
+
+// PolicyRulePresent 判断内核返回的规则列表里是否已有「目标网段 → 专用表」这条规则。
+func PolicyRulePresent(rules []PolicyRuleView, cidr string, table int) bool {
+	for _, r := range rules {
+		if r.Table == table && r.Dst == cidr {
+			return true
+		}
+	}
+	return false
+}
+
+// PolicyRoutePresent 判断内核返回的（指定表内）路由目标列表里是否已有该网段。
+func PolicyRoutePresent(dsts []string, cidr string) bool {
+	for _, d := range dsts {
+		if d == cidr {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizedCIDR 把网段写成归一化形式（去掉主机位）；非法写法返回空串。
+//
+// 核对时必须用它：配置里可能写成 192.168.2.5/24，而内核回读的是 192.168.2.0/24，
+// 直接比字符串会永远判成「不存在」，于是每轮收敛都重复下发同一条规则。
+func normalizedCIDR(cidr string) string {
+	_, n, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil {
+		return ""
+	}
+	return maskedCIDR(n)
+}
+
 // DescribePolicyRoutes 汇总策略路由，用于日志与界面展示。
 func DescribePolicyRoutes(list []PolicyRoute) string {
 	if len(list) == 0 {

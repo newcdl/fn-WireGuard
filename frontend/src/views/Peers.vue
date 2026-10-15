@@ -49,7 +49,20 @@
           <template #default="{ row }">
             <span :class="['fnwg-dot', handshakeLevel(row.last_handshake)]"></span>
             <strong>{{ row.name }}</strong>
+            <!-- 站点条目代表的是「另一台 NAS」，不是一台接入设备：标出来才不会有人
+                 拿它的配置去自己的电脑上用（那会让电脑冒充对端 NAS，两边互相抢连接） -->
+            <el-tag v-if="row.site_link" size="small" type="primary" effect="plain" style="margin-left: 6px">
+              对端 NAS
+            </el-tag>
             <el-tag v-if="!row.enabled" size="small" type="info" effect="plain" style="margin-left: 6px">已停用</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="设备 IP" width="150">
+          <template #default="{ row }">
+            <template v-if="deviceIPs(row.allowed_ips).length">
+              <div v-for="(ip, i) in deviceIPs(row.allowed_ips)" :key="i" class="fnwg-mono">{{ ip }}</div>
+            </template>
+            <span v-else class="fnwg-hint">未分配</span>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="90">
@@ -123,9 +136,10 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="showConfig(row)">扫码连接</el-button>
+            <el-button v-if="row.site_link" link type="primary" @click="openInvite(row)">邀请</el-button>
             <el-button v-if="session.can('peer.write')" link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button v-if="session.can('peer.write')" link type="danger" @click="remove(row)">删除</el-button>
           </template>
@@ -153,6 +167,7 @@
         @toggle="toggleSelect(row.id)"
       >
         <template #extra>
+          <el-tag v-if="row.site_link" size="small" type="primary" effect="plain">对端 NAS</el-tag>
           <el-tag size="small" :type="stateTagType(row)" effect="plain">{{ stateLabel(row) }}</el-tag>
           <el-tag v-if="!row.enabled" size="small" type="info" effect="plain">已停用</el-tag>
           <el-tag v-if="row.config_stale" size="small" type="warning" effect="plain">需重新扫码</el-tag>
@@ -161,6 +176,10 @@
         <div class="fnwg-kv">
           <span class="fnwg-kv-key">所属连接</span>
           <span class="fnwg-kv-val">{{ row.interface_name }}</span>
+        </div>
+        <div class="fnwg-kv">
+          <span class="fnwg-kv-key">设备 IP</span>
+          <span class="fnwg-kv-val fnwg-mono">{{ deviceIPs(row.allowed_ips).join('、') || '未分配' }}</span>
         </div>
         <div class="fnwg-kv">
           <span class="fnwg-kv-key">允许访问</span>
@@ -181,6 +200,7 @@
 
         <template #actions>
           <el-button size="small" type="primary" @click="showConfig(row)">扫码连接</el-button>
+          <el-button v-if="row.site_link" size="small" @click="openInvite(row)">邀请</el-button>
           <el-button v-if="session.can('peer.write')" size="small" @click="openEdit(row)">编辑</el-button>
           <el-button v-if="session.can('peer.write')" size="small" @click="remove(row)">删除</el-button>
         </template>
@@ -546,6 +566,14 @@
       </template>
     </el-dialog>
 
+    <!-- 互联邀请：这条路只给「对端 NAS」条目用 —— 查看当初那份邀请（含私钥与口令） -->
+    <InterconnectDialog
+      v-model="interconnectVisible"
+      initial-tab="existing"
+      :focus-peer-id="invitePeerId"
+      @done="load"
+    />
+
     <ConfigHelpDrawer v-model="helpVisible" :groups="helpGroups" />
   </div>
 </template>
@@ -566,6 +594,7 @@ import type {
   WgPeer,
 } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
+import InterconnectDialog from '@/components/InterconnectDialog.vue'
 import FieldLabel from '@/components/FieldLabel.vue'
 import FieldTips from '@/components/FieldTips.vue'
 import ItemCard from '@/components/ItemCard.vue'
@@ -614,6 +643,9 @@ const keyword = ref('')
 const drawerVisible = ref(false)
 const cfgVisible = ref(false)
 const helpVisible = ref(false)
+// 互联邀请（只对「对端 NAS」条目开放）：打开对话框的「已生成的邀请」页签并定位到该条目
+const interconnectVisible = ref(false)
+const invitePeerId = ref<number | undefined>(undefined)
 const cfg = ref<PeerConfigResult | null>(null)
 const qrDataUrl = ref('')
 const scenario = ref('split')
@@ -695,6 +727,23 @@ function describeAllowed(ips?: string[]): string {
   const lan = ips.filter((i) => !i.endsWith('/32') && !i.endsWith('/128'))
   if (lan.length) return `可访问 ${lan.length} 个网段（含家庭内网）`
   return '仅本机内部地址'
+}
+
+/**
+ * 这台设备在隧道里使用的地址（去掉掩码，形如 10.20.0.3）。
+ *
+ * 取准入地址里的**主机项**（/32 与 /128）——那就是设备自己的隧道地址：
+ * 正常设备只有它一项；站点条目的准入地址里还带着「对端内网网段」（那些是
+ * 它能从哪些源地址进来，不是它的地址），靠掩码就能分开 —— 与 describeAllowed 同一套判据。
+ *
+ * 单独成一列而不是塞进「允许访问」：排查「某台设备连不上」时，
+ * 第一个要核对的就是「它到底是哪个地址」。
+ * 一台设备若同时登记了多条（例如手工改过地址、旧的自动地址还留着），这里会逐条列出 ——
+ * 那种情况本身就该看见：多出来的地址同样会与别人撞车。
+ */
+function deviceIPs(ips?: string[]): string[] {
+  if (!ips || !ips.length) return []
+  return ips.filter((i) => i.endsWith('/32') || i.endsWith('/128')).map((i) => i.replace(/\/(32|128)$/, ''))
 }
 
 function stateLabel(row: WgPeer): string {
@@ -802,6 +851,12 @@ function onDrawerClosed() {
   createStep.value = 0
 }
 
+/** 查看「对端 NAS」条目对应的互联邀请（按当前设置重新生成，含私钥与口令）。 */
+function openInvite(row: WgPeer) {
+  invitePeerId.value = row.id
+  interconnectVisible.value = true
+}
+
 function openEdit(row: WgPeer) {
   Object.assign(form, {
     id: row.id,
@@ -832,7 +887,45 @@ function applyScenario(values: Record<string, unknown>) {
   Object.assign(form, values)
 }
 
+/** 所选连接是否为「站点互联」（异地组网）连接；kind 由后端派生（IfaceKindSite）。 */
+function isSiteIface(id?: number): boolean {
+  if (!id) return false
+  return interfaces.value.find((i) => i.id === id)?.kind === 'site'
+}
+
+/**
+ * 往站点互联连接上加普通设备时的确认。
+ *
+ * 为什么必须拦一下（这是真机反馈过的现象）：互联连接的隧道网段是两台 NAS **共用**的，
+ * 两端各自添加的设备由各自独立分配，于是算到同一个地址（都是 .3、.4…）。
+ * 而现象只是「能访问对端 NAS、访问不了对端的某几台设备」——
+ * 用户从界面上根本推不出与地址撞车有关，只会以为是对方那台设备坏了。
+ *
+ * 处置代价很低，所以劝阻而不是禁止：这些设备加到普通连接上一样能访问两端内网
+ *（连上本机的设备会自动带上对端网段）。
+ */
+async function confirmSiteDevice(): Promise<boolean> {
+  try {
+    await ElMessageBox.confirm(
+      '这条连接是与另一台 NAS 的互联隧道，它的网段由两台 NAS 共用：' +
+        '两边各自添加的设备会算到同一个地址（都是 .3、.4…），那几台设备之间就访问不到了。' +
+        '建议把设备加到普通连接上 —— 连在普通连接上的设备同样会自动访问对端内网。' +
+        '确实要加在这条互联连接上吗？',
+      '要把设备加到互联连接上吗',
+      { confirmButtonText: '仍然添加', cancelButtonText: '换个连接', type: 'warning' },
+    )
+    return true
+  } catch {
+    // 用户选择「换个连接」：留在抽屉里让他改，不提交
+    return false
+  }
+}
+
 async function submit() {
+  // 新建时若挂在互联连接上，先确认一次（照常允许，但要说清后果）
+  if (!form.id && isSiteIface(form.interface_id) && !(await confirmSiteDevice())) {
+    return
+  }
   saving.value = true
   try {
     const payload = {

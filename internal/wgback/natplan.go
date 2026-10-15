@@ -80,6 +80,38 @@ type NATPlanInput struct {
 	// 隔离范围要覆盖全部隧道，而不是只覆盖开了隔离的那一条：
 	// 若只隔离 wg0，wg1 里的设备仍能访问 wg0 的设备，那隔离就是假的。
 	TunnelSubnets []string
+
+	// SiteNAT 是各「站点连接」（本机需要主动把流量送进对端内网的连接）的远端网段与出口。
+	//
+	// 它解决的是「设备连上来之后到不了另一台 NAS 的内网」：
+	// 设备 → 对端内网的流量在本机是「隧道进、隧道出」，没有任何源地址改写，
+	// 而对端的准入地址里只有「对面 NAS 的地址」，于是包被对端 WireGuard 直接丢弃 ——
+	// 表现是能连上本机、却访问不了对方内网，且不报错。
+	SiteNAT []SiteNATInput
+}
+
+// SiteNATInput 是一条站点连接的站点间改写输入。
+type SiteNATInput struct {
+	// Dev 是站点连接的网卡名（改写后的出口）。
+	Dev string
+	// Remote 是该连接的对端内网网段（隧道之外的那些）。
+	Remote []string
+}
+
+// SNATRule 是一条「站点间源地址改写」规则（纯数据，测试可穷举核对）。
+//
+// 语义：源地址落在 Src（本机其它隧道网段）且目标是 Dst（对端内网）时，
+// 从 Dev（站点连接）出去前把源地址改写成该连接的地址。这样对端只需要认识
+// 「对面 NAS 的地址」，无需在两端来回登记各自的客户端网段。
+type SNATRule struct {
+	Src string
+	Dst string
+	Dev string
+}
+
+// Key 返回该规则的稳定描述（指纹与测试核对用）。
+func (r SNATRule) Key() string {
+	return "snat:" + r.Src + ">" + r.Dst + "@" + r.Dev
 }
 
 // PeerRestriction 是「某台设备能访问内网的哪些目标」。
@@ -140,10 +172,14 @@ type NATPlan struct {
 	// 两者都必须排在网段级放行之前，否则丢弃轮不到生效（nftables 以第一条匹配的规则为终局判定）。
 	PeerAllow []PeerTargetRule
 	PeerDeny  [][2]string
+
+	// SiteMasq 是「站点间源地址改写」规则（见 SNATRule）。
+	// 与内网访问是否启用无关：它只依赖隧道网段与对端网段，因此单独计算、单独落地。
+	SiteMasq []SNATRule
 }
 
 // Empty 表示这份决策不需要在内核里留下任何规则。
-func (p NATPlan) Empty() bool { return !p.Enable && !p.Isolate }
+func (p NATPlan) Empty() bool { return !p.Enable && !p.Isolate && len(p.SiteMasq) == 0 }
 
 // Fingerprint 返回该决策的指纹，用于判断规则是否需要重建。
 // 内容一致时完全不动内核里的规则，避免无谓的规则抖动。
@@ -160,6 +196,10 @@ func (p NATPlan) Fingerprint() string {
 		}
 	}
 	parts = append(parts, peerACLFingerprint(p)...)
+	// 站点间改写规则：内容变了必须重建，否则改了站点网段却还是旧规则。
+	for _, r := range p.SiteMasq {
+		parts = append(parts, r.Key())
+	}
 	if len(parts) == 0 {
 		return ""
 	}
@@ -220,6 +260,8 @@ func PlanNAT(in NATPlanInput) NATPlan {
 	plan.applyIsolation(in)
 	plan.applyForwarding(in)
 	plan.applyPeerTargets(in)
+	// 站点间源地址改写同样只依赖隧道网段与对端网段，与内网访问能否启用无关。
+	plan.applySiteMasq(in)
 	return plan
 }
 
@@ -408,6 +450,46 @@ func (p *NATPlan) applyPeerTargets(in NATPlanInput) {
 	})
 }
 
+// applySiteMasq 计算「站点间源地址改写」规则。
+//
+// 源取**全部**隧道网段，包括站点连接自己的网段。这一点很容易写错：设备的地址
+// 与站点连接的地址常常落在同一个网段里（只有一条连接、设备就挂在它下面 —— 这是
+// 最常见的用法），若把「站点连接自身的网段」整段排除，源会被排除光，
+// 一条改写规则都不下发，现象是「设备能访问本机内网、却访问不了对端内网」。
+//
+// 包含它没有任何副作用：NAS 自身流量的源地址就是站点连接自己的地址，
+// 改写成该地址等于原样放行（空操作）；而局域网里主机的源地址不在隧道网段里，
+// 依然不被改写，因此「局域网互通」那一路的行为完全不变。
+func (p *NATPlan) applySiteMasq(in NATPlanInput) {
+	if len(in.SiteNAT) == 0 {
+		return
+	}
+	sources := ipv4Subnets(in.SourceSubnets)
+	if len(sources) == 0 {
+		return
+	}
+	seen := map[string]bool{}
+	for _, site := range in.SiteNAT {
+		dev := strings.TrimSpace(site.Dev)
+		remote := ipv4Subnets(site.Remote)
+		if dev == "" || len(remote) == 0 {
+			continue
+		}
+		for _, src := range sources {
+			for _, dst := range remote {
+				key := src + ">" + dst + "@" + dev
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				p.SiteMasq = append(p.SiteMasq, SNATRule{Src: src, Dst: dst, Dev: dev})
+			}
+		}
+	}
+	// 排序让指纹稳定：否则输入顺序一变就会被判定成「内容变了」，每轮收敛都重建规则。
+	sort.Slice(p.SiteMasq, func(i, j int) bool { return p.SiteMasq[i].Key() < p.SiteMasq[j].Key() })
+}
+
 // maskedCIDR 把网段归一化
 //
 // 放在本文件（而不是 linux.go）：它是纯计算，跨平台的用例也要能调到它 ——
@@ -473,6 +555,40 @@ func DescribeNAT(p NATPlan) string {
 	}
 	return fmt.Sprintf("允许 %s 的设备经由 %s 访问家里内网",
 		strings.Join(p.Sources, "、"), strings.Join(p.WANs, "、"))
+}
+
+// SiteMasqDevs 汇总站点间改写涉及的连接（出口网卡），去重并排序。
+func SiteMasqDevs(p NATPlan) []string {
+	out := []string{}
+	for _, r := range p.SiteMasq {
+		if !contains(out, r.Dev) {
+			out = append(out, r.Dev)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SiteMasqSubnets 汇总站点间改写涉及的对端内网网段，去重并排序。
+func SiteMasqSubnets(p NATPlan) []string {
+	out := []string{}
+	for _, r := range p.SiteMasq {
+		if !contains(out, r.Dst) {
+			out = append(out, r.Dst)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DescribeSiteMasq 汇总站点间源地址改写，用于日志与界面展示。
+func DescribeSiteMasq(p NATPlan) string {
+	devs := SiteMasqDevs(p)
+	if len(devs) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("已为经 %s 访问对端内网 %s 的流量改写源地址",
+		strings.Join(devs, "、"), strings.Join(SiteMasqSubnets(p), "、"))
 }
 
 // DescribeIsolation 汇总设备隔离决策，用于日志与界面展示。

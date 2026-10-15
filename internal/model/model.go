@@ -50,6 +50,24 @@ const (
 	// RouteTableClient 仅当本机作为客户端时才为对端网段添加路由。
 	RouteTableClient = "client"
 
+	// DNSModeClient 把连接里填的 DNS 下发给连进来的设备（默认）。
+	DNSModeClient = "client"
+	// DNSModeOff 不下发 DNS：连接里那一项只作为「内网域名解析」的上游使用。
+	//
+	// 它存在的意义是「配了上游但不想让设备用」——这类需求没法用「把 DNS 留空」表达，
+	// 因为留空会连上游一起没有（见 reconcile.syncDNS：上游就取自连接里的 DNS）。
+	DNSModeOff = "off"
+	// DNSModeLegacyHost 是历史值「NAS 也一起使用」，从未生效过（本应用不改系统解析），
+	// 一律按 DNSModeClient 处理：留着它照旧不报错，但界面上不再出现这个选项。
+	DNSModeLegacyHost = "host"
+
+	// IfaceKindSite 表示这条连接是「异地组网」（站点到站点互联）。
+	//
+	// 派生字段，**不落库**：由「该连接下存在站点条目（备注以「站点互联」开头）」判定，
+	// 与拓扑图、互联向导用同一口径。落库会污染备份与快照的比对（同一份配置会因为
+	// 派生值不同而被判成「变了」）。
+	IfaceKindSite = "site"
+
 	// PeerDisabledQuota / PeerDisabledExpired 是设备被**自动**停用的原因（Peer.DisabledReason 的取值）。
 	//
 	// 只记「为什么停用」，不记具体数值或期限：那些会随管理员调整而变，
@@ -109,16 +127,20 @@ type Interface struct {
 	ListenPort int      `json:"listen_port"`
 	FWMark     int      `json:"fwmark"`
 	MTU        int      `json:"mtu"`
-	Addresses  []string `json:"addresses"`   // ["10.10.0.1/24","fd00::1/64"]
-	DNS        []string `json:"dns"`         // 下发给客户端的 DNS
-	DNSMode    string   `json:"dns_mode"`    // client | host | off
-	RouteTable string   `json:"route_table"` // auto | off | <n>
-	PreUp      string   `json:"pre_up"`
-	PostUp     string   `json:"post_up"`
-	PreDown    string   `json:"pre_down"`
-	PostDown   string   `json:"post_down"`
-	Enabled    bool     `json:"enabled"`
-	Autostart  bool     `json:"autostart"`
+	Addresses  []string `json:"addresses"` // ["10.10.0.1/24","fd00::1/64"]
+	DNS        []string `json:"dns"`       // 既作为「内网域名解析」的上游，也在 DNSMode=client 时下发给设备
+	// DNSMode 决定连接里填的 DNS 要不要下发给设备：client（默认）下发，off 不下发。
+	//
+	// 历史值 "host"（「NAS 也一起使用」）从未生效过：本应用一律不修改 NAS 自身的系统解析
+	//（见 internal/dnsserver：绝不碰 /etc/resolv.conf），因此它一律按 client 处理。
+	DNSMode    string `json:"dns_mode"`
+	RouteTable string `json:"route_table"` // auto | off | <n>
+	PreUp      string `json:"pre_up"`
+	PostUp     string `json:"post_up"`
+	PreDown    string `json:"pre_down"`
+	PostDown   string `json:"post_down"`
+	Enabled    bool   `json:"enabled"`
+	Autostart  bool   `json:"autostart"`
 	// AllowLAN 为真时启用「允许设备访问家里内网」：
 	// 为这条连接的隧道网段做源地址改写，让连进来的设备能访问局域网中的其它设备。
 	AllowLAN bool `json:"allow_lan"`
@@ -132,7 +154,11 @@ type Interface struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 
-	// 以下为运行时字段，不落库
+	// 以下为运行时/派生字段，不落库
+	// Kind 是「这条连接的用途」：IfaceKindSite=异地组网，空=普通（设备接入）。
+	Kind string `json:"kind,omitempty"`
+	// PortNote 是「对外访问地址的端口 ≠ 本连接监听端口」时的提示（派生，不落库）。
+	PortNote   string  `json:"port_note,omitempty"`
 	PublicKey  string  `json:"public_key,omitempty"`
 	Up         bool    `json:"up,omitempty"`
 	PeerCount  int     `json:"peer_count,omitempty"`
@@ -170,7 +196,16 @@ type Peer struct {
 	LANPolicy string `json:"lan_policy"`
 	// LANTargets 仅在 LANPolicy=restrict 时有意义：允许该设备访问的内网目标，
 	// 写法见 ParseLANTarget：192.168.1.10、192.168.1.0/24、192.168.1.10:445。
-	LANTargets   []string   `json:"lan_targets"`
+	LANTargets []string `json:"lan_targets"`
+	// SiteOccupied 是「对端 NAS 已占用的隧道网段」台账（只有站点条目会有值）。
+	//
+	// 它来自互联邀请里带的清单，**导入时写入、之后不再变**：本机新建连接的自动分配据此
+	// 避开对端已用的网段，体检也据此持续比对「两端的默认网段撞了没有」。
+	// 不落库的话这份信息只在导入那一刻存在，用户过两天再遇到撞车就再也对不上原因。
+	//
+	// 刻意不给它做「编辑设备」通路：它属于对端在某时刻告诉我们的东西，
+	// 与用户对这台设备的编辑无关（见 store.SetPeerSiteOccupied）。
+	SiteOccupied []string   `json:"site_occupied,omitempty"`
 	EndpointHost string     `json:"endpoint_host"`
 	EndpointPort int        `json:"endpoint_port"`
 	Keepalive    int        `json:"persistent_keepalive"`
@@ -197,7 +232,10 @@ type Peer struct {
 	// 然后对着「明明改了范围却还是访问不了」困惑很久。
 	ConfigFingerprint string `json:"config_fingerprint,omitempty"`
 
-	// 运行时字段
+	// 运行时/派生字段
+	// SiteLink 表示这条条目代表的是「另一台 NAS」（站点互联的对端），不是一台接入设备。
+	// 派生自备注前缀（与拓扑、互联向导同一口径），不落库。
+	SiteLink      bool      `json:"site_link,omitempty"`
 	Online        bool      `json:"online,omitempty"`
 	LastHandshake time.Time `json:"last_handshake,omitempty"`
 	Endpoint      string    `json:"endpoint,omitempty"`
@@ -530,6 +568,11 @@ type NATStatus struct {
 	IsolateNets []string `json:"isolate_nets"`
 	// IsolateRules 内核里实际的阻断规则条数，便于对照 `nft list table` 核对。
 	IsolateRules int `json:"isolate_rules"`
+	// SiteNATDevs 是当前做了「站点间源地址改写」的连接（出口网卡）列表。
+	// 它对应「设备连上隧道后能访问另一台 NAS 的内网」这一步。
+	SiteNATDevs []string `json:"site_nat_devs"`
+	// SiteNATSubnets 是被改写后可达的对端内网网段。
+	SiteNATSubnets []string `json:"site_nat_subnets"`
 	// Checks 是内网访问链路的逐项自检结果。
 	// 「设备连上了但访问不了家里其它设备」在界面上只是一个现象，
 	// 成因可能有好几层，这里把每层都查一遍并给出修复建议。

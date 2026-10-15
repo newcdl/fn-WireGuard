@@ -200,7 +200,7 @@ const peerCols = `p.id,p.interface_id,IFNULL(i.name,''),p.name,p.public_key,p.pr
 	IFNULL(p.route_mode,'lan'),IFNULL(p.client_ips,'[]'),p.endpoint_host,
 	p.endpoint_port,p.allowed_ips,p.keepalive,p.group_tag,p.remark,p.quota_rx,p.quota_tx,p.expire_at,p.enabled,
 	p.created_at,p.updated_at,IFNULL(p.config_fp,''),IFNULL(p.disabled_reason,''),
-	IFNULL(p.lan_policy,'inherit'),IFNULL(p.lan_targets,'[]')`
+	IFNULL(p.lan_policy,'inherit'),IFNULL(p.lan_targets,'[]'),IFNULL(p.site_occupied,'[]')`
 
 const peerFrom = ` FROM wg_peer p LEFT JOIN wg_interface i ON i.id = p.interface_id`
 
@@ -217,18 +217,20 @@ func (s *Store) scanPeer(sc interface{ Scan(...any) error }) (*model.Peer, error
 		updatedAt string
 		lanPolicy string
 		lanTarget string
+		siteOcc   string
 	)
 	err := sc.Scan(&p.ID, &p.InterfaceID, &p.InterfaceName, &p.Name, &p.PublicKey, &psk, &clientKey,
 		&p.RouteMode, &clientIPs, &p.EndpointHost,
 		&p.EndpointPort, &allowed, &p.Keepalive, &p.GroupTag, &p.Remark, &p.QuotaRx, &p.QuotaTx, &expireAt,
 		&enabled, &createdAt, &updatedAt, &p.ConfigFingerprint, &p.DisabledReason,
-		&lanPolicy, &lanTarget)
+		&lanPolicy, &lanTarget, &siteOcc)
 	if err != nil {
 		return nil, err
 	}
 	p.AllowedIPs = jsonStrings(allowed)
 	p.ClientAllowedIPs = jsonStrings(clientIPs)
 	p.LANTargets = jsonStrings(lanTarget)
+	p.SiteOccupied = jsonStrings(siteOcc)
 	p.LANPolicy = lanPolicy
 	if p.LANPolicy == "" {
 		p.LANPolicy = model.LANPolicyInherit
@@ -363,6 +365,25 @@ func (s *Store) UpdatePeer(ctx context.Context, p *model.Peer) error {
 		p.EndpointHost, p.EndpointPort,
 		mustJSON(p.AllowedIPs), lanPolicyArg(p.LANPolicy), mustJSON(p.LANTargets), p.Keepalive, p.GroupTag, p.Remark, p.QuotaRx, p.QuotaTx,
 		expireArg(p.ExpireAt), b2i(p.Enabled), p.DisabledReason, p.ConfigFingerprint, ts(now), p.ID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetPeerSiteOccupied 写入「对端 NAS 已占用的隧道网段」台账（只在导入邀请时调用）。
+//
+// 单独一个方法而不是并进 UpdatePeer：那份台账属于「对端当时告诉我什么」，与用户对这台设备
+// 的编辑无关。UpdatePeer 是编辑设备的通用路径，让每次编辑都原样搬运一遍这份数据，
+// 一旦漏了就静默清空 —— 而它的全部价值就是「导入之后仍然记得」。因此 UPDATE 语句里
+// 刻意不含这一列：编辑不会碰它，只有这里会写。
+func (s *Store) SetPeerSiteOccupied(ctx context.Context, peerID int64, subnets []string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE wg_peer SET site_occupied=?,updated_at=? WHERE id=?`,
+		mustJSON(subnets), ts(time.Now()), peerID)
 	if err != nil {
 		return err
 	}

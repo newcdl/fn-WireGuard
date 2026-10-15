@@ -209,6 +209,45 @@ func TestPlanPolicyRoutesEmptyWhenNotAllowed(t *testing.T) {
 	}
 }
 
+// TestPlanRoutesIgnoresDefaultRouteInHostNetworks 回归：主机的默认路由若以
+// 0.0.0.0/0 的形态混进「主机网段」，绝不能把每一条对端路由都判成冲突。
+//
+// 真机表现（踩过）：异地组网隧道通了、对端地址也能 ping 通，却访问不了对端内网；
+// 日志里那句是「192.168.3.0/24（与 NAS 现有网段重叠…已跳过）」，而机器上
+// 根本没有 192.168.3.0/24 —— 罪魁就是 dump 出来的默认路由。
+func TestPlanRoutesIgnoresDefaultRouteInHostNetworks(t *testing.T) {
+	plan := PlanRoutes(RoutePlanInput{
+		ManageRoutes:   true,
+		InterfaceAddrs: []string{"10.10.0.1/24"},
+		PeerAllowedIPs: []string{"192.168.3.0/24"},
+		HostNetworks:   []string{"192.168.2.0/24", "0.0.0.0/0", "::/0", "172.17.0.0/16"},
+		ExistingRoutes: []HostRoute{{Dst: "", Family: 4}},
+	})
+	if len(plan.Add) != 1 || plan.Add[0] != "192.168.3.0/24" {
+		t.Fatalf("默认路由不该被当成冲突网段，实际: %+v", plan)
+	}
+}
+
+// TestPlanRoutesNamesConflictingNetwork 冲突时必须点名「和哪个网段冲突」，
+// 并通过 Conflict 字段把网段交出来（调用方据此补上来源）。
+func TestPlanRoutesNamesConflictingNetwork(t *testing.T) {
+	plan := PlanRoutes(RoutePlanInput{
+		ManageRoutes:   true,
+		InterfaceAddrs: []string{"10.10.0.1/24"},
+		PeerAllowedIPs: []string{"192.168.2.0/24"},
+		HostNetworks:   []string{"192.168.2.0/24"},
+	})
+	if len(plan.Skip) != 1 {
+		t.Fatalf("与既有网段冲突时应被跳过，实际: %+v", plan)
+	}
+	if plan.Skip[0].Conflict != "192.168.2.0/24" {
+		t.Fatalf("Conflict 应为冲突网段，实际: %q", plan.Skip[0].Conflict)
+	}
+	if !strings.Contains(plan.Skip[0].Reason, "192.168.2.0/24") {
+		t.Fatalf("提示要点名冲突网段，实际: %s", plan.Skip[0].Reason)
+	}
+}
+
 func TestIsDefaultRouteCIDR(t *testing.T) {
 	for _, c := range []string{"0.0.0.0/0", "::/0", "0/0", "0::/0"} {
 		if !IsDefaultRouteCIDR(c) {

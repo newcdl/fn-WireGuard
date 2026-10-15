@@ -119,6 +119,11 @@ func (s *Server) mountAPI(r chi.Router) {
 		// 两端的准入地址与通行范围都由同一份数据推导，免得两头手工填错一条就「不通」。
 		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interconnect", s.handleCreateInterconnect)
 		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interconnect/import", s.handleImportInterconnect)
+		// 导入前的预检（只读）：导入会一次建好连接与对端条目、并写若干策略路由，
+		// 用户在确认之前必须先看到「建什么、用哪个地址、哪些流量会进隧道」。
+		r.With(s.requirePerm(model.PermIfaceWrite)).Post("/interconnect/import/preview", s.handlePreviewInterconnect)
+		// 再次查看已生成的邀请：内容含对端私钥与口令，按「查看密钥」同级校验（并写审计）。
+		r.With(s.requirePerm(model.PermKeyReveal)).Get("/interconnect/invite/{id}", s.handleInterconnectInvite)
 
 		// 配置漂移巡检：状态与「此刻的判定」只读；改计划与立即巡检要写权限。
 		// 判定在服务层只有一份实现（界面与定期报告读同一个函数），执行在代理进程 ——

@@ -239,6 +239,17 @@ type inspectFacts struct {
 	// BackupEnabled / BackupLast 计划备份的开关与最近一次结果。
 	BackupEnabled bool
 	BackupLast    *BackupRunState
+	// SiteOccupied 是本机已知的「另一台 NAS 已占用网段」（各站点条目上记着的台账）；
+	// SiteOverlap 是它与本机连接网段重叠的那些。
+	//
+	// 这是「两端设备地址成对重复」里**事后也无从自查**的那一类：现象只是
+	// 「访问不了对端的某几台设备」，因此必须由体检持续说出来，而不是只在导入那一刻提示一次。
+	//
+	// 「往站点互联连接上直接加设备」那类**不在这里报**：它发生在用户自己的操作当时，
+	// 添加设备时有一次确认提醒就够了（见 frontend 的 Peers.vue）—— 报成常驻待处理，
+	// 只会让顶栏长期挂着一条用户已经知情并接受的事，而待办清单一旦开始说无用的话就没人看了。
+	SiteOccupied []string
+	SiteOverlap  []string
 }
 
 // InspectChecks 做一次即时判定，不落库。
@@ -275,6 +286,9 @@ func (s *Service) inspectFacts(ctx context.Context) inspectFacts {
 	f.Gateway, f.HasGateway = LoadGatewayFact(ctx, s.Store)
 	f.BackupEnabled = LoadBackupPlan(ctx, s.Store).Enabled
 	f.BackupLast = loadBackupRunState(ctx, s.Store)
+	// 站点互联引发的地址撞车（见判定 ⑬）：读不到就当没有，不因此让整份报告缺项。
+	f.SiteOccupied = s.reservedSubnets(ctx)
+	f.SiteOverlap = s.siteReservedOverlaps(ctx, f.SiteOccupied)
 	return f
 }
 
@@ -284,8 +298,9 @@ func (s *Service) inspectFacts(ctx context.Context) inspectFacts {
 // 这份清单的价值全在「每一条都对」，而它最容易出的错是「该报的没报」
 // （用户以为巡检过了就等于没问题），所以每一条都有对应用例。
 //
-// 顺序即重要性：后台服务 → 运行模式 → 系统网络 → 桌面入口 → 连接 →
-// 内网访问 → 隔离 → 访问控制冲突 → 残留网卡 → 对外地址 → 通知 → 解析 → 备份。
+// 顺序即重要性：后台服务 → 运行模式 → 下发结果 → 系统网络 → 桌面入口 → 连接 →
+// 内网访问 → 隔离 → 访问控制冲突 → 残留网卡 → 对外地址 → 通知 → 解析 → 备份 →
+// 站点互联的地址撞车（本机网段与对端已占用网段重叠）。
 func judgeInspect(f inspectFacts) []InspectItem {
 	out := []InspectItem{}
 
@@ -330,12 +345,18 @@ func judgeInspect(f inspectFacts) []InspectItem {
 			Detail: "系统内核支持加密网络模块，连接由内核直接处理。",
 		})
 	case f.Health.TunDevice:
+		// 兼容模式能顶上，功能是正常的，因此这是一条**状态**而不是待办。
+		//
+		// 它曾经是警告级，结果在真机上长期挂在「待处理事项」里：这一条永远成立、
+		// 用户没有任何可做的操作，顶栏因此一直是黄的，点「去处理」还会跳回本页看到同样的话
+		// （同一条提示里写着「无需手动操作」，却待在待办清单里——自相矛盾）。
+		// 现在按状态报，并给一条**真的能执行**的路径（确认模块可用后停用再启用即可切回）。
 		out = append(out, InspectItem{
-			Key: "compat", Level: InspectWarning,
-			Title:  "正在使用兼容模式",
-			Detail: "系统没有可用的内核加密网络模块，已自动改用兼容模式，连接可以正常工作，速度和资源占用略逊于标准模式。",
-			Fix:    "无需手动操作；若 NAS 系统升级后支持了内核模块，会自动切回标准模式。",
-			To:     "maintenance",
+			Key: "compat", Level: InspectOK,
+			Title:  "工作模式：兼容模式（用户态实现）",
+			Detail: "系统没有可用的内核加密网络模块，已自动改用用户态实现：连接照常工作，速度与资源占用略逊于标准模式。",
+			Fix: "一般无需处理。若系统的内核模块其实可用（执行 sudo modprobe wireguard 能成功），" +
+				"到应用中心把本应用停用再启用即可切回标准模式；切换会重建连接，会有一次短暂中断。",
 		})
 	default:
 		out = append(out, InspectItem{
@@ -347,6 +368,30 @@ func judgeInspect(f inspectFacts) []InspectItem {
 			Fix: "这属于系统内核能力问题：请先把 NAS 系统更新到较新版本再试。若更新后仍不支持，请把系统版本与内核版本（uname -r）反馈给我们以便适配。",
 			To:  "logs",
 		})
+	}
+
+	// ②' 最近一次下发结果：这是「配置看起来改好了、其实没写进内核」的唯一信号。
+	//
+	// 早先它只躺在运行记录里：真机上出现过「重启后异地组网断了、界面一切正常、
+	// 到设备列表里随便保存一下就恢复」，用户完全无从判断为什么——原因就是那一轮收敛
+	// 有连接没下发成功（单条失败不阻断其余连接，见 wgback.Apply），而界面不显示。
+	// 演示模式不参与：它不碰内核，报「下发成功」没有意义。
+	if f.Health.AgentUp && !demo {
+		if f.Health.Error != "" {
+			out = append(out, InspectItem{
+				Key: "apply", Level: InspectError,
+				Title:  "配置下发失败，部分连接可能没在工作",
+				Detail: "把配置写入系统时出错：" + f.Health.Error,
+				Fix:    "本应用每 10 秒会自动重试；若持续失败，请到「运行记录」查看详情并把该条信息反馈给我们。",
+				To:     "logs",
+			})
+		} else {
+			out = append(out, InspectItem{
+				Key: "apply", Level: InspectOK,
+				Title:  "最近一次配置下发成功",
+				Detail: "当前连接与规则都已写入系统；此后的改动若失败会在这里报出。",
+			})
+		}
 	}
 
 	// ③ 网络自检读不到：说清原因，并跳过所有依赖它的小节。
@@ -663,6 +708,34 @@ func judgeInspect(f inspectFacts) []InspectItem {
 				Key: "backup", Level: InspectOK,
 				Title:  "计划备份正常",
 				Detail: detail + "。",
+			})
+		}
+	}
+
+	// ⑬ 本机连接网段与「另一台 NAS 已占用网段」重叠。
+	//
+	// 不报成 error：隧道本身仍然是通的，只是那几台设备互相访问不到 ——
+	// 报成 error 会让人以为整条组网断了，去查一通端口与公钥，方向全错。
+	// 没有对端台账（老邀请导入的、或还没导入过）时不产生任何条目：宁可不说话，也不说一句无用的结论。
+	if len(f.SiteOccupied) > 0 {
+		if len(f.SiteOverlap) > 0 {
+			out = append(out, InspectItem{
+				Key: "site-subnet-overlap", Level: InspectWarning,
+				Title: "本机连接网段与另一台 NAS 已占用的网段重复",
+				Detail: strings.Join(f.SiteOverlap, "；") + " 与另一台 NAS 已占用的网段重叠。" +
+					"两端同网段里的设备会拿到相同的地址，互相访问会被本机直连路由截住（永远不通），" +
+					"表现为「能访问对端 NAS，却访问不了对端的某几台设备」。",
+				Fix: "到「我的连接」把上面那条连接的「本机专用地址」换成别的网段（新建时留空会自动挑一个不冲突的）；" +
+					"改完该连接下的设备需要重新扫码一次。",
+				To: "interfaces",
+			})
+		} else {
+			out = append(out, InspectItem{
+				Key: "site-subnet-overlap", Level: InspectOK,
+				Title:  "本机网段与另一台 NAS 已占用的网段没有重复",
+				Detail: fmt.Sprintf("对端已占用 %s，本机连接都避开了。", strings.Join(f.SiteOccupied, "、")),
+				Fix: "无需处理。这份清单是导入那一刻对方的占用情况，对方之后新增的连接不会同步过来；" +
+					"本机新建连接时请留意不要与对端撞车。",
 			})
 		}
 	}

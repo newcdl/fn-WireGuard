@@ -259,9 +259,12 @@ func (s *Service) checkClientAllowedIPs(ctx context.Context, ifaces []model.Inte
 				return true, fmt.Sprintf("设备「%s」的通行范围 %s 已包含家里网段 %s",
 					describePeer(p), strings.Join(allowed, "、"), strings.Join(home, "、"))
 			}
+			// 只说**真缺的那几段**：此前这里把整个家里网段列表念一遍，于是会出现
+			// 「通行范围是 192.168.2.0/24，不含家里网段 192.168.2.0/24」这种自相矛盾的结论 ——
+			// 用户看到的是一个明明已经配好的网段，只能去改一个本来没问题的设置（真机反馈过）。
 			return false, fmt.Sprintf(
-				"设备「%s」的通行范围是 %s，不含家里网段 %s —— 设备根本不会把访问家里其它设备的流量送进隧道",
-				describePeer(p), strings.Join(allowed, "、"), strings.Join(home, "、"))
+				"设备「%s」的通行范围是 %s，缺家里网段 %s —— 设备根本不会把访问家里其它设备的流量送进隧道",
+				describePeer(p), strings.Join(allowed, "、"), strings.Join(missingSubnets(allowed, home), "、"))
 		}
 	}
 	return false, "这些连接下还没有已启用的设备，先在「我的设备」里添加一台并重新生成二维码"
@@ -272,6 +275,27 @@ func describePeer(p *model.Peer) string {
 		return p.Name
 	}
 	return fmt.Sprintf("#%d", p.ID)
+}
+
+// missingSubnets 返回 home 里没有被 allowed 覆盖的那些（保持原顺序、去重）。
+//
+// 只说真缺的：报「整个列表」会得出「范围是 X、却说不含 X」这种自相矛盾的结论，
+// 用户照着改只会改坏一个本来正确的设置。
+func missingSubnets(allowed, home []string) []string {
+	out := []string{}
+	for _, h := range home {
+		if cidrCoversAll(allowed, []string{h}) {
+			continue
+		}
+		if !containsString(out, h) {
+			out = append(out, h)
+		}
+	}
+	if len(out) == 0 {
+		// 覆盖不全却算不出缺哪一段（只可能是解析失败的脏数据）：退回原样，不编造结论。
+		return home
+	}
+	return out
 }
 
 // cidrCoversAll 判断 allowed 里的网段是否已完整覆盖 home 里的每个网段。

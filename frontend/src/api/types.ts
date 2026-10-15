@@ -11,7 +11,8 @@ export interface WgInterface {
   mtu: number
   addresses: string[]
   dns: string[]
-  dns_mode: 'client' | 'host' | 'off'
+  /** 连接里填的 DNS 是否下发给设备；host 是历史值（从未生效过），后端按 client 处理 */
+  dns_mode: 'client' | 'off'
   route_table: string
   pre_up: string
   post_up: string
@@ -35,6 +36,10 @@ export interface WgInterface {
   rx_rate?: number
   tx_rate?: number
   backend?: string
+  /** 用途（派生）：'site' = 异地组网；空 = 普通连接（设备接入） */
+  kind?: string
+  /** 对外访问地址的端口与本连接监听端口不一致时的提示（派生） */
+  port_note?: string
 }
 
 export interface WgPeer {
@@ -77,6 +82,8 @@ export interface WgPeer {
   tx_bytes?: number
   rx_rate?: number
   tx_rate?: number
+  /** 这条条目代表的是「另一台 NAS」（站点互联对端），不是一台接入设备（派生） */
+  site_link?: boolean
 }
 
 export interface PeerStatus {
@@ -648,7 +655,16 @@ export interface InterconnectCreated {
   invite_json: string
   /** 对端不装本应用时可用的 wg-quick 配置 */
   peer_conf: string
+  /** 对外地址端口 ≠ 本连接监听端口时的提示 */
+  port_note?: string
   warnings: string[]
+}
+
+/** 多 NAS 互联：导入邀请的入参 */
+export interface InterconnectImportInput {
+  text: string
+  /** 本机这条连接要监听的 UDP 端口，0 = 自动分配 */
+  listen_port: number
 }
 
 /** 多 NAS 互联：导入邀请的结果 */
@@ -661,6 +677,38 @@ export interface InterconnectImported {
   tunnel_subnet: string
   allowed_ips: string[]
   client_allowed_ips: string[]
+  /** 本机这条连接实际监听的 UDP 端口 */
+  listen_port: number
+  /** 本机的对外访问地址（host:port） */
+  public_endpoint: string
+  /** 两者不一致时的提示（为空表示一致） */
+  port_note?: string
+  warnings: string[]
+}
+
+/** 多 NAS 互联：导入前的预检结果（只读，不落库） */
+export interface InterconnectPreview {
+  /** 将要新建的连接名 */
+  interface_name: string
+  /** 该连接在隧道里的地址（形如 10.20.0.2/24） */
+  tunnel_address: string
+  tunnel_subnet: string
+  /** 预检选定的监听端口：确认导入后实际就用它 */
+  listen_port: number
+  /** 将要新建的对端条目名 */
+  peer_name: string
+  /** 放行对端使用的来源地址（对端 NAS 地址 + 对端内网网段） */
+  allowed_ips: string[]
+  /** 连上本机的设备会被配置成可访问的范围（本机暴露给对端的网段） */
+  client_allowed_ips: string[]
+  /** 会写进本应用专用策略路由表的网段 */
+  route_subnets: string[]
+  /** 本机主动去连对端用的地址（邀请里没带就是空，由对端发起） */
+  peer_endpoint?: string
+  /** 对外地址端口与本机监听端口不一致时的提示 */
+  port_note?: string
+  /** 对端随邀请带来的「已占用网段」：本机今后新建连接会自动避开 */
+  occupied_by_peer: string[]
   warnings: string[]
 }
 

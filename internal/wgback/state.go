@@ -73,6 +73,13 @@ type State struct {
 	NATIsolateNets []string `json:"nat_isolate_nets,omitempty"`
 	// NATIsolateBlocked 记录隔离开关已打开但规则未能下发的原因。
 	NATIsolateBlocked string `json:"nat_isolate_blocked,omitempty"`
+	// NATSiteDevs / NATSiteSubnets 记录当前生效的「站点间源地址改写」：
+	// 哪些站点连接（出口网卡）的流量被改写了源地址、改写后送去的对端网段。
+	//
+	// 它是「设备连上后能访问另一台 NAS 内网」的关键一步，用户在诊断里要能看到
+	// 「这一步生效了、经的是哪条连接」，否则只能看到现象而不知成因。
+	NATRuleSiteDevs    []string `json:"nat_site_devs,omitempty"`
+	NATRuleSiteSubnets []string `json:"nat_site_subnets,omitempty"`
 	// IPForwardEnabled 记录内核转发开关是否由本应用开启。
 	// 只记录不还原：还原可能影响机器上其它依赖转发的服务。
 	IPForwardEnabled bool `json:"ip_forward_by_us,omitempty"`
@@ -397,6 +404,32 @@ func (s *State) SetIsolateState(switchedOn bool, applied []string, blocked strin
 	}
 	s.NATIsolateNets = append([]string{}, applied...)
 	s.NATIsolateBlocked = blocked
+}
+
+// NATSiteDevs 返回当前生效的站点间改写出口（连接名）副本。
+func (s *State) NATSiteDevs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.NATRuleSiteDevs))
+	copy(out, s.NATRuleSiteDevs)
+	return out
+}
+
+// NATSiteSubnets 返回当前生效的站点间改写对端网段副本。
+func (s *State) NATSiteSubnets() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.NATRuleSiteSubnets))
+	copy(out, s.NATRuleSiteSubnets)
+	return out
+}
+
+// SetNATSite 记录站点间改写的生效情况；传空表示没有生效的站点改写。
+func (s *State) SetNATSite(devs, subnets []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.NATRuleSiteDevs = append([]string{}, devs...)
+	s.NATRuleSiteSubnets = append([]string{}, subnets...)
 }
 
 // IPForwardByUs 返回内核转发开关是否由本应用开启。

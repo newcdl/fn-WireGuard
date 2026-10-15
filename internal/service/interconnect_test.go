@@ -66,12 +66,19 @@ func TestInterconnectRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.TunnelSubnet != "10.10.0.0/24" || created.PeerTunnelAddress != "10.10.0.2" {
-		t.Fatalf("隧道网段与对端地址不对：%s / %s", created.TunnelSubnet, created.PeerTunnelAddress)
+	// 隧道网段是 10.x.0.0/24：x 由**本机基准偏移**决定（同一台机器稳定、不同机器几乎不同），
+	// 因此这里只能断言形状与相对关系，不能写死具体网段 —— 写死就等于把"两台机器必然撞车"
+	// 当成契约，而那正是我们要去掉的行为。
+	if !strings.HasPrefix(created.TunnelSubnet, "10.") || !strings.HasSuffix(created.TunnelSubnet, ".0.0/24") {
+		t.Fatalf("隧道网段应形如 10.x.0.0/24，实际 %s", created.TunnelSubnet)
+	}
+	// 对端隧道地址必须是同一网段里的 .2
+	if want := subnetHost(t, created.TunnelSubnet, 2); created.PeerTunnelAddress != want {
+		t.Fatalf("对端隧道地址应为同网段里的 .2（%s），实际 %s", want, created.PeerTunnelAddress)
 	}
 	// 邀请里给对方的地址要带隧道网段掩码（对方直接拿它当连接地址）
-	if created.Invite.Peer.TunnelAddress != "10.10.0.2/24" {
-		t.Fatalf("邀请里的对端隧道地址应为 10.10.0.2/24，实际 %s", created.Invite.Peer.TunnelAddress)
+	if want := created.PeerTunnelAddress + "/24"; created.Invite.Peer.TunnelAddress != want {
+		t.Fatalf("邀请里的对端隧道地址应为 %s，实际 %s", want, created.Invite.Peer.TunnelAddress)
 	}
 	if created.Invite.Peer.TunnelSubnet != created.TunnelSubnet {
 		t.Fatalf("邀请里的隧道网段要与本机一致：%+v", created.Invite.Peer)
@@ -85,6 +92,15 @@ func TestInterconnectRoundTrip(t *testing.T) {
 	if !strings.Contains(created.PeerConf, created.Invite.Site.PublicKey) {
 		t.Fatalf("wg-quick 配置里应当有本机公钥：\n%s", created.PeerConf)
 	}
+	// 二次加密口令必须随邀请交给对方：生成侧给对端条目生成了口令却不带走，
+	// 两端会因口令不一致**永远握不上手**（真机踩到过：两端流量在涨、
+	// 「最近通信」却一直是「从未」，端口与公网全都正确也救不回来）。
+	if !wgkey.Validate(created.Invite.Peer.PresharedKey) {
+		t.Fatal("邀请里必须带上二次加密口令")
+	}
+	if !strings.Contains(created.PeerConf, created.Invite.Peer.PresharedKey) {
+		t.Fatalf("wg-quick 配置里的口令应与邀请里的一致：\n%s", created.PeerConf)
+	}
 	// 私钥随文件走这件事必须明确告诉用户
 	foundKeyWarn := false
 	for _, w := range created.Warnings {
@@ -96,10 +112,11 @@ func TestInterconnectRoundTrip(t *testing.T) {
 		t.Fatalf("必须提醒「邀请文件含私钥」：%v", created.Warnings)
 	}
 
-	// A 本端：连接与对端条目
+	// A 本端：连接与对端条目（地址都由自动分配给出，因此只断言形状与相对关系）
+	myAddr := subnetHost(t, created.TunnelSubnet, 1) // 本机在隧道里占 .1
 	ifaceA := mustInterface(t, svcA)
-	if len(ifaceA.Addresses) != 1 || ifaceA.Addresses[0] != "10.10.0.1/24" {
-		t.Fatalf("A 的隧道地址应为 10.10.0.1/24：%v", ifaceA.Addresses)
+	if len(ifaceA.Addresses) != 1 || ifaceA.Addresses[0] != myAddr+"/24" {
+		t.Fatalf("A 的隧道地址应为 %s/24：%v", myAddr, ifaceA.Addresses)
 	}
 	if !ifaceA.AllowLAN {
 		t.Fatal("站点互联必须打开「允许设备访问家里内网」：对端局域网里的主机要靠它转发")
@@ -108,11 +125,14 @@ func TestInterconnectRoundTrip(t *testing.T) {
 		t.Fatalf("站点互联要用 client 路由方式（走本应用自己的策略路由表）：%s", ifaceA.RouteTable)
 	}
 	peersA := mustPeers(t, svcA, ifaceA.ID)
-	if got := peersA[0].AllowedIPs; len(got) != 2 || got[0] != "10.10.0.2/32" || got[1] != "192.168.2.0/24" {
+	if got := peersA[0].AllowedIPs; len(got) != 2 || got[0] != created.PeerTunnelAddress+"/32" || got[1] != "192.168.2.0/24" {
 		t.Fatalf("A 的对端准入地址应为对端隧道地址+对端内网：%v", got)
 	}
 	if got := peersA[0].ClientAllowedIPs; len(got) != 1 || got[0] != "192.168.1.0/24" {
 		t.Fatalf("A 给对端的通行范围应为本机暴露的网段：%v", got)
+	}
+	if peersA[0].PresharedKey != created.Invite.Peer.PresharedKey {
+		t.Fatal("本机对端条目的二次加密口令必须与邀请里的一致")
 	}
 	if peersA[0].EndpointHost != "b.example.com" || peersA[0].EndpointPort != 51820 {
 		t.Fatalf("A 的对端条目应当带上对端地址：%+v", peersA[0].EndpointHost)
@@ -123,13 +143,13 @@ func TestInterconnectRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	imported, err := svcB.ImportInterconnect(ctx, inv, actor)
+	imported, err := svcB.ImportInterconnect(ctx, inv, 0, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ifaceB := mustInterface(t, svcB)
-	if len(ifaceB.Addresses) != 1 || ifaceB.Addresses[0] != "10.10.0.2/24" {
-		t.Fatalf("B 的隧道地址应当由邀请给定：%v", ifaceB.Addresses)
+	if len(ifaceB.Addresses) != 1 || ifaceB.Addresses[0] != created.PeerTunnelAddress+"/24" {
+		t.Fatalf("B 的隧道地址应当由邀请给定（%s/24）：%v", created.PeerTunnelAddress, ifaceB.Addresses)
 	}
 	if !ifaceB.AllowLAN || ifaceB.RouteTable != model.RouteTableClient {
 		t.Fatalf("B 侧同样要打开内网访问并用 client 路由：%+v", ifaceB)
@@ -146,8 +166,13 @@ func TestInterconnectRoundTrip(t *testing.T) {
 	if peersB[0].PublicKey != created.Invite.Site.PublicKey {
 		t.Fatal("B 的对端条目应当记 A 的公钥")
 	}
-	if got := peersB[0].AllowedIPs; len(got) != 2 || got[0] != "10.10.0.1/32" || got[1] != "192.168.1.0/24" {
+	if got := peersB[0].AllowedIPs; len(got) != 2 || got[0] != myAddr+"/32" || got[1] != "192.168.1.0/24" {
 		t.Fatalf("B 的对端准入地址应为 A 的隧道地址+A 内网：%v", got)
+	}
+	// 这条断言是本次事故的回归：导入侧必须拿到与邀请一致的口令，
+	// 否则两端的握手会被 WireGuard 直接拒绝（现象仅是「从未连接」）。
+	if peersB[0].PresharedKey != created.Invite.Peer.PresharedKey {
+		t.Fatalf("导入侧的口令必须与邀请一致，实际: %q", peersB[0].PresharedKey)
 	}
 	// B 的对端条目要带上「邀请里写的那个对外地址」——地址本身是 A 探测/配置出来的，
 	// 测试不假设它的取值，只钉住它被原样带过去了。
@@ -257,7 +282,9 @@ func TestInterconnectImportRejectsConflicts(t *testing.T) {
 			Name: "nas-a", TunnelAddress: "10.10.0.1/24", LANSubnets: []string{"192.168.9.0/24"},
 		},
 		Peer: service.InterconnectPeerParams{
-			PrivateKey: mustKey(t), TunnelAddress: "10.10.0.2/24", TunnelSubnet: "10.10.0.0/24", MTU: 1380,
+			PrivateKey:    mustKey(t),
+			PresharedKey:  mustKey(t), // 合法的 32 字节 base64 即可，与私钥同一格式
+			TunnelAddress: "10.10.0.2/24", TunnelSubnet: "10.10.0.0/24", MTU: 1380,
 		},
 	}
 	good.Site.PublicKey = mustPublicKey(t)
@@ -265,7 +292,7 @@ func TestInterconnectImportRejectsConflicts(t *testing.T) {
 	t.Run("标识不对", func(t *testing.T) {
 		inv := good
 		inv.Kind = "something-else"
-		if _, err := svc.ImportInterconnect(ctx, inv, actor); err == nil ||
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
 			!strings.Contains(err.Error(), "不是本应用的互联邀请") {
 			t.Fatalf("应拒绝无关内容：%v", err)
 		}
@@ -273,7 +300,7 @@ func TestInterconnectImportRejectsConflicts(t *testing.T) {
 	t.Run("版本过新", func(t *testing.T) {
 		inv := good
 		inv.Version = service.InterconnectVersion + 1
-		if _, err := svc.ImportInterconnect(ctx, inv, actor); err == nil ||
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
 			!strings.Contains(err.Error(), "更新版本") {
 			t.Fatalf("应提示升级：%v", err)
 		}
@@ -281,7 +308,7 @@ func TestInterconnectImportRejectsConflicts(t *testing.T) {
 	t.Run("声明的隧道网段与地址对不上", func(t *testing.T) {
 		inv := good
 		inv.Peer.TunnelSubnet = "10.99.0.0/24"
-		if _, err := svc.ImportInterconnect(ctx, inv, actor); err == nil ||
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
 			!strings.Contains(err.Error(), "不在隧道网段") {
 			t.Fatalf("应拒绝损坏的邀请：%v", err)
 		}
@@ -289,15 +316,23 @@ func TestInterconnectImportRejectsConflicts(t *testing.T) {
 	t.Run("隧道地址不在网段内", func(t *testing.T) {
 		inv := good
 		inv.Peer.TunnelAddress = "10.11.0.2/24"
-		if _, err := svc.ImportInterconnect(ctx, inv, actor); err == nil ||
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
 			!strings.Contains(err.Error(), "不在隧道网段") {
 			t.Fatalf("应拒绝损坏的邀请：%v", err)
+		}
+	})
+	t.Run("缺少二次加密口令", func(t *testing.T) {
+		inv := good
+		inv.Peer.PresharedKey = ""
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
+			!strings.Contains(err.Error(), "二次加密口令") {
+			t.Fatalf("旧版（缺口令）的邀请必须被拒绝并说清原因：%v", err)
 		}
 	})
 	t.Run("两端内网网段撞车", func(t *testing.T) {
 		inv := good
 		inv.Site.LANSubnets = []string{"192.168.1.0/24"} // 与本机家里网段相同
-		if _, err := svc.ImportInterconnect(ctx, inv, actor); err == nil ||
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
 			!strings.Contains(err.Error(), "重叠") {
 			t.Fatalf("两端内网网段相同时应拒绝：%v", err)
 		}
@@ -311,14 +346,14 @@ func TestInterconnectImportRejectsConflicts(t *testing.T) {
 		inv.Peer.TunnelAddress = "10.12.0.2/24"
 		inv.Peer.TunnelSubnet = "10.12.0.0/24"
 		inv.Site.PublicKey = pub
-		if _, err := svc.ImportInterconnect(ctx, inv, actor); err == nil ||
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
 			!strings.Contains(err.Error(), "公钥") {
 			t.Fatalf("公钥重复时应拒绝：%v", err)
 		}
 	})
 	t.Run("隧道网段与已有连接冲突", func(t *testing.T) {
 		inv := good
-		if _, err := svc.ImportInterconnect(ctx, inv, actor); err == nil ||
+		if _, err := svc.ImportInterconnect(ctx, inv, 0, actor); err == nil ||
 			!strings.Contains(err.Error(), "隧道网段") {
 			t.Fatalf("隧道网段与已有连接重叠时应拒绝：%v", err)
 		}
@@ -347,8 +382,121 @@ func TestInterconnectSecondLinkGetsOwnTunnel(t *testing.T) {
 	if second.TunnelSubnet == first.TunnelSubnet {
 		t.Fatalf("第二条互联应当自动换一个隧道网段：都是 %s", first.TunnelSubnet)
 	}
-	if second.PeerTunnelAddress != "10.11.0.2" {
-		t.Fatalf("第二条互联的对端地址应为新网段里的 .2：%s", second.PeerTunnelAddress)
+	if want := subnetHost(t, second.TunnelSubnet, 2); second.PeerTunnelAddress != want {
+		t.Fatalf("第二条互联的对端地址应为它自己网段里的 .2（%s）：%s", want, second.PeerTunnelAddress)
+	}
+}
+
+// TestInterconnectInviteRebuild 覆盖两件事：
+//  1. 已生成的邀请能「再次查看」，且与生成时**逐字一致**（同一份推导，不是两套逻辑）；
+//  2. 列表能一眼认出「哪条连接是异地组网、哪条条目是对端 NAS」（派生标记，不落库）。
+func TestInterconnectInviteRebuild(t *testing.T) {
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+	svc, _ := newTestEnv(t)
+
+	created, err := svc.CreateInterconnect(ctx, service.InterconnectInput{
+		PeerName: "nas-b", PeerLANSubnets: []string{"192.168.3.0/24"}, LocalLANSubnets: []string{"192.168.2.0/24"},
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 派生标记：连接是「异地组网」，条目是「对端 NAS」
+	ifaces, err := svc.ListInterfaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ifaces) != 1 || ifaces[0].Kind != model.IfaceKindSite {
+		t.Fatalf("互联连接应被标为异地组网，实际：%+v", ifaces)
+	}
+	peers, err := svc.ListPeers(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 1 || !peers[0].SiteLink {
+		t.Fatalf("站点条目应被标出来，实际：%+v", peers)
+	}
+
+	// 再次查看：内容必须与当初生成的那份一致
+	again, err := svc.InterconnectInvite(ctx, created.PeerID, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.InviteJSON != created.InviteJSON {
+		t.Fatalf("重现的邀请应与生成时逐字一致：\n生成：\n%s\n重现：\n%s", created.InviteJSON, again.InviteJSON)
+	}
+	if !wgkey.Validate(again.Invite.Peer.PresharedKey) {
+		t.Fatal("重现的邀请必须带上二次加密口令")
+	}
+	if again.Invite.Site.Endpoint != created.Invite.Site.Endpoint {
+		t.Fatalf("对外地址应一致：%q / %q", again.Invite.Site.Endpoint, created.Invite.Site.Endpoint)
+	}
+
+	// 普通设备没有「邀请」可看：必须说清而不是给一份奇怪的配置
+	dev, err := svc.CreatePeer(ctx, service.PeerInput{
+		InterfaceID: ifaces[0].ID, Name: "我的电脑", GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.InterconnectInvite(ctx, dev.ID, actor); err == nil ||
+		!strings.Contains(err.Error(), "不是互联条目") {
+		t.Fatalf("普通设备不该有互联邀请，实际：%v", err)
+	}
+}
+
+// TestInterconnectImportListenPort 导入时允许指定本机监听端口，并把「对外端口 vs 监听端口」
+// 的不一致提示出来 —— 这类错配的现象只有「对端一直连不上本机」，不提示就只能靠猜。
+func TestInterconnectImportListenPort(t *testing.T) {
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester"}
+	svcA, _ := newTestEnv(t)
+	svcB, _ := newTestEnv(t)
+
+	// 本机的对外地址用 51820（外部端口），而这条连接要监听 51821 —— 靠映射换算的常见形态。
+	if err := svcB.SetSettings(ctx, map[string]string{"server_endpoint": "www.example.com:51820"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	created, err := svcA.CreateInterconnect(ctx, service.InterconnectInput{
+		PeerName: "nas-b", PeerLANSubnets: []string{"192.168.3.0/24"}, LocalLANSubnets: []string{"192.168.2.0/24"},
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, err := service.ParseInterconnectInvite([]byte(created.InviteJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svcB.ImportInterconnect(ctx, inv, 51821, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ListenPort != 51821 {
+		t.Fatalf("指定的监听端口应生效，实际：%d", got.ListenPort)
+	}
+	if got.PublicEndpoint != "www.example.com:51820" {
+		t.Fatalf("应回报本机对外地址，实际：%q", got.PublicEndpoint)
+	}
+	if !strings.Contains(got.PortNote, "51820") || !strings.Contains(got.PortNote, "51821") {
+		t.Fatalf("端口不一致时必须提示两个端口，实际：%q", got.PortNote)
+	}
+
+	// 端口被别的连接占用时当场拒绝（否则连建好也起不来）
+	created2, err := svcA.CreateInterconnect(ctx, service.InterconnectInput{
+		PeerName: "nas-c", PeerLANSubnets: []string{"192.168.4.0/24"}, LocalLANSubnets: []string{"192.168.2.0/24"},
+	}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv2, err := service.ParseInterconnectInvite([]byte(created2.InviteJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svcB.ImportInterconnect(ctx, inv2, 51821, actor); err == nil ||
+		!strings.Contains(err.Error(), "占用") {
+		t.Fatalf("端口已被占用时应拒绝，实际：%v", err)
 	}
 }
 

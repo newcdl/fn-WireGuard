@@ -160,13 +160,13 @@ func TestSplitClientAndServerIPs(t *testing.T) {
 }
 
 func TestRenderClient(t *testing.T) {
-	it := &model.Interface{DNS: []string{"223.5.5.5"}, MTU: 1420}
 	p := &model.Peer{Name: "手机", PresharedKey: "psk", Keepalive: 25}
-	out := RenderClient("serverpub", it, p, RenderClientOptions{
+	out := RenderClient("serverpub", p, RenderClientOptions{
 		Endpoint:         "vpn.example.com:51820",
 		ClientPrivateKey: "clientpriv",
 		ClientAddress:    []string{"10.10.0.2/32"},
 		AllowedIPs:       []string{"0.0.0.0/0", "::/0"},
+		DNS:              []string{"223.5.5.5"},
 	})
 	for _, want := range []string{
 		"PrivateKey = clientpriv",
@@ -180,6 +180,29 @@ func TestRenderClient(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("客户端配置缺少 %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestRenderClientDoesNotFallBack 渲染层不做任何兜底 —— 这两处兜底曾经把调用方的语义悄悄换掉。
+//
+// ① DNS 为空就是「不下发」：回落成连接里配置的 DNS，会让「不下发」变成「下发」，
+//
+//	而设备配置指纹是按调用方算出的值算的，两边因此永远对不上（界面显示「需重新扫码」）；
+//
+// ② 通行范围为空就不写这一行：兜底成 0.0.0.0/0 会把设备的**全部上网流量**塞进隧道，
+//
+//	而用户以为的仍是「只访问家里设备」。
+func TestRenderClientDoesNotFallBack(t *testing.T) {
+	out := RenderClient("serverpub", &model.Peer{Name: "手机"}, RenderClientOptions{
+		Endpoint:         "vpn.example.com:51820",
+		ClientPrivateKey: "clientpriv",
+		ClientAddress:    []string{"10.10.0.2/32"},
+	})
+	if strings.Contains(out, "DNS =") {
+		t.Fatalf("未指定 DNS 时不该写出 DNS 行：\n%s", out)
+	}
+	if strings.Contains(out, "AllowedIPs") {
+		t.Fatalf("未指定通行范围时不该写出 AllowedIPs 行（更不能兜底成 0.0.0.0/0）：\n%s", out)
 	}
 }
 

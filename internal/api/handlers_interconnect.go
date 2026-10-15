@@ -15,6 +15,10 @@ import (
 // 由后端去解析与校验，报错信息也就能直接照原样显示（哪一项不对、为什么不对）。
 type interconnectImportRequest struct {
 	Text string `json:"text"`
+	// ListenPort 是本机这条连接要监听的 UDP 端口，0 = 自动分配。
+	// 允许指定是因为「外部端口 ≠ 本机端口」很常见（路由器映射、内网穿透），
+	// 与外部端口对不上时对端永远连不上，而现象只有「一直离线」。
+	ListenPort int `json:"listen_port"`
 }
 
 // handleCreateInterconnect 生成一份互联邀请：本端建好连接与对端条目，并返回要交给对方的文件。
@@ -47,7 +51,48 @@ func (s *Server) handleImportInterconnect(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	out, err := s.svc.ImportInterconnect(r.Context(), inv, actorOf(r))
+	out, err := s.svc.ImportInterconnect(r.Context(), inv, req.ListenPort, actorOf(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handlePreviewInterconnect 导入前的预检：把「将要建什么、会有什么后果」算出来给用户确认。
+//
+// 与 handleImportInterconnect 共用同一个请求体，前端因此可以把用户在对话框里填的监听端口
+// 原样带过来 —— 预检给出的端口就是他最终会得到的那个，确认框里的话才有意义。
+// 它是只读的：不落库、不下发，也不写审计。
+func (s *Server) handlePreviewInterconnect(w http.ResponseWriter, r *http.Request) {
+	var req interconnectImportRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	inv, err := service.ParseInterconnectInvite([]byte(req.Text))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.svc.PreviewInterconnect(r.Context(), inv, req.ListenPort)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleInterconnectInvite 重现一份已生成的互联邀请。
+//
+// 权限按「查看密钥」同级校验：邀请里含对端连接的私钥与二次加密口令，
+// 等同于把对方那条连接交出去；没有该权限的账号应当只能看到条目、看不到邀请。
+func (s *Server) handleInterconnectInvite(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idOrFail(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.svc.InterconnectInvite(r.Context(), id, actorOf(r))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

@@ -207,7 +207,6 @@ import { api } from '@/api/client'
 import type { AuditEntry, LogEntry } from '@/api/types'
 import ItemCard from '@/components/ItemCard.vue'
 import TrafficReport from '@/components/TrafficReport.vue'
-import { useBreakpoint } from '@/composables/useBreakpoint'
 import { formatTime } from '@/utils/format'
 import ViewSwitch from '@/components/ViewSwitch.vue'
 import { useViewMode } from '@/composables/useViewMode'
@@ -216,8 +215,6 @@ import { useViewMode } from '@/composables/useViewMode'
 // 表格 / 卡片视图：由用户决定并记住（两个列表各用一个键，切一个不会连带另一个）
 const { mode: auditViewMode, isTable: auditIsTable } = useViewMode('logs-audit')
 const { mode: runtimeViewMode, isTable: runtimeIsTable } = useViewMode('logs-runtime')
-
-const { isMobile } = useBreakpoint()
 
 const tab = ref('audit')
 

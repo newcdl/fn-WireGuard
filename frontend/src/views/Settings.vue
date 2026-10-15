@@ -900,6 +900,7 @@ import type {
   Health,
   NotifyResult,
   NotifyStatus,
+  SnapshotCreateResult,
   SnapshotDiff,
   SnapshotDiffSection,
   User,
@@ -1185,7 +1186,6 @@ async function loadHealth() {
  * 于是一个已经设过码的实例会看起来像没设（用户实测撞上的就是这个）。
  */
 const securityCodeState = ref<'yes' | 'no' | 'unknown'>('unknown')
-const securityCodeConfigured = computed(() => securityCodeState.value === 'yes')
 const securityCodeDialog = ref(false)
 const newSecurityCode = ref('')
 const savedSecurityCode = ref(false)
@@ -1266,7 +1266,7 @@ async function createSnapshot() {
   }
   snapshotCreating.value = true
   try {
-    const res = await api.post<{ created: boolean; message?: string }>('/snapshots', { note })
+    const res = await api.post<SnapshotCreateResult>('/snapshots', { note })
     if (res.created) ElMessage.success('已留档')
     else ElMessage.info(res.message || '当前配置与最近一份快照一致，未重复留档')
     await loadSnapshots()
@@ -1395,16 +1395,6 @@ async function sendTestNotify() {
     ElMessage.error((e as Error).message)
   } finally {
     testingNotify.value = false
-  }
-}
-
-async function forceReconcile() {
-  try {
-    const res = await api.post<{ actions: string[] }>('/system/reconcile')
-    ElMessage.success(res.actions?.length ? `已重新应用 ${res.actions.length} 项设置` : '当前状态与配置一致，无需变更')
-    await loadHealth()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
   }
 }
 

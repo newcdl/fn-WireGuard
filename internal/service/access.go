@@ -34,6 +34,11 @@ type AccessIssue struct {
 // 矛盾类型。按「最该先处理」的顺序排列，逐台设备只报告优先级最高的一条 ——
 // 一次抛出四条互相重叠的结论只会让用户更糊涂。
 const (
+	// hitAddrOutside 设备的登记地址全部落在本连接隧道网段之外 —— 这台设备物理上连不上。
+	// 排在最前：它是「根本没通」，其余都是「通了但某个方向被挡住」。
+	hitAddrOutside = "peer_addr_outside_tunnel"
+	// hitSiteAdmitCross 站点条目放行的网段与本机另一条连接的隧道网段重叠。
+	hitSiteAdmitCross = "site_admit_cross_interface"
 	// hitScopeDefault 自定义通行范围里写了默认路由。
 	hitScopeDefault = "scope_default_route"
 	// hitScopeCross 通行范围与另一条连接的专用地址重叠。
@@ -98,6 +103,22 @@ func (s *Service) diagnoseInterfaceAccess(ctx context.Context, it *model.Interfa
 		name := displayPeerName(p)
 
 		switch {
+		case peerAddrsOutsideTunnel(it, p):
+			// 优先级最高：这台设备**根本没通**。它的地址不在隧道网段里，配置照常生成、
+			// 二维码看起来完全正常，但本机没有回到那个地址的路由，回包被直接丢弃。
+			// 最容易踩到的路径：为了避免多台 NAS 撞车改了连接的网段，而旧设备地址没跟着改。
+			hits[hitAddrOutside] = append(hits[hitAddrOutside], name)
+			if _, ok := details[hitAddrOutside]; !ok {
+				details[hitAddrOutside] = strings.Join(p.AllowedIPs, "、")
+			}
+		case isSitePeer(p) && crossOverlaps(extra, others):
+			// 站点条目放行的网段撞上了本机另一条连接的专用地址：从本机（或它的设备）
+			// 访问那个网段会被本地那条连接截住，到不了对端 —— 与「通行范围重叠」同一类问题，
+			// 但方向相反，所以单独一类。
+			if _, ok := details[hitSiteAdmitCross]; !ok {
+				details[hitSiteAdmitCross] = crossDetail(extra, others)
+			}
+			hits[hitSiteAdmitCross] = append(hits[hitSiteAdmitCross], name)
 		case p.RouteMode == model.RouteModeCustom && hasDefaultRoute(scope):
 			hits[hitScopeDefault] = append(hits[hitScopeDefault], name)
 		case crossOverlaps(scope, others):
@@ -115,7 +136,7 @@ func (s *Service) diagnoseInterfaceAccess(ctx context.Context, it *model.Interfa
 
 	out := []AccessIssue{}
 	// 固定顺序输出，保证界面上的呈现稳定（不会每轮刷新换位置）。
-	for _, kind := range []string{hitScopeDefault, hitScopeCross, hitScopeIsolate, hitScopeNeedsLAN} {
+	for _, kind := range []string{hitAddrOutside, hitSiteAdmitCross, hitScopeDefault, hitScopeCross, hitScopeIsolate, hitScopeNeedsLAN} {
 		names := hits[kind]
 		if len(names) == 0 {
 			continue
@@ -131,6 +152,22 @@ func accessIssue(kind string, it *model.Interface, names []string, detail string
 	who := fmt.Sprintf("连接「%s」上的 %s", it.Name, peerListText(names))
 	issue := AccessIssue{Key: kind, InterfaceID: it.ID, To: "interfaces"}
 	switch kind {
+	case hitAddrOutside:
+		// 处理入口在设备页：改的是那台设备的地址，不是这条连接的设置。
+		issue.To = "peers"
+		issue.Title = "有设备的地址不在连接的隧道网段里，它连不上"
+		issue.Detail = fmt.Sprintf("%s 的登记地址是 %s，落在本连接的隧道网段 %s 之外："+
+			"它的配置里会带一个隧道外的地址，握手能成、回包却没有路可走，现象只是「怎么都连不上」。",
+			who, detail, strings.Join(cidrStrings(it.Addresses), "、"))
+		issue.Fix = "到「我的设备」编辑它，把「分配给这台设备的内部地址」改成隧道网段内的地址" +
+			"（例如该网段里的 .2），保存后重新生成二维码导入一次。" +
+			"若是为了避免多台 NAS 网段撞车刚改过这条连接的网段，把该连接下的设备地址逐台改过来即可。"
+	case hitSiteAdmitCross:
+		issue.Title = "对端条目放行的网段与本机另一条连接撞车"
+		issue.Detail = fmt.Sprintf("%s 放行的网段（%s）与本机另一条连接的专用地址重叠："+
+			"从本机访问该网段会被本地那条连接截住，到不了对端。", who, detail)
+		issue.Fix = "把其中一侧那条连接的「本机专用地址」换成别的网段（改完它下面的设备需要重新扫码），" +
+			"或到「我的设备」把这条对端条目准入地址里重叠的网段去掉。"
 	case hitScopeDefault:
 		issue.Title = "有设备的通行范围写成了「全部流量」"
 		issue.Detail = fmt.Sprintf("%s 的范围里含 0.0.0.0/0：设备的上网流量也会全部走这条连接，"+
@@ -153,6 +190,41 @@ func accessIssue(kind string, it *model.Interface, names []string, detail string
 		issue.Fix = "到「我的连接」把这条连接的「内网访问」开关打开；若本就不该访问内网，请改小设备的通行范围。"
 	}
 	return issue
+}
+
+// peerAddrsOutsideTunnel 判断一台设备的登记地址是否**全部**落在本连接隧道网段之外。
+//
+// 这类设备连不上，而且以前完全没有提示：地址一个都不在隧道网段里时，生成的配置会把它们
+// 降级当成「可通过隧道访问的网段」，于是设备那份配置里带的是一个隧道外的地址 ——
+// 握手能成，但本机没有回到那个地址的路由，回包被直接丢弃，现象只是「怎么都连不上」。
+//
+// 最容易踩到的路径：为了避免多台 NAS 默认网段撞车，把连接的「本机专用地址」改成了别的网段，
+// 而这条连接下已有设备的地址没跟着改（它们仍留在旧网段里）。
+func peerAddrsOutsideTunnel(it *model.Interface, p *model.Peer) bool {
+	if len(it.Addresses) == 0 || len(p.AllowedIPs) == 0 {
+		return false // 连接还没有地址时另有结论，不在这一条里重复报
+	}
+	subs := make([]*net.IPNet, 0, len(it.Addresses))
+	for _, a := range it.Addresses {
+		if _, n, err := net.ParseCIDR(strings.TrimSpace(a)); err == nil {
+			subs = append(subs, n)
+		}
+	}
+	if len(subs) == 0 {
+		return false
+	}
+	for _, a := range p.AllowedIPs {
+		ip, _, err := net.ParseCIDR(strings.TrimSpace(a))
+		if err != nil {
+			continue
+		}
+		for _, sn := range subs {
+			if sn.Contains(ip) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // hasDefaultRoute 判断一组网段里是否含默认路由写法。
