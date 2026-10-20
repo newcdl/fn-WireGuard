@@ -67,13 +67,40 @@ func (s *Service) GetInterface(ctx context.Context, id int64) (*model.Interface,
 	return it, nil
 }
 
-// portNoteFor 推导「对外访问地址的端口 ≠ 本连接监听端口」的提示（派生，不落库）。
+// portNoteFor 推导「这条连接能不能从外网连回来」的提示（派生，不落库）。
 //
 // 放在列表与详情两条读路径上：这条提示必须在**平时**就能看见，
-// 否则用户只有在「对端连不上本机」时才会去猜端口。
+// 否则用户只有在「设备/对端连不上」时才会去猜端口。
 func (s *Service) portNoteFor(ctx context.Context, it model.Interface) string {
 	endpoint, _ := s.serverEndpoint(ctx, &it)
-	return portNoteIfMismatch(&it, endpoint)
+	note := portNoteIfMismatch(&it, endpoint)
+	if note == "" {
+		return ""
+	}
+	// 端口不一致有两种情形，处置完全不同，混成一句话会让一半的人查错方向：
+	//   a) 另一条连接正好监听这个外部端口 —— 外部的包已经转给它了，本连接在外网不可能被连上，
+	//      要改的是「系统设置里的端口」；
+	//   b) 没有连接监听这个端口 —— 用户是把外部端口交给路由器换算到本机端口，
+	//      可以工作，但必须真的转得通（真机踩过：以为转好了，其实没有），要查的是路由器。
+	_, ext := splitHostPort(endpoint)
+	if ext <= 0 {
+		return note
+	}
+	others, err := s.otherInterfaces(ctx, it.ID)
+	if err != nil {
+		// 读不到其它连接时退回软提示：这是解释性文案，不值得让它挡住列表。
+		return note
+	}
+	for _, o := range others {
+		if o.Enabled && o.ListenPort == ext {
+			return fmt.Sprintf("对外访问地址用的是 %d 端口，而这个端口正由连接「%s」监听："+
+				"一个外部端口同一时刻只能转给一条连接，所以这条连接从外网连不回来。"+
+				"到「系统设置 → 接入设置」把对外访问地址里的端口去掉（只留域名或 IP），"+
+				"每条连接就会各自用自己的端口；若确实只能用一个外部端口，就只让「%s」对外接客，"+
+				"其余连接只用于站点互联", ext, o.Name, o.Name)
+		}
+	}
+	return note
 }
 
 // markSiteInterfaces 填「这条连接是异地组网还是普通连接」的派生标记（不落库）。

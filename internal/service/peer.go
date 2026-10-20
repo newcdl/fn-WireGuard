@@ -487,6 +487,14 @@ func (s *Service) PeerConfig(ctx context.Context, id int64) (*PeerConfigResult, 
 		return nil, err
 	}
 	endpoint, warn := s.serverEndpoint(ctx, it)
+	// 端口对不上时把结论直接带进二维码页面：用户正是在这一步复制地址、转发配置，
+	// 那一刻不说，他就只能等「怎么都连不上」再回来猜（列表里那行提示未必会再被看一眼）。
+	if note := s.portNoteFor(ctx, *it); note != "" {
+		if warn != "" {
+			warn += "；"
+		}
+		warn += note
+	}
 	// 站点互联的对端条目不是「一台设备」：它代表的就是**对面那台 NAS**，
 	// 生成的配置里带着对端连接的私钥与隧道地址。
 	//
@@ -716,20 +724,53 @@ func cachedLocalIPv4() string {
 	return v
 }
 
+// serverEndpoint 解析「这台设备/这个对端该连到哪个地址」，供二维码、邀请与配置指纹共用。
+//
+// 端口策略（多连接）：
+//   - 设置里只写了主机名/IP（不带端口）→ 按**本连接**的 ListenPort 拼接。
+//     这样每条连接各有各的外部端口（同号映射，路由器上放行哪个就通哪条），多连接才能同时对外。
+//   - 设置里写了端口 → 原样使用（兼容既有配置）。一个外部端口同一时刻只能转给一条连接，
+//     所以此时只有监听该端口的那条连接能从外网回来，其余由 portNoteFor 常驻提示。
+//
+// 为什么不能一律用设置值：此前就是这么做的，于是第二条连接监听 51821 时，
+// 它的二维码里仍写 51820 —— 握手包落到 wg0 上、公钥对不上，现象只有「一直连不上」，
+// 状态与日志里都看不出与端口有关（真机踩到过）。
 func (s *Service) serverEndpoint(ctx context.Context, it *model.Interface) (string, string) {
 	if v := s.Store.GetSetting(ctx, "server_endpoint", ""); v != "" {
-		return v, ""
+		return endpointForInterface(v, it.ListenPort), ""
 	}
 	ip := cachedLocalIPv4()
 	if ip == "" {
 		return "", "尚未配置「服务端对外地址」，二维码中的 Endpoint 为空，请到系统设置中填写公网域名或 IP"
 	}
-	port := it.ListenPort
-	if port == 0 {
+	return endpointForInterface(ip, it.ListenPort),
+		"当前 Endpoint 使用自动探测的本机地址，公网访问请到系统设置中配置 DDNS 域名或公网 IP"
+}
+
+// endpointForInterface 把「对外访问地址」的设置值补成这条连接可用的 host:port。
+//
+// 已带端口就原样返回：用户显式写了端口，意味着他自己配了「外部端口 → 本机端口」的映射，
+// 本应用擅自改掉会让路由器上那条映射失效，而那只存在他自己的路由器里，改错了两边都对不上。
+// 没带端口时才补上本连接的监听端口 —— 同号映射最省事，也最不容易错。
+func endpointForInterface(host string, listenPort int) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	// "example.com:51820" → 已指定端口；"example.com:"（手滑留下冒号）视同没写端口。
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		if p != "" {
+			return host
+		}
+		host = h
+	}
+	// 用户可能把 IPv6 连方括号一起填进来（[fd00::1]），JoinHostPort 会再包一层，变成 [[fd00::1]]。
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	port := listenPort
+	if port <= 0 {
 		port = defaultListenPort
 	}
-	return net.JoinHostPort(ip, strconv.Itoa(port)),
-		"当前 Endpoint 使用自动探测的本机地址，公网访问请到系统设置中配置 DDNS 域名或公网 IP"
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func (s *Service) validatePeer(ctx context.Context, p *model.Peer, selfID int64) error {

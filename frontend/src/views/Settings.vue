@@ -17,7 +17,22 @@
           <el-form :model="settings" class="fnwg-form" :label-position="isMobile ? 'top' : 'right'" label-width="150px">
             <el-form-item>
               <template #label><FieldLabel :meta="S.server_endpoint" /></template>
-              <el-input v-model="settings.server_endpoint" placeholder="例如 home.example.com:51820" />
+              <el-input v-model="settings.server_endpoint" placeholder="例如 home.example.com（推荐不带端口）" />
+              <!-- 写了端口就只剩一个外部入口：这条必须当场说，否则用户填完就走，
+                   等到「怎么都连不上」时已经想不起与这里有关（真机踩过）。 -->
+              <el-alert
+                v-if="endpointPortConflicts.length"
+                type="warning"
+                :closable="false"
+                show-icon
+                style="margin-top: 8px"
+              >
+                <template #title>
+                  这里写死了 {{ endpointExternalPort }} 端口：一个外部端口同一时刻只能转给一条连接，
+                  所以只有监听 {{ endpointExternalPort }} 的那条连接连得回来；{{ endpointPortConflicts.join('、') }}
+                  会显示「外网接不回」。把端口去掉、只留域名或 IP，每条连接就会各自用自己的端口。
+                </template>
+              </el-alert>
               <FieldTips :meta="S.server_endpoint" example />
             </el-form-item>
 
@@ -904,6 +919,7 @@ import type {
   SnapshotDiff,
   SnapshotDiffSection,
   User,
+  WgInterface,
 } from '@/api/types'
 import ConfigHelpDrawer from '@/components/ConfigHelpDrawer.vue'
 import SecurityCodeBlock from '@/components/SecurityCodeBlock.vue'
@@ -940,6 +956,55 @@ const settings = reactive<Record<string, string>>({
   default_dns: '',
 })
 const savingSettings = ref(false)
+
+// 「对外访问地址」的端口策略：地址里只写主机名时，后端会按每条连接的监听端口分别补上；
+// 写了端口则所有连接共用这一个入口，只有监听该端口的那条能连回来。
+// 这条提示必须在这里当场给 —— 用户填完就走，等到「连不上」时已经想不起与这个端口有关。
+const ifacePorts = ref<{ name: string; listen_port: number; enabled: boolean }[]>([])
+const endpointExternalPort = computed(() => parseEndpointPort(settings.server_endpoint))
+const endpointPortConflicts = computed(() =>
+  endpointExternalPort.value
+    ? ifacePorts.value
+        .filter((i) => i.enabled && i.listen_port > 0 && i.listen_port !== endpointExternalPort.value)
+        .map((i) => `「${i.name}」（监听 ${i.listen_port}）`)
+    : [],
+)
+
+/**
+ * 解析「host:port」里的端口，没有端口返回 0。
+ *
+ * 不能直接用 /:(\d+)$/ 判断：裸 IPv6（fd00::1）会被当成端口 1，
+ * 于是多连接时凭空冒出一条「端口冲突」的警告。
+ */
+function parseEndpointPort(v: string): number {
+  const s = (v || '').trim()
+  if (!s) return 0
+  let portText = ''
+  if (s.startsWith('[')) {
+    const i = s.indexOf(']:')
+    if (i < 0) return 0
+    portText = s.slice(i + 2)
+  } else {
+    // 冒号多于一个且不是 IPv4:port 的形态，只能是裸 IPv6，没有端口
+    if ((s.match(/:/g) || []).length !== 1) return 0
+    portText = s.split(':')[1]
+  }
+  const p = Number(portText)
+  return Number.isInteger(p) && p > 0 && p <= 65535 ? p : 0
+}
+
+async function loadIfacePorts() {
+  try {
+    const data = await api.get<{ items: WgInterface[] }>('/interfaces')
+    ifacePorts.value = (data.items || []).map((it) => ({
+      name: it.name,
+      listen_port: it.listen_port,
+      enabled: it.enabled,
+    }))
+  } catch {
+    // 读不到就不提示：这是解释性文案，不值得让它挡住设置页
+  }
+}
 
 // 事件通知单独一组状态，与「接入设置」各自保存：
 // 改通知渠道不该连带改动对外访问地址这类会影响所有设备的配置。
@@ -1027,6 +1092,7 @@ async function loadAll() {
   }
   await loadNotify()
   await loadHealth()
+  await loadIfacePorts()
   if (session.isAdmin) await loadUsers()
   // 备份与计划备份在各自的组件里按需取（见 BackupPanel）
   await loadSnapshots()

@@ -200,6 +200,33 @@ func TestJudgeInspectProblems(t *testing.T) {
 			level:  InspectWarning,
 		},
 		{
+			// 「已填写」不等于「每条连接都连得回来」：地址里写死端口时，
+			// 一个外部端口同一时刻只能转给一条连接，其余连接的二维码都指着同一个门。
+			// 只报「已填写」会让巡检给出一份「一切正常」的报告，而其中一条怎么都连不上。
+			name: "对外地址写死端口而其余连接监听别的端口",
+			break_: func(f *inspectFacts) {
+				f.Ov.InterfaceCount = 2
+				f.Ov.Interfaces = append(f.Ov.Interfaces,
+					model.Interface{ID: 2, Name: "wg1", Enabled: true, Up: true, ListenPort: 51821})
+			},
+			key:   "endpoint",
+			level: InspectWarning,
+		},
+		{
+			// 不带端口是推荐写法：每条连接各用自己的端口，巡检应当报通过而不是制造待办。
+			// 它属于「状态类结论」，Fix 写「无需处理」即可（报告里会渲染这一段）。
+			name: "对外地址不带端口时不应报异常",
+			break_: func(f *inspectFacts) {
+				f.Ov.ServerEndpoint = "nas.example.com"
+				f.Ov.InterfaceCount = 2
+				f.Ov.Interfaces[0].ListenPort = 51820
+				f.Ov.Interfaces = append(f.Ov.Interfaces,
+					model.Interface{ID: 2, Name: "wg1", Enabled: true, Up: true, ListenPort: 51821})
+			},
+			key:   "endpoint",
+			level: InspectOK,
+		},
+		{
 			name:   "通知地址本身有问题",
 			break_: func(f *inspectFacts) { f.Notify.Problem = "不是合法的 http(s) 地址" },
 			key:    "notify",
