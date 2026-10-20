@@ -642,11 +642,40 @@ func judgeInspect(f inspectFacts) []InspectItem {
 				To:     "settings",
 			})
 		} else if ov.InterfaceCount > 0 {
-			out = append(out, InspectItem{
-				Key: "endpoint", Level: InspectOK,
+			// 「已填写」不等于「每条连接都连得回来」：地址里写死端口时，
+			// 一个外部端口同一时刻只能转给一条连接，其余连接的二维码会指着同一个人家的门。
+			// 那正是「配了却连不上、状态里还看不出原因」的根源，这里必须说清而不是只报「已填写」。
+			detail := "地址里没写端口：每条连接的二维码/邀请会各自使用自己的监听端口，" +
+				"路由器上放行哪个端口，就连得回哪条连接。"
+			level := InspectOK
+			if _, port := splitHostPort(ov.ServerEndpoint); port > 0 {
+				stranded := make([]string, 0, len(ov.Interfaces))
+				for _, it := range ov.Interfaces {
+					// ListenPort 为 0 只出现在没有下发过配置的中间态，不据此下结论。
+					if it.Enabled && it.ListenPort > 0 && it.ListenPort != port {
+						stranded = append(stranded, fmt.Sprintf("%s（监听 %d）", it.Name, it.ListenPort))
+					}
+				}
+				detail = fmt.Sprintf("地址里写死了 %d 端口：一个外部端口同一时刻只能转给一条连接，"+
+					"只有监听 %d 的那条能从外网连回来。", port, port)
+				if len(stranded) > 0 {
+					level = InspectWarning
+					detail += "其余连接现在连不回来：" + strings.Join(stranded, "、") +
+						"；到「系统设置 → 接入设置」把端口去掉（只留域名或 IP），每条连接就会各自用自己的端口。"
+				}
+			}
+			item := InspectItem{
+				Key: "endpoint", Level: level,
 				Title:  "对外访问地址已填写",
-				Detail: "二维码里带的是这个地址，手机在外网也能连回来。",
-			})
+				Detail: detail,
+			}
+			if level == InspectOK {
+				item.Fix = "无需处理；路由器上要放行每条连接各自的端口（例如 51820、51821），对应的设备才连得回来。"
+			} else {
+				item.Fix = "把对外访问地址里的端口去掉（只留域名或 IP）：多连接时每条连接会各自用自己的监听端口。"
+				item.To = "settings"
+			}
+			out = append(out, item)
 		}
 	}
 

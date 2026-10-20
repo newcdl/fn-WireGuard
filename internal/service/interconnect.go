@@ -425,17 +425,13 @@ func portNoteIfMismatch(it *model.Interface, endpoint string) string {
 	if it == nil || it.ListenPort <= 0 {
 		return ""
 	}
-	_, portStr, err := net.SplitHostPort(strings.TrimSpace(endpoint))
-	if err != nil {
-		return ""
-	}
-	ext, err := strconv.Atoi(portStr)
-	if err != nil || ext <= 0 || ext == it.ListenPort {
+	_, ext := splitHostPort(endpoint)
+	if ext == 0 || ext == it.ListenPort {
 		return ""
 	}
 	return fmt.Sprintf("对外访问地址用的是 %d 端口，本连接的监听端口是 %d："+
 		"两者可以不同（靠路由器端口映射或内网穿透换算），但必须真的转得通 —— "+
-		"请确认「外部 %d」确实转到了「本机 %d」；对端一直连不上本机时，先查这一条",
+		"请确认「外部 %d」确实转到了「本机 %d」；设备或对端一直连不上时，先查这一条",
 		ext, it.ListenPort, ext, it.ListenPort)
 }
 

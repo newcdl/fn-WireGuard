@@ -248,6 +248,24 @@
           style="margin-bottom: 12px"
         />
 
+        <!-- 第二条及以后的连接才会遇到「端口撞车」这件事：
+             对外访问地址只有一份，写了端口就只有一个外部入口，所以必须在这里先说清，
+             否则用户会以为新建一条连接就能多一个入口（真机踩过：二维码指向了别人那条连接）。 -->
+        <el-alert
+          v-if="!form.id && list.length"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+        >
+          <template #title>
+            这是第 {{ list.length + 1 }} 条连接，它会有自己的服务端口。但对外入口只有一份：
+            如果「系统设置 → 对外访问地址」里写了端口（例如 home.example.com:51820），
+            就只有监听该端口的那条连接能从外网接回来。请到系统设置把端口去掉、只留域名或 IP，
+            每条连接就会各自用自己的端口；否则这条连接只适合用于「与另一台 NAS 互联」。
+          </template>
+        </el-alert>
+
         <el-alert
           type="success"
           :closable="false"
@@ -520,10 +538,11 @@ function computeWarn(row: WgInterface): RowWarn | null {
       text: '这条连接上的设备范围与「内网访问」「设备隔离」这几项开关对不上，按现象查不出来。点这里到「系统维护」查看具体结论。',
       action: 'maintenance',
     }
-  // 端口映射类问题放在最后：它平时不影响使用，只在「外面连不回来」时才致命。
+  // 端口类问题放在最后：它平时不影响使用，只在「外面连不回来」时才致命。
   // 但恰恰因为平时看不出，才必须在列表里常驻提示（真机踩过：外部端口与本机监听端口对不上）。
-  // 它不跳转：要改的是路由器上的端口映射，本应用里没有能改的地方，跳过去只会让人白找一圈。
-  if (row.port_note) return { label: '核对端口', text: `${row.port_note}。`, action: 'none' }
+  // 它不跳转：要改的要么是路由器上的映射，要么是「系统设置」里的对外地址，
+  // 本页没有能一键改好的地方，跳过去只会让人白找一圈 —— 完整处置已经写在 port_note 里。
+  if (row.port_note) return { label: '外网接不回', text: `${row.port_note}。`, action: 'none' }
   return null
 }
 

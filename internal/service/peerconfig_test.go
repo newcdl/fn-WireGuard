@@ -480,3 +480,115 @@ func TestDNSModeControlsPushedDNS(t *testing.T) {
 		t.Fatalf("开启内网域名解析后，设备应被指向本机隧道地址：\n%s", again.Conf)
 	}
 }
+
+// TestServerEndpointPortPolicy 覆盖多连接时「二维码里的端口从哪来」与配套提示。
+//
+// 两种写法对应两种现实，处置完全不同：
+//  1. 对外地址只填域名/IP（推荐）：每条连接用自己的监听端口，多连接可同时从外网接入；
+//  2. 对外地址写了端口（历史写法）：一个外部端口同一时刻只能转给一条连接，
+//     其余连接必须能在「我的连接」里常驻看到「连不回来」，而不是只在连不上时靠猜。
+func TestServerEndpointPortPolicy(t *testing.T) {
+	svc, _ := newTestEnv(t)
+	ctx := context.Background()
+	actor := service.Actor{Username: "tester", SrcIP: "127.0.0.1"}
+
+	// 家里网段显式指定：否则结果会随开发机真实局域网变化
+	if err := svc.SetSettings(ctx, map[string]string{"home_lan_cidrs": "172.31.0.0/24"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name, addr string, port int) (*model.Interface, *model.Peer) {
+		t.Helper()
+		it, err := svc.CreateInterface(ctx, service.CreateInterfaceInput{
+			Name: name, Addresses: []string{addr}, ListenPort: port,
+			Enabled: boolPtr(true), Autostart: boolPtr(true),
+		}, actor)
+		if err != nil {
+			t.Fatalf("创建连接 %s 失败: %v", name, err)
+		}
+		p, err := svc.CreatePeer(ctx, service.PeerInput{
+			InterfaceID: it.ID, Name: "设备-" + name, GenerateKeys: true, AutoAddress: true, Enabled: boolPtr(true),
+		}, actor)
+		if err != nil {
+			t.Fatalf("在 %s 上创建设备失败: %v", name, err)
+		}
+		return it, p
+	}
+	_, p0 := mk("wg0", "10.10.0.1/24", 51820)
+	_, p1 := mk("wg1", "10.11.0.1/24", 51821)
+
+	portNotes := func() map[string]string {
+		t.Helper()
+		list, err := svc.ListInterfaces(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]string{}
+		for _, it := range list {
+			m[it.Name] = it.PortNote
+		}
+		return m
+	}
+
+	// ① 只填域名：每条连接各自用自己的端口，这是多连接推荐的写法
+	if err := svc.SetSettings(ctx, map[string]string{"server_endpoint": "vpn.example.com"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	cfg0, err := svc.PeerConfig(ctx, p0.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg1, err := svc.PeerConfig(ctx, p1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg0.Endpoint != "vpn.example.com:51820" {
+		t.Fatalf("首条连接的二维码应使用 51820，实际 %q", cfg0.Endpoint)
+	}
+	if cfg1.Endpoint != "vpn.example.com:51821" {
+		t.Fatalf("第二条连接的二维码应使用它自己的 51821，实际 %q", cfg1.Endpoint)
+	}
+	if !strings.Contains(cfg1.Conf, "Endpoint = vpn.example.com:51821") {
+		t.Fatalf("设备配置里的 Endpoint 与二维码必须一致：\n%s", cfg1.Conf)
+	}
+	if n := portNotes(); n["wg0"] != "" || n["wg1"] != "" {
+		t.Fatalf("端口对得上时不该有提示：%v", n)
+	}
+
+	// ② 写了端口：这个外部端口已经被 wg0 占用，wg1 的提示必须说清「连不回来」并指出改哪里
+	if err := svc.SetSettings(ctx, map[string]string{"server_endpoint": "vpn.example.com:51820"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	n := portNotes()
+	if n["wg0"] != "" {
+		t.Fatalf("监听 51820 的那条本来就通，不该报提示：%q", n["wg0"])
+	}
+	for _, want := range []string{"51820", "wg0", "连不回来"} {
+		if !strings.Contains(n["wg1"], want) {
+			t.Fatalf("被占用的连接必须提示 %q，实际：%q", want, n["wg1"])
+		}
+	}
+	// 二维码这一刻确实指向错误的端口：交付页面上也要能看见，而不是只有列表里那一行
+	cfg1, err = svc.PeerConfig(ctx, p1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg1.Endpoint != "vpn.example.com:51820" {
+		t.Fatalf("写死端口时所有连接的二维码都会用它（提示正是为这个事实准备的），实际 %q", cfg1.Endpoint)
+	}
+	if !strings.Contains(cfg1.Warning, "连不回来") {
+		t.Fatalf("生成二维码时必须同时给出「这条连不回来」的说明，实际：%q", cfg1.Warning)
+	}
+
+	// ③ 写了端口但没有连接监听它：用户是靠路由器换算（外部 60000 → 本机 51821），
+	//    这时不能误报「被占用」，只能提醒「映射必须真的转得通」。
+	if err := svc.SetSettings(ctx, map[string]string{"server_endpoint": "vpn.example.com:60000"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	n = portNotes()
+	if !strings.Contains(n["wg1"], "外部 60000") || !strings.Contains(n["wg1"], "本机 51821") {
+		t.Fatalf("换算场景应提示两个端口彼此对应，实际：%q", n["wg1"])
+	}
+	if strings.Contains(n["wg1"], "正由连接") {
+		t.Fatalf("没有连接监听 60000 时不该报「被占用」：%q", n["wg1"])
+	}
+}
